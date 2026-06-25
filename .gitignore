@@ -1,3 +1,30 @@
-*
-*/
-!.gitignore
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Cache
+.cache/
+
+# Node
+node_modules/
+
+# Rust
+target/
+
+# Java
+target/
+*.class
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

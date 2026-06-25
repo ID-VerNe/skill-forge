@@ -1,0 +1,7 @@
+{
+    "search": true,
+    "audit": true,
+    "analysis_ast": true,
+    "analysis_tree_sitter": false,
+    "installer": true
+}
