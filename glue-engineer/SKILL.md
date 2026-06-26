@@ -318,3 +318,61 @@ export const meta = {
 	- multi-lens-research skill: 多视角 STORM 工作流模式
 	- Tree-sitter: github.com/tree-sitter/py-tree-sitter
 	- 多视角 v3 方案合成: upgrade-analysis/glue-v3-outputs/synthesis-plan.md
+		### 规则 6：Claude Code v4 Deep Mode（基础组件选择时触发）
+
+		当满足以下 **至少 2 项** 条件时，触发 v4 Deep Mode：
+		- 候选库 ≥ 3 个
+		- 用户需求含 ≥ 3 条具体功能
+		- 用户提及 fork / modify / integrate / reuse / build on top
+		- 决策影响长期架构
+		- 用户要求"深度分析" / "深入了解" / "看看能不能改造"
+
+		触发流程：
+		```
+		1. [强制] 先执行 v3 发现管道：
+		   python -m polyglot scout <lang> <keyword>
+		   python -m polyglot cross-search "<keywords>" --languages <langs>
+		   python -m polyglot mvp-scope <project> --features ...
+
+		2. 询问用户是否进入 v4 Deep Mode：
+		   "检测到您需要选择基础组件。是否触发深度代码分析？
+		   （Claude Code subagents 将自由探索每个候选库，
+		    输出架构分析 + 代码复用表 + 改造方案）
+		    预计 ~3-5 分钟，需等待 subagents 完成。"
+
+		3. 用户确认后执行：
+		   a. python -m polyglot deep-init --project <name>
+		         --requirements "req1,req2,req3" --repos <url1> <url2>
+		      → 创建 deep-output/ 工作区 + clone 所有仓库
+
+		   b. python -m polyglot deep-pack deep-output/
+		      → 为每个 repo 生成 task prompt
+
+		   c. 并行启动 glue-repo-architect subagent（每个 repo 一个）
+		      - Subagent 自由探索源码（无文件数限制）
+		      - Subagent 写入 4 个产物到 disk
+		      - Subagent 只返回短摘要，不贴完整报告
+
+		   d. python -m polyglot deep-validate deep-output/
+		      → 校验所有 architecture 产物
+
+		4. 基于 deep-output/ 产出的结构化数据输出最终方案
+		```
+
+		**Subagent 规则**：
+		- 探索路径自由（不限制读取文件数）
+		- 源码只读，不 build，不 install
+		- Write 权限仅限于 `deep-output/`
+		- 只返回简短摘要给主 agent
+
+		### 并行策略
+
+		当有多 repo 时，用 `Agent` 工具并行启动 glue-repo-architect
+		（每个 repo 一个实例）。所有 subagent 独立落盘，互不干扰。
+
+		完整 Phase 2 流程：
+		```
+		1. deep-compare → 生成需求覆盖矩阵 + 对比表 + 排名（纯结构，不调 LLM）
+		2. deep-summarize → 生成 final-report-draft.md
+		3. deep-clean → 清理 clone 产物（保留报告）
+		```

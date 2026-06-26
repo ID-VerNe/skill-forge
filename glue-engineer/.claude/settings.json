@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(git clone *)",
+      "Bash(git -C *)",
+      "Bash(git ls-files *)",
+      "Bash(rg *)",
+      "Bash(find *)",
+      "Bash(mkdir -p deep-output*)",
+      "Bash(python -m polyglot *)",
+      "Read",
+      "Grep",
+      "Glob",
+      "Write"
+    ],
+    "ask": [
+      "Bash(rm *)",
+      "Bash(mkdir *)"
+    ],
+    "deny": [
+      "Bash(cargo build *)",
+      "Bash(cargo run *)",
+      "Bash(cargo install *)",
+      "Bash(npm install *)",
+      "Bash(pip install *)",
+      "Bash(pnpm install *)",
+      "Bash(yarn install *)",
+      "Bash(docker *)",
+      "Bash(make *)",
+      "Bash(cmake *)"
+    ]
+  },
+  "printMode": false
+}

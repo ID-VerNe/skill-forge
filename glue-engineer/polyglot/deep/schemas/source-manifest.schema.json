@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Source Manifest",
+  "description": "Records which files were read during architecture analysis",
+  "type": "object",
+  "required": ["repo", "files_read", "total_files", "analysis_date"],
+  "properties": {
+    "repo": {
+      "type": "string",
+      "description": "Repository name"
+    },
+    "files_read": {
+      "type": "array",
+      "description": "Paths of files read during analysis",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "lines": { "type": "integer" },
+          "purpose": { "type": "string" }
+        },
+        "required": ["path"]
+      }
+    },
+    "total_files": {
+      "type": "integer",
+      "description": "Total files in repository (approximate)"
+    },
+    "skipped_dirs": {
+      "type": "array",
+      "description": "Directories intentionally skipped",
+      "items": { "type": "string" }
+    },
+    "analysis_date": {
+      "type": "string",
+      "description": "ISO datetime of analysis"
+    }
+  }
+}

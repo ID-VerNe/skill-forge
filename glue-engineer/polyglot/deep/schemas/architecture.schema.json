@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Architecture Report",
+  "description": "Structured output from glue-repo-architect subagent",
+  "type": "object",
+  "required": [
+    "repo",
+    "slug",
+    "source_path",
+    "commit",
+    "one_line_summary",
+    "core_modules",
+    "key_types",
+    "platform_apis",
+    "known_gaps",
+    "confidence",
+    "evidence"
+  ],
+  "properties": {
+    "repo": {
+      "type": "string",
+      "description": "Repository name"
+    },
+    "slug": {
+      "type": "string",
+      "description": "Filesystem-safe slug"
+    },
+    "source_path": {
+      "type": "string",
+      "description": "Local path to cloned source"
+    },
+    "commit": {
+      "type": "string",
+      "description": "HEAD commit hash at analysis time"
+    },
+    "language": {
+      "type": "string",
+      "description": "Primary language"
+    },
+    "one_line_summary": {
+      "type": "string",
+      "description": "One sentence describing the project"
+    },
+    "architecture_overview": {
+      "type": "string",
+      "description": "2-3 paragraph architecture description"
+    },
+    "entrypoints": {
+      "type": "array",
+      "description": "Entry point files/modules",
+      "items": { "type": "string" }
+    },
+    "core_modules": {
+      "type": "array",
+      "description": "Core module names/paths",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "path": { "type": "string" },
+          "purpose": { "type": "string" }
+        },
+        "required": ["name", "path"]
+      }
+    },
+    "data_flow": {
+      "type": "array",
+      "description": "Key data flow steps",
+      "items": { "type": "string" }
+    },
+    "key_types": {
+      "type": "array",
+      "description": "Key structs, enums, types",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "type": "string", "enum": ["struct", "enum", "trait", "type", "interface", "class"] },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "purpose": { "type": "string" }
+        },
+        "required": ["name", "kind", "file", "line"]
+      }
+    },
+    "platform_apis": {
+      "type": "array",
+      "description": "Platform-specific API usage",
+      "items": {
+        "type": "object",
+        "properties": {
+          "api": { "type": "string" },
+          "purpose": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "integer" }
+        },
+        "required": ["api", "purpose"]
+      }
+    },
+    "extension_points": {
+      "type": "array",
+      "description": "Design extension points",
+      "items": { "type": "string" }
+    },
+    "known_gaps": {
+      "type": "array",
+      "description": "Known capability gaps vs requirements",
+      "items": {
+        "type": "object",
+        "properties": {
+          "requirement": { "type": "string" },
+          "status": { "type": "string", "enum": ["supported", "partial", "missing"] },
+          "details": { "type": "string" },
+          "effort": { "type": "string", "enum": ["low", "medium", "high", "unknown"] }
+        },
+        "required": ["requirement", "status"]
+      }
+    },
+    "reuse_candidates": {
+      "type": "array",
+      "description": "Potentially reusable modules",
+      "items": {
+        "type": "object",
+        "properties": {
+          "module": { "type": "string" },
+          "file": { "type": "string" },
+          "line_start": { "type": "integer" },
+          "line_end": { "type": "integer" },
+          "purpose": { "type": "string" }
+        }
+      }
+    },
+    "confidence": {
+      "type": "number",
+      "description": "Subagent confidence in analysis (0.0-1.0)",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "evidence": {
+      "type": "array",
+      "description": "Evidence backing key claims",
+      "items": {
+        "type": "object",
+        "properties": {
+          "claim": { "type": "string" },
+          "file": { "type": "string" },
+          "line_start": { "type": "integer" },
+          "line_end": { "type": "integer" },
+          "note": { "type": "string" }
+        },
+        "required": ["claim", "file", "line_start", "line_end"]
+      },
+      "minItems": 1
+    },
+    "unresolved_questions": {
+      "type": "array",
+      "description": "Questions subagent could not answer",
+      "items": { "type": "string" }
+    }
+  }
+}

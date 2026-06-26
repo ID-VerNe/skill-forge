@@ -7,7 +7,7 @@
 | Skill | 目录 | 版本 | 说明 |
 |-------|------|------|------|
 | **multi-lens-research** | `multi-lens-research/` | v2.2.0 | 基于斯坦福 STORM 方法的多视角深度研究 Skill |
-| **glue-engineer** | `glue-engineer/` | v3.0.0 | 多语言胶水代码生成引擎。跨语言搜索、能力本体匹配、自动桥接代码生成、MVP 分级 |
+| **glue-engineer** | `glue-engineer/` | **v4.0.0** | 多语言胶水代码生成引擎 + Deep Mode。跨语言搜索、能力本体匹配、自动桥接代码生成；v4 新增深度分析管道：`deep-init` → 并行子 agent 架构分析 → `deep-compare` → `deep-summarize` → reuse-map + 许可证检查 → 集成路线规划 |
 
 ---
 
@@ -16,6 +16,10 @@
 将所需 skill 的目录链接或复制到 `~/.claude/skills/` 下即可。
 
 ```bash
-# 示例：安装 glue-engineer
+# 示例：安装 glue-engineer（含 4 个子 agent 定义）
 ln -s $(pwd)/glue-engineer ~/.claude/skills/glue-engineer
+cp glue-engineer/agents/*.md ~/.claude/agents/
+
+# 查看可用的子 agent
+/agents
 ```

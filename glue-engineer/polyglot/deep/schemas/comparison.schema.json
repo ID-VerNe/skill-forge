@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Comparison Report",
+  "description": "Structured comparison of multiple repository architecture reports",
+  "type": "object",
+  "required": ["project", "matrix", "comparisons", "ranking"],
+  "properties": {
+    "project": { "type": "string" },
+    "matrix": {
+      "type": "object",
+      "description": "Requirements coverage matrix",
+      "properties": {
+        "requirements": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "repos": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "matrix": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "requirement": { "type": "string" },
+              "patternProperties": {
+                "^[a-zA-Z0-9_-]+$": { "type": "string", "enum": ["supported", "partial", "missing"] }
+              }
+            }
+          }
+        }
+      }
+    },
+    "comparisons": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "slug": { "type": "string" },
+          "name": { "type": "string" },
+          "language": { "type": "string" },
+          "one_line_summary": { "type": "string" },
+          "confidence": { "type": "number" },
+          "known_gaps_summary": { "type": "string" },
+          "evidence_count": { "type": "integer" },
+          "core_module_count": { "type": "integer" },
+          "key_type_count": { "type": "integer" },
+          "platform_api_count": { "type": "integer" },
+          "commit": { "type": "string" }
+        }
+      }
+    },
+    "ranking": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "rank": { "type": "integer" },
+          "slug": { "type": "string" },
+          "score": { "type": "number" },
+          "confidence": { "type": "number" },
+          "evidence_count": { "type": "integer" }
+        }
+      }
+    }
+  }
+}

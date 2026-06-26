@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reuse Map",
+  "description": "Structured output from glue-reuse-mapper subagent (Phase 3)",
+  "type": "object",
+  "required": [
+    "repo",
+    "slug",
+    "candidates"
+  ],
+  "properties": {
+    "repo": {
+      "type": "string",
+      "description": "Repository name"
+    },
+    "slug": {
+      "type": "string",
+      "description": "Filesystem-safe slug matching the architecture report"
+    },
+    "target_license": {
+      "type": "string",
+      "description": "Target project license (SPDX identifier)"
+    },
+    "candidates": {
+      "type": "array",
+      "description": "Reusable code candidates",
+      "items": {
+        "type": "object",
+        "required": [
+          "file",
+          "line_start",
+          "line_end",
+          "symbol",
+          "purpose",
+          "reuse_mode",
+          "source_license",
+          "license_note",
+          "adaptation_steps",
+          "confidence",
+          "evidence"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Source file path relative to repo root"
+          },
+          "line_start": {
+            "type": "integer",
+            "description": "Start line number",
+            "minimum": 1
+          },
+          "line_end": {
+            "type": "integer",
+            "description": "End line number",
+            "minimum": 1
+          },
+          "symbol": {
+            "type": "string",
+            "description": "Function/type/module/symbol name"
+          },
+          "purpose": {
+            "type": "string",
+            "description": "What this code does"
+          },
+          "reuse_mode": {
+            "type": "string",
+            "description": "Recommended reuse mode",
+            "enum": ["copy", "port", "wrap", "reference_only", "avoid"]
+          },
+          "source_license": {
+            "type": "string",
+            "description": "SPDX identifier of source code license"
+          },
+          "license_note": {
+            "type": "string",
+            "description": "License compatibility explanation, including obligations"
+          },
+          "adaptation_steps": {
+            "type": "array",
+            "description": "Steps needed to adapt for reuse",
+            "items": { "type": "string" },
+            "minItems": 1
+          },
+          "confidence": {
+            "type": "number",
+            "description": "Confidence in reuse recommendation (0.0-1.0)",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Why this code is reusable or why not"
+          }
+        }
+      },
+      "minItems": 1
+    }
+  }
+}

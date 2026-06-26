@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Integration Plan",
+  "description": "Structured output from glue-integration-planner subagent (Phase 4)",
+  "type": "object",
+  "required": [
+    "repo",
+    "slug",
+    "recommended_route",
+    "decision_matrix",
+    "implementation_roadmap",
+    "risks",
+    "validation_checklist"
+  ],
+  "properties": {
+    "repo": {
+      "type": "string",
+      "description": "Repository name"
+    },
+    "slug": {
+      "type": "string",
+      "description": "Filesystem-safe slug matching the architecture report"
+    },
+    "recommended_route": {
+      "type": "string",
+      "description": "Recommended integration route",
+      "enum": ["direct_use", "fork", "compose", "build"]
+    },
+    "route_rationale": {
+      "type": "string",
+      "description": "Why this route was chosen over the alternatives"
+    },
+    "decision_matrix": {
+      "type": "array",
+      "description": "Multi-criteria decision analysis for route selection",
+      "items": {
+        "type": "object",
+        "properties": {
+          "criterion": { "type": "string" },
+          "score": { "type": "number", "minimum": 0, "maximum": 10 },
+          "weight": { "type": "number", "minimum": 0, "maximum": 1 },
+          "evidence": { "type": "string" }
+        },
+        "required": ["criterion", "score", "weight", "evidence"]
+      },
+      "minItems": 1
+    },
+    "implementation_roadmap": {
+      "type": "array",
+      "description": "Ordered implementation steps",
+      "items": {
+        "type": "object",
+        "properties": {
+          "step": { "type": "integer" },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "effort": { "type": "string", "enum": ["low", "medium", "high"] },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "dependencies": {
+            "type": "array",
+            "description": "Step indices this step depends on",
+            "items": { "type": "integer" }
+          }
+        },
+        "required": ["step", "title", "description", "effort", "confidence"]
+      },
+      "minItems": 1
+    },
+    "first_pr_plan": {
+      "type": "object",
+      "description": "Plan for the first pull request (smallest meaningful integration)",
+      "properties": {
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "files_to_change": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string" },
+              "action": { "type": "string", "enum": ["create", "modify", "delete"] },
+              "content_summary": { "type": "string" }
+            },
+            "required": ["path", "action", "content_summary"]
+          }
+        },
+        "order": {
+          "type": "array",
+          "description": "Ordered list of file paths to change in this PR",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["title", "description", "files_to_change", "order"]
+    },
+    "risks": {
+      "type": "array",
+      "description": "Risks and unknowns",
+      "items": {
+        "type": "object",
+        "properties": {
+          "risk": { "type": "string" },
+          "likelihood": { "type": "string", "enum": ["low", "medium", "high"] },
+          "impact": { "type": "string", "enum": ["low", "medium", "high"] },
+          "mitigation": { "type": "string" }
+        },
+        "required": ["risk", "likelihood", "impact", "mitigation"]
+      }
+    },
+    "validation_checklist": {
+      "type": "array",
+      "description": "Validation checks before declaring integration complete",
+      "items": {
+        "type": "object",
+        "properties": {
+          "check": { "type": "string" },
+          "category": { "type": "string", "enum": ["functional", "build", "license", "performance", "security"] }
+        },
+        "required": ["check", "category"]
+      },
+      "minItems": 1
+    }
+  }
+}

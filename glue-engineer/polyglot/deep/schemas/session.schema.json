@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Session",
+  "description": "Deep analysis session configuration",
+  "type": "object",
+  "required": ["project", "requirements", "candidate_repos", "created_at", "workflow"],
+  "properties": {
+    "project": { "type": "string" },
+    "requirements": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "target_license": { "type": "string" },
+    "candidate_repos": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "url", "slug", "local_path"],
+        "properties": {
+          "name": { "type": "string" },
+          "url": { "type": "string" },
+          "slug": { "type": "string" },
+          "local_path": { "type": "string" },
+          "commit": { "type": "string" }
+        }
+      }
+    },
+    "created_at": { "type": "string" },
+    "workflow": { "type": "string" }
+  }
+}
