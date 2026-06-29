@@ -1,0 +1,24 @@
+{
+  "skill_name": "gpt-image-2",
+  "eval_schema_version": "1.0",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "帮我做一张小红书封面，主题是'30天早起计划'，要有高级感，文字要清楚。",
+      "expected_output": "A structured GPT Image 2 prompt for a vertical social media cover, with exact Chinese text rendering, layout, scene, lighting, and constraints. Must use EXACT TEXT or verbatim for the headline.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "prompt": "把这张产品图的背景换成大理石浴室台面，产品不要变。这是一个护肤品瓶子的照片。",
+      "expected_output": "An image edit prompt using Change / Preserve / Integration / Constraints structure. Must specify what to change (only background), what to preserve (product geometry, label, etc.), and matching requirements.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "帮我生成一张国家地理风格的老人做面包的照片，要真实。",
+      "expected_output": "A photorealistic documentary-style prompt with specific photography elements: lens, lighting, texture details (skin, flour, worn surfaces), and constraints against glamorization. Must translate '真实' and '国家地理风格' into concrete visual facts.",
+      "files": []
+    }
+  ]
+}
