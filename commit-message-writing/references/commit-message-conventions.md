@@ -18,8 +18,19 @@ Use conventional commits prefix:
 - `docs:` — documentation
 - `style:` — formatting (no code behavior change)
 - `refactor:` — refactoring (neither feature nor bug fix)
+- `perf:` — performance improvement
 - `test:` — adding tests
 - `chore:` — build process or auxiliary tool changes
+
+## Scope (optional)
+Add scope after type to indicate the affected module:
+- `feat(auth):` — auth module feature
+- `fix(ui):` — UI bug fix
+- `refactor(api):` — API refactoring
+
+## Footer (optional)
+- `Closes #<issue>` — link to resolved issue
+- `BREAKING CHANGE: <description>` — mark incompatible changes
 
 ## Commit Message Structure
 ```

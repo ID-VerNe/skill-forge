@@ -1,5 +1,6 @@
 ---
 name: commit-message-writing
+version: 1.1.0
 description: 专门用于写 commit message、执行 git commit 和 git push 的 skill。只要用户提及 git、commit、push、提交、暂存、stage、add、推送、PR 准备、或者任何与代码提交相关的操作，都必须触发此 skill。每次调用 git commit 和 git push 都必须走这个 skill 的工作流。
 ---
 
@@ -67,10 +68,22 @@ FIX:
 | `docs:` | 文档变更 |
 | `style:` | 格式调整（不改变代码行为） |
 | `refactor:` | 重构（既不是新功能也不是修 Bug） |
+| `perf:` | 性能优化 |
 | `test:` | 添加测试 |
 | `chore:` | 构建/工具链变更 |
 
-**原则：** 摘要行使用小写前缀，冒号后有空格。ADD/FIX 部分是英文单词 + 冒号，子项用 dash bullet。
+**可选 Scope（影响范围）：** 类型后可加 `(<scope>)` 标明改动涉及模块，如 `feat(auth):`、`fix(ui):`。
+**可选 Footer（页脚）：** 正文后可加 `Closes #123` 关联 Issue，或 `BREAKING CHANGE:` 标记不兼容变更。
+
+**原则：** 摘要行使用小写前缀，冒号后有空格。ADD/FIX 部分是英文单词 + 冒号，子项用 dash bullet。**多行示例（标准格式）：**
+```
+fix(auth): 修复第三方登录令牌过期未刷新的问题
+
+原因是在请求拦截器中漏掉了对 401 状态码的判断。
+现在已补上拦截逻辑，并会自动触发 token 刷新请求。
+
+Closes #123
+```
 
 ## 工作流程
 
@@ -101,7 +114,7 @@ git add <file2>
 git diff --cached
 ```
 根据暂存区 diff 生成 commit message：
-- **摘要行**：最合适的 type 前缀 + 不超过 72 字的英文摘要
+- **摘要行**：最合适的 type 前缀（可选加 scope，如 `feat(auth):`）+ 不超过 72 字的英文摘要
 - **ADD 部分**：新增的功能/文件
 - **FIX 部分**：修复的问题
 - **REMOVE 部分**：删除了什么内容/文件（当有文件被删除时使用）
@@ -109,7 +122,10 @@ git diff --cached
 - **STYLE 部分**：代码格式、命名调整等不影响逻辑的变更
 - **DOCS 部分**：文档相关的变更
 - **CHORE 部分**：构建配置、依赖、工具链变更
+- **Footer（可选）**：如果 diff 涉及修复某个 Issue，在末尾加 `Closes #xxx`；如果有不兼容变更，加 `BREAKING CHANGE: <说明>`
 - 没有某个部分就省略，只列出有内容的部分
+
+**注：** 对于简单变更，单行摘要即可。对于复杂变更，建议提供多行正文说明**为什么这么改**，而不只是改了什么东西。
 
 ### Step 5: 展示 message 给用户确认（不可跳过）
 **写完 commit message 后，必须先展示给用户看，用户说OK才能继续。** 这一步不能跳过，不能默认确认。
