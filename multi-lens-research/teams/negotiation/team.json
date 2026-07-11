@@ -1,0 +1,13 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "negotiation",
+  "version": "1.0.0",
+  "description": "谈判策略团队 — 从博弈和心理角度分析谈判场景",
+  "scenario": ["negotiate", "谈判", "deal", "交易", "bargain", "协商"],
+  "agents": [
+    { "slug": "strategist", "label": "博弈策略师", "phase": 1 },
+    { "slug": "psychologist", "label": "谈判心理学家", "phase": 1 },
+    { "slug": "batna-analyst", "label": "BATNA分析师", "phase": 1 },
+    { "slug": "cultural-advisor", "label": "文化顾问", "phase": 1 }
+  ]
+}

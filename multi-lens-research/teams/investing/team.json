@@ -1,0 +1,14 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "investing",
+  "version": "1.0.0",
+  "description": "投资研究团队 — 从多个投资维度分析标的和机会",
+  "scenario": ["invest", "stock", "股票", "投资", "buy", "买入", "market"],
+  "agents": [
+    { "slug": "value-investor", "label": "价值投资者", "phase": 1 },
+    { "slug": "macro-analyst", "label": "宏观分析师", "phase": 1 },
+    { "slug": "technical-analyst", "label": "技术分析者", "phase": 1 },
+    { "slug": "risk-manager", "label": "风险管理师", "phase": 1 },
+    { "slug": "industry-insider", "label": "行业内部视角", "phase": 1 }
+  ]
+}

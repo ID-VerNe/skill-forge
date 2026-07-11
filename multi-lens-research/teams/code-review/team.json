@@ -1,0 +1,14 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "code-review",
+  "version": "1.0.0",
+  "description": "代码/功能评审团队 — 评估功能的价值、架构影响和隐藏成本",
+  "scenario": ["code", "feature", "function", "PR", "功能", "代码", "merge"],
+  "agents": [
+    { "slug": "architect", "label": "架构师", "phase": 1 },
+    { "slug": "user-advocate", "label": "用户倡导者", "phase": 1 },
+    { "slug": "minimalist", "label": "极简主义者", "phase": 1 },
+    { "slug": "security-perf-engineer", "label": "安全/性能工程师", "phase": 1 },
+    { "slug": "business-analyst", "label": "业务分析师", "phase": 1 }
+  ]
+}

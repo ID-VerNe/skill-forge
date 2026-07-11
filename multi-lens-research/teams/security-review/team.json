@@ -1,0 +1,13 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "security-review",
+  "version": "1.0.0",
+  "description": "安全审计团队 — 从安全角度评估系统、代码或架构的风险",
+  "scenario": ["security", "安全", "audit", "审计", "渗透", "vulnerability"],
+  "agents": [
+    { "slug": "threat-modeler", "label": "威胁建模师", "phase": 1 },
+    { "slug": "pentester", "label": "渗透测试者", "phase": 1 },
+    { "slug": "compliance-officer", "label": "合规官", "phase": 1 },
+    { "slug": "privacy-analyst", "label": "隐私分析师", "phase": 1 }
+  ]
+}

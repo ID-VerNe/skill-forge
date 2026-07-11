@@ -1,0 +1,13 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "interview-prep",
+  "version": "1.0.0",
+  "description": "面试准备团队 — 从面试官角度模拟面试流程",
+  "scenario": ["interview", "面试", "hiring", "招聘", "求职"],
+  "agents": [
+    { "slug": "technical-interviewer", "label": "技术面试官", "phase": 1 },
+    { "slug": "behavioral-interviewer", "label": "行为面试官", "phase": 1 },
+    { "slug": "system-design-interviewer", "label": "系统设计面试官", "phase": 1 },
+    { "slug": "hiring-manager", "label": "招聘经理", "phase": 1 }
+  ]
+}

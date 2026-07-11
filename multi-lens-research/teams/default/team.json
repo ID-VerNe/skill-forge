@@ -1,0 +1,14 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "default",
+  "version": "1.0.0",
+  "description": "通用多视角研究团队 — 适合任意主题的深度分析",
+  "scenario": ["research", "general", "deep-dive", "study", "话题研究", "深度分析"],
+  "agents": [
+    { "slug": "practitioner", "label": "实践者", "phase": 1 },
+    { "slug": "academic", "label": "学者", "phase": 1 },
+    { "slug": "skeptic", "label": "怀疑论者", "phase": 1 },
+    { "slug": "economist", "label": "经济学家", "phase": 1 },
+    { "slug": "historian", "label": "历史学家", "phase": 1 }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "tech-architecture",
+  "version": "1.0.0",
+  "description": "技术架构评估团队 — 评估架构决策、技术选型和系统演进路线",
+  "scenario": ["architecture", "架构", "tech-stack", "技术选型", "system-design"],
+  "agents": [
+    { "slug": "systems-architect", "label": "系统架构师", "phase": 1 },
+    { "slug": "scalability-engineer", "label": "可扩展性工程师", "phase": 1 },
+    { "slug": "migration-specialist", "label": "迁移专家", "phase": 1 },
+    { "slug": "tech-debt-analyst", "label": "技术债务分析师", "phase": 1 }
+  ]
+}

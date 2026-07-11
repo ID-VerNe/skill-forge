@@ -1,0 +1,14 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "direction-judge",
+  "version": "1.0.0",
+  "description": "研究方向评估团队 — 判断研究方向或项目的价值和风险",
+  "scenario": ["direction", "值不值得", "评估方向", "值得做", "worth", "viable", "评估", "方向", "可行"],
+  "agents": [
+    { "slug": "optimist", "label": "乐观者", "phase": 1 },
+    { "slug": "pessimist", "label": "悲观者", "phase": 1 },
+    { "slug": "publication-strategist", "label": "发表策略师", "phase": 1 },
+    { "slug": "resource-realist", "label": "资源现实主义者", "phase": 1 },
+    { "slug": "pattern-matcher", "label": "模式匹配者", "phase": 1 }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "paper-review",
+  "version": "1.0.0",
+  "description": "论文审稿团队 — 从审稿人角度评估论文的贡献、方法和缺陷",
+  "scenario": ["paper", "review", "manuscript", "论文", "审阅", "投稿"],
+  "agents": [
+    { "slug": "supportive-reviewer", "label": "支持性审稿人", "phase": 1 },
+    { "slug": "hostile-reviewer", "label": "反对性审稿人", "phase": 1 },
+    { "slug": "methodologist", "label": "方法论审稿人", "phase": 1 },
+    { "slug": "competitor", "label": "竞争性审稿人", "phase": 1 },
+    { "slug": "interdisciplinary-bridge", "label": "跨学科桥梁", "phase": 1 }
+  ]
+}

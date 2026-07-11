@@ -1,0 +1,12 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "shared",
+  "version": "1.0.0",
+  "description": "Phase 2-4 通用角色 — 矛盾分析师、综合简报师、同行评审员",
+  "scenario": ["all"],
+  "agents": [
+    { "slug": "contradiction-analyst", "label": "矛盾分析师", "phase": 2 },
+    { "slug": "synthesis-briefer", "label": "综合简报师", "phase": 3 },
+    { "slug": "peer-reviewer", "label": "同行评审员", "phase": 4 }
+  ]
+}

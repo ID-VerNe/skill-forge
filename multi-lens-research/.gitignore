@@ -1,3 +1,6 @@
 *
 */
 !.gitignore
+!SKILL.md
+!teams/
+!teams/**

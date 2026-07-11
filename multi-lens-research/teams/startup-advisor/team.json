@@ -1,0 +1,13 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "startup-advisor",
+  "version": "1.0.0",
+  "description": "创业顾问团队 — 从多个创业维度评估创意、市场和执行方案",
+  "scenario": ["startup", "创业", "idea", "商业", "business", "MVP"],
+  "agents": [
+    { "slug": "founder-mentor", "label": "创业者导师", "phase": 1 },
+    { "slug": "venture-analyst", "label": "风险投资分析师", "phase": 1 },
+    { "slug": "go-to-market-strategist", "label": "市场进入策略师", "phase": 1 },
+    { "slug": "technical-co-founder", "label": "技术合伙视角", "phase": 1 }
+  ]
+}

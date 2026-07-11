@@ -1,0 +1,13 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "product-design",
+  "version": "1.0.0",
+  "description": "产品设计评审团队 — 评估产品设计、用户体验和交互方案",
+  "scenario": ["design", "UX", "UI", "产品", "交互", "用户体", "设计", "评审设计"],
+  "agents": [
+    { "slug": "ux-researcher", "label": "用户研究员", "phase": 1 },
+    { "slug": "product-manager", "label": "产品经理", "phase": 1 },
+    { "slug": "visual-designer", "label": "视觉设计师", "phase": 1 },
+    { "slug": "accessibility-specialist", "label": "无障碍专家", "phase": 1 }
+  ]
+}
