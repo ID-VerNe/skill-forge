@@ -4,11 +4,62 @@ export const meta = {
 	  metadata: { requires: [python, git] },
 	};
 
-	# Glue Engineer v3 — Multi-Language Glue Code Generation Engine
+	# Glue Engineer — Search & Deep Mode
 
-	> **核心理念**: 自动完成"找库→比库→测库→接库→验库"的全流程。v3 新增跨语言搜索、能力本体匹配、自动胶水代码生成。
-	>
-	> 借鉴 [multi-lens-research](skills/multi-lens-research) 的 STORM 方法论：并行独立 Agent → 文件通信 → 分阶段用户确认。
+	> **核心理念**: 双模式入口，自动完成"找库→比库→测库→接库→验库"的全流程。
+	> - **Search Mode**（默认进入）: CLI 自动链搜索 → 出完整方案
+	> - **Deep Mode**（可选进入）: 源码级 subagent 深度分析（search-mode 完成后询问）
+
+	---
+
+	## ⚠️ 入口协议（强制执行，违反 = 没有执行此 Skill）
+
+	### 决策树
+
+	```
+	用户输入
+
+	  ├─ 设计/构建/评估一个项目或系统？
+	  │   ↓
+	  │   ╔════════════════════════════════╗
+	  │   ║     ===MODE: SEARCH===         ║
+	  │   ║  (自动进入，无需询问用户)       ║
+	  │   ╚════════════════════════════════╝
+	  │
+	  │   阶段 1：CLI 自动链（全自动执行，不可跳过）
+	  │   ├─ 1️⃣ python -m polyglot scout <lang> <keyword>
+	  │   ├─ 2️⃣ python -m polyglot cross-search "<keyword>" --languages <langs>
+	  │   ├─ 3️⃣ python -m polyglot mvp-scope <project> --features ...
+	  │   └─ 4️⃣ python -m polyglot cap-list / cap-match
+	  │
+	  │   阶段 2：基于 CLI 真实数据出完整方案
+	  │   ├─ 每个库标注：版本号、许可证、下载量、数据来源
+	  │   ├─ 基于 mvp-scope 做 P0/P1/P2 分级
+	  │   └─ 如果涉及跨语言，标注桥接策略
+	  │
+	  │   阶段 3：询问 Deep Mode（强制执行）
+	  │   ─────────────────────────────────
+	  │   方案输出后，**必须**问用户：
+	  │   「方案已出。是否需要进入 v4 Deep Mode，
+	  │    用 subagent 对候选库做代码级源码分析？
+	  │    （约 3-5 分钟，需等待 subagent 完成）」
+	  │       ├─ 是 → 执行 ===MODE: DEEP=== 子流程
+	  │       └─ 否 → 结束，输出最终方案
+	  │
+	  └─ 单纯搜库/审计/匹配/生成胶水代码？
+	      ↓
+	      直接跑对应的 CLI 命令，返回结果
+	```
+
+	### 绝对禁止的行为
+
+	| ❌ 禁止行为 | ✅ 正确做法 |
+	|------------|------------|
+	| 使用 Claude Web Search 检索库信息 | 必须用 `python -m polyglot scout` |
+	| 靠内部知识列库名 | 必须跑 CLI 获取真实版本号/许可证/下载量 |
+	| 跳过 CLI 命令直接出方案 | 这是本 skill 的核心价值 |
+	| 子 agent 不传 CLI 指令 | 必须在 prompt 中注入 `python -m polyglot scout` |
+	| Deep Mode 跳过候选库 | 必须把 Search Mode 输出的所有候选库传给 deep-init |
 
 	---
 
@@ -82,6 +133,112 @@ export const meta = {
 	5. 基于 CLI 获取的真实数据生成方案，每个库标注版本/许可证/下载量
 	```
 	如果不包含这些指令，子 agent 会只靠知识库回答，无法调用胶水工具。
+
+	### 规则 6：Deep Mode 必须包含所有 Search Mode 候选库
+
+	Deep Mode 调用 `deep-init` 时，**必须把所有 Search Mode 输出的候选库的 repo URL 都传进去**。
+	不允许主 agent 主观跳过某个库（即使觉得它老旧/下载量低），因为代码级分析才能判断哪个库真正合适。
+	如果用户明确要求排除某个库，则按用户意愿执行。
+
+	---
+
+	## ===MODE: SEARCH=== 详细流程
+
+	当用户请求设计/构建/评估项目时，**自动进入 Search Mode**，全自动执行以下链式流程：
+
+	### 阶段 1: CLI 自动链
+
+	```bash
+	# 1. 单语言搜索用户需求所需库
+	python -m polyglot scout <lang> "<keyword>"
+
+	# 2. 跨语言搜索（如果涉及多语言）
+	python -m polyglot cross-search "<keyword>" --languages <langs>
+
+	# 3. MVP 功能分级
+	python -m polyglot mvp-scope <project> --features "功能1,分类" "功能2,分类"
+
+	# 4. 能力匹配检查
+	python -m polyglot cap-list
+	python -m polyglot cap-match <lang> <lib_a> <lang> <lib_b>
+	```
+
+	### 阶段 2: 出完整方案
+
+	基于 CLI 获取的真实数据生成方案，包含：
+	- 每个推荐库的**版本号、许可证、下载量、数据来源**
+	- 基于 mvp-scope 的 P0/P1/P2 分级
+	- 跨语言桥接策略（如果适用）
+	- 方案中每个库推荐必须标注来源
+
+	### 阶段 3: 询问 Deep Mode（强制执行）
+
+	方案输出后，**必须**问用户（不可跳过，不可默认确认）：
+
+	> 「方案已出。是否需要进入 v4 Deep Mode，用 subagent 对候选库做代码级源码分析？
+	> （约 3-5 分钟，需等待 subagent 完成）」
+	>
+	> - 是 → 执行 ===MODE: DEEP=== 子流程
+	> - 否 → 结束，输出最终方案
+
+	---
+
+	## ===MODE: DEEP=== 详细流程
+
+	Deep Mode 是对候选库的源码级深度分析。当用户确认后执行以下流程。
+
+	### 触发条件
+
+	如果用户直接要求深度分析，或满足以下条件，Search Mode 尾部会询问用户是否进入 Deep Mode：
+	- 候选库 ≥ 3 个
+	- 用户需求含 ≥ 3 条具体功能
+	- 用户提及 fork / modify / integrate / reuse / build on top
+	- 决策影响长期架构
+	- 用户要求"深度分析" / "深入了解" / "看看能不能改造"
+
+	### 执行流程
+
+	```bash
+	# ⚠️ 先确保在 glue-engineer 目录下运行（polyglot CLI 依赖目录结构）
+	cd <path-to-glue-engineer>
+
+	# Phase 1: 初始化 + 克隆
+	# ⚠️ 必须包含 Search Mode 输出的所有候选库的 repo URL，不能主观跳过任何一个
+	#    （subagent 会做代码级分析来判断优劣，主 agent 不应先替用户过滤）
+	python -m polyglot deep-init --project <name> --requirements "req1,req2" --repos <url1> <url2> <url3> <...>
+	python -m polyglot deep-pack .glue/deep/
+
+	# 并行启动 glue-repo-architect subagent（每个 repo 一个）
+	# → Subagent prompt 必须包含 CLI 指令（见子 agent 规则）
+
+	# 验证产物
+	python -m polyglot deep-validate .glue/deep/
+
+	# Phase 2: 对比 + 总结
+	python -m polyglot deep-compare .glue/deep/
+	python -m polyglot deep-summarize .glue/deep/
+
+	# Phase 3: 复用分析（可选）
+	# → 启动 glue-reuse-mapper subagent（如需要）
+
+	# Phase 4: 集成规划 + 综合
+	# → 启动 glue-integration-planner subagent
+	# → 启动 glue-synthesizer subagent
+
+	# Phase 5: 清理（使用 -f 跳过交互确认，因为 Bash 环境 input() 可能异常）
+	python -m polyglot deep-clean .glue/deep/ --force
+	```
+
+	**Subagent 规则**：
+	- 探索路径自由（不限制读取文件数）
+	- 源码只读，不 build，不 install
+	- Write 权限仅限于 `.glue/deep/`
+	- 只返回简短摘要给主 agent
+
+	### 并行策略
+
+	当有多 repo 时，用 `Agent` 工具并行启动 glue-repo-architect
+	（每个 repo 一个实例）。所有 subagent 独立落盘，互不干扰。
 
 	---
 
@@ -254,7 +411,7 @@ export const meta = {
 
 	### 同语言桥接 (Python → Python: requests → httpx)
 	```
-	glue-outputs/requests_httpx/
+	.glue/search/requests_httpx/
 	├── generated/
 	│   ├── glue.py              # 包装函数 + try/except
 	│   └── __init__.py
@@ -265,7 +422,7 @@ export const meta = {
 
 	### 跨语言桥接 (Python → Rust: orjson → serde_json)
 	```
-	glue-outputs/orjson_serde_json/
+	.glue/search/orjson_serde_json/
 	├── generated/
 	│   ├── glue.py              # Python 端 BridgeClient
 	│   ├── bridge.rs             # Rust 端 stdin/stdout CLI
@@ -288,7 +445,7 @@ export const meta = {
 
 	---
 
-## 向后兼容
+	## 向后兼容
 
 	旧版命令和脚本仍可使用:
 	```bash
@@ -309,6 +466,9 @@ export const meta = {
 	5. **速率限制**: GitHub API 被限时 → 使用缓存 (24h TTL) → 显示提示
 	6. **v3 生成失败**: Schema 验证错误 → 失败详情 + 建议修复方向
 	7. **v3 验证失败**: 具体失败级别 + 文件/行号提示 → 用户决定修复或重新生成
+	8. **deep-init 目录错误**: 如果在非 glue-engineer 目录运行会报 `No module named polyglot` → 必须先 `cd <glue-engineer-path>` 再执行
+	9. **deep-clean 交互卡住**: `input()` 在 Bash 环境可能异常 → 必须使用 `--force` / `-f` 参数跳过确认
+	10. **Deep Mode 遗漏候选库**: 主 agent 主观跳过某个库 → 规则 6 强制要求传所有候选库
 
 	---
 
@@ -318,61 +478,3 @@ export const meta = {
 	- multi-lens-research skill: 多视角 STORM 工作流模式
 	- Tree-sitter: github.com/tree-sitter/py-tree-sitter
 	- 多视角 v3 方案合成: upgrade-analysis/glue-v3-outputs/synthesis-plan.md
-		### 规则 6：Claude Code v4 Deep Mode（基础组件选择时触发）
-
-		当满足以下 **至少 2 项** 条件时，触发 v4 Deep Mode：
-		- 候选库 ≥ 3 个
-		- 用户需求含 ≥ 3 条具体功能
-		- 用户提及 fork / modify / integrate / reuse / build on top
-		- 决策影响长期架构
-		- 用户要求"深度分析" / "深入了解" / "看看能不能改造"
-
-		触发流程：
-		```
-		1. [强制] 先执行 v3 发现管道：
-		   python -m polyglot scout <lang> <keyword>
-		   python -m polyglot cross-search "<keywords>" --languages <langs>
-		   python -m polyglot mvp-scope <project> --features ...
-
-		2. 询问用户是否进入 v4 Deep Mode：
-		   "检测到您需要选择基础组件。是否触发深度代码分析？
-		   （Claude Code subagents 将自由探索每个候选库，
-		    输出架构分析 + 代码复用表 + 改造方案）
-		    预计 ~3-5 分钟，需等待 subagents 完成。"
-
-		3. 用户确认后执行：
-		   a. python -m polyglot deep-init --project <name>
-		         --requirements "req1,req2,req3" --repos <url1> <url2>
-		      → 创建 deep-output/ 工作区 + clone 所有仓库
-
-		   b. python -m polyglot deep-pack deep-output/
-		      → 为每个 repo 生成 task prompt
-
-		   c. 并行启动 glue-repo-architect subagent（每个 repo 一个）
-		      - Subagent 自由探索源码（无文件数限制）
-		      - Subagent 写入 4 个产物到 disk
-		      - Subagent 只返回短摘要，不贴完整报告
-
-		   d. python -m polyglot deep-validate deep-output/
-		      → 校验所有 architecture 产物
-
-		4. 基于 deep-output/ 产出的结构化数据输出最终方案
-		```
-
-		**Subagent 规则**：
-		- 探索路径自由（不限制读取文件数）
-		- 源码只读，不 build，不 install
-		- Write 权限仅限于 `deep-output/`
-		- 只返回简短摘要给主 agent
-
-		### 并行策略
-
-		当有多 repo 时，用 `Agent` 工具并行启动 glue-repo-architect
-		（每个 repo 一个实例）。所有 subagent 独立落盘，互不干扰。
-
-		完整 Phase 2 流程：
-		```
-		1. deep-compare → 生成需求覆盖矩阵 + 对比表 + 排名（纯结构，不调 LLM）
-		2. deep-summarize → 生成 final-report-draft.md
-		3. deep-clean → 清理 clone 产物（保留报告）
-		```

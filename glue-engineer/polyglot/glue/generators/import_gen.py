@@ -46,7 +46,7 @@ class ImportGenerator(PluginInterface):
         version="1.0.0",
     )
 
-    def generate(self, schema: GlueSchema, output_dir: str = "glue-outputs") -> GlueOutputPackage:
+    def generate(self, schema: GlueSchema, output_dir: str = ".glue/search") -> GlueOutputPackage:
         """Generate glue code for same-language import strategy."""
         pair_id = schema.pair_id
         pair_dir = os.path.join(output_dir, pair_id)

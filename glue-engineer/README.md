@@ -118,7 +118,7 @@ python -m polyglot deep-init \
   --repos https://github.com/jtroo/kanata https://github.com/qmk/qsk
 
 # 2. Generate task prompts for subagents
-python -m polyglot deep-pack deep-output/
+python -m polyglot deep-pack .glue/deep/
 
 # 3. (In Claude Code) Spawn subagents in parallel
 #    Spawn one glue-repo-architect per repo
@@ -126,29 +126,29 @@ python -m polyglot deep-pack deep-output/
 #    → They return only short summaries
 
 # 4. Validate subagent outputs
-python -m polyglot deep-validate deep-output/
+python -m polyglot deep-validate .glue/deep/
 
 # 5. Generate comparison matrix
-python -m polyglot deep-compare deep-output/
+python -m polyglot deep-compare .glue/deep/
 
 # 6. Generate report draft
-python -m polyglot deep-summarize deep-output/
+python -m polyglot deep-summarize .glue/deep/
 
 # 7. (In Claude Code) Spawn glue-reuse-mapper for reuse analysis
 #    → Spawn glue-integration-planner for integration plans
 #    → Spawn glue-synthesizer for final recommendation
 
 # 8. Validate including reuse maps
-python -m polyglot deep-validate deep-output/ --include-reuse-map
+python -m polyglot deep-validate .glue/deep/ --include-reuse-map
 
 # 9. Clean up cloned repos when done
-python -m polyglot deep-clean deep-output/
-python -m polyglot deep-clean deep-output/ --all   # also clean tasks/ and logs/
+python -m polyglot deep-clean .glue/deep/
+python -m polyglot deep-clean .glue/deep/ --all   # also clean tasks/ and logs/
 ```
 
 ### Session File
 
-All state is tracked in `deep-output/session.json`:
+All state is tracked in `.glue/deep/session.json`:
 
 ```json
 {
@@ -157,7 +157,7 @@ All state is tracked in `deep-output/session.json`:
   "target_license": "MIT",
   "candidate_repos": [
     { "name": "kanata", "url": "https://github.com/jtroo/kanata", "slug": "kanata",
-      "local_path": "deep-output/repos/kanata/source", "commit": "40a8b17" }
+      "local_path": ".glue/deep/repos/kanata/source", "commit": "40a8b17" }
   ],
   "workflow": "glue-engineer-v4"
 }
@@ -180,7 +180,7 @@ python -m polyglot deep-init \
 ```
 
 **Args:**
-- `dir` — Workspace directory (default: `deep-output`)
+- `dir` — Workspace directory (default: `.glue/deep`)
 - `--project` — Project name (required)
 - `--requirements` — Comma-separated list (required)
 - `--target-license` — SPDX identifier (default: `""`)
@@ -268,7 +268,7 @@ All subagents are defined in `agents/*.md`. Each has:
 ### Output Protocol
 
 Every subagent must:
-1. **Write full reports to disk** (under `deep-output/`)
+1. **Write full reports to disk** (under `.glue/deep/`)
 2. **Return only a short summary** to the main agent (< 10 lines)
 3. **Never** paste full reports into the main conversation context
 

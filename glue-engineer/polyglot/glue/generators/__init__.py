@@ -30,7 +30,7 @@ def _get_generator(mode: str):
                          f"Available: {', '.join(PluginRegistry.list_modes())}")
 
 
-def generate_glue(schema: GlueSchema, output_dir: str = "glue-outputs") -> GlueOutputPackage:
+def generate_glue(schema: GlueSchema, output_dir: str = ".glue/search") -> GlueOutputPackage:
     """Generate glue code from a GlueSchema.
 
     Routes to the correct generator based on strategy mode.

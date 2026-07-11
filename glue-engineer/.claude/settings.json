@@ -8,7 +8,7 @@
       "Bash(git ls-files *)",
       "Bash(rg *)",
       "Bash(find *)",
-      "Bash(mkdir -p deep-output*)",
+      "Bash(mkdir -p .glue/deep*)",
       "Bash(python -m polyglot *)",
       "Read",
       "Grep",

@@ -30,10 +30,10 @@
 # Create test workspace
 python -m polyglot deep-init --project "clean-test" --requirements "test" --repos https://github.com/jtroo/kanata
 # Run clean
-python -m polyglot deep-clean deep-output/ --force
+python -m polyglot deep-clean .glue/deep/ --force
 # Verify
-ls deep-output/repos/kanata/source/  # should fail (source removed)
-ls deep-output/repos/kanata/architecture.json  # should exist (report preserved)
+ls .glue/deep/repos/kanata/source/  # should fail (source removed)
+ls .glue/deep/repos/kanata/architecture.json  # should exist (report preserved)
 ```
 
 **Checklist:**
@@ -52,10 +52,10 @@ ls deep-output/repos/kanata/architecture.json  # should exist (report preserved)
 
 - [ ] `.claude/settings.json` exists in skill root
 - [ ] Permissions file is valid JSON
-- [ ] `allow` includes: git clone, find, rg, mkdir -p deep-output*, python -m polyglot
+- [ ] `allow` includes: git clone, find, rg, mkdir -p .glue/deep/*, python -m polyglot
 - [ ] `allow` includes: Read, Grep, Glob, Write
 - [ ] `deny` includes: cargo build, cargo run, npm install, pip install, docker
-- [ ] `ask` includes: rm, mkdir (without -p deep-output)
+- [ ] `ask` includes: rm, mkdir (without -p .glue/deep)
 
 ## Step 4: Agent Definitions Consistency
 
@@ -69,7 +69,7 @@ ls deep-output/repos/kanata/architecture.json  # should exist (report preserved)
 - [ ] Each agent has valid YAML frontmatter
 - [ ] Each agent has `name:` field matching filename (without .md)
 - [ ] Each agent has `permissionMode: default`
-- [ ] Each agent restricts Write to `deep-output/`
+- [ ] Each agent restricts Write to `.glue/deep/`
 - [ ] Each agent has clear final response format (< 10 lines)
 - [ ] No agent references paths that don't exist
 - [ ] maxTurns are reasonable (25/20/15/10 descending)
@@ -85,7 +85,7 @@ python -m polyglot --help
 - [ ] All 7 deep commands listed: init, pack, validate, compare, summarize, clean
 - [ ] v3 commands also listed: scout, audit, analyze, cross-search, cap-list, cap-match, bridge, strategies
 - [ ] No command has broken argparse definitions
-- [ ] All default arguments work (e.g., `python -m polyglot deep-validate` defaults to `deep-output/`)
+- [ ] All default arguments work (e.g., `python -m polyglot deep-validate` defaults to `.glue/deep/`)
 
 ## Step 6: Error Message UX
 

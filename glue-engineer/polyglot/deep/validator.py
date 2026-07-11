@@ -183,7 +183,7 @@ def validate_all(workspace_dir: str, include_reuse_map: bool = False) -> dict:
     """Validate artifacts for all repos in the session.
 
     Args:
-        workspace_dir: Path to deep-output/
+        workspace_dir: Path to .glue/deep/
         include_reuse_map: If True, also validate reuse-map artifacts (Phase 3)
 
     Returns:

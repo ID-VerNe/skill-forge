@@ -20,23 +20,23 @@ python -m polyglot deep-init \
 
 **Checklist:**
 
-- [ ] `deep-output/` directory created
-- [ ] `deep-output/session.json` exists and is valid JSON
+- [ ] `.glue/deep/` directory created
+- [ ] `.glue/deep/session.json` exists and is valid JSON
 - [ ] `session.json` contains: `project`, `requirements`, `target_license`, `candidate_repos`
-- [ ] `deep-output/repos/kanata/` directory created
-- [ ] `deep-output/tasks/` directory created
-- [ ] `deep-output/logs/` directory created
+- [ ] `.glue/deep/repos/kanata/` directory created
+- [ ] `.glue/deep/tasks/` directory created
+- [ ] `.glue/deep/logs/` directory created
 - [ ] commit hash recorded in session.json
 
 ## Step 2: deep-pack
 
 ```bash
-python -m polyglot deep-pack deep-output/
+python -m polyglot deep-pack .glue/deep/
 ```
 
 **Checklist:**
 
-- [ ] `deep-output/tasks/kanata.architect.task.md` exists
+- [ ] `.glue/deep/tasks/kanata.architect.task.md` exists
 - [ ] Task file contains: project name, requirements, repo path
 - [ ] Task file references output paths (architecture.md, architecture.json, etc.)
 
@@ -49,13 +49,13 @@ _In Claude Code: spawn one glue-repo-architect subagent for kanata_
 - [ ] Subagent reads source code (no artificial file count limit)
 - [ ] Subagent does NOT install/build/run
 - [ ] Subagent does NOT modify source files
-- [ ] Subagent writes to `deep-output/repos/kanata/` only
+- [ ] Subagent writes to `.glue/deep/repos/kanata/` only
 - [ ] Subagent returns short summary (< 10 lines) to main agent
 
 ## Step 4: deep-validate
 
 ```bash
-python -m polyglot deep-validate deep-output/
+python -m polyglot deep-validate .glue/deep/
 ```
 
 **Checklist:**
@@ -76,7 +76,7 @@ python -m polyglot deep-validate deep-output/
 ## Deep-Clean (verify cleanup)
 
 ```bash
-python -m polyglot deep-clean deep-output/
+python -m polyglot deep-clean .glue/deep/
 ```
 
 - [ ] Source directories removed

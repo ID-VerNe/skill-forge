@@ -254,7 +254,7 @@ def cmd_bridge(args):
         return
 
     # Generate code
-    output_dir = args.output_dir or "glue-outputs"
+    output_dir = args.output_dir or ".glue/search"
     package = generate_glue(schema, output_dir)
 
     output_summary = {
@@ -508,7 +508,7 @@ def main():
     p_bridge.add_argument("src")
     p_bridge.add_argument("dst_lang")
     p_bridge.add_argument("dst")
-    p_bridge.add_argument("--output-dir", default="glue-outputs")
+    p_bridge.add_argument("--output-dir", default=".glue/search")
     p_bridge.add_argument("--dry-run", action="store_true", help="Print schema without generating")
     p_bridge.add_argument("--skip-verify", action="store_true", help="Skip verification step")
     p_bridge.add_argument("--format", choices=["json", "markdown"], default="json")
@@ -527,8 +527,8 @@ def main():
 
     # v4: Deep Mode commands
     p_deep_init = sub.add_parser("deep-init", help="Create deep analysis workspace")
-    p_deep_init.add_argument("--dir", default="deep-output",
-                            help="Workspace directory (default: deep-output)")
+    p_deep_init.add_argument("--dir", default=".glue/deep",
+                            help="Workspace directory (default: .glue/deep)")
     p_deep_init.add_argument("--project", required=True, help="Project name")
     p_deep_init.add_argument("--requirements", nargs="+", default=[],
                             help="Structured requirement descriptions")
@@ -536,26 +536,26 @@ def main():
     p_deep_init.add_argument("repos", nargs="+", help="Repository URLs to analyze")
 
     p_deep_pack = sub.add_parser("deep-pack", help="Generate subagent task prompts")
-    p_deep_pack.add_argument("dir", default="deep-output", nargs="?",
-                            help="Workspace directory (default: deep-output)")
+    p_deep_pack.add_argument("dir", default=".glue/deep", nargs="?",
+                            help="Workspace directory (default: .glue/deep)")
 
     p_deep_val = sub.add_parser("deep-validate", help="Validate subagent architecture outputs")
-    p_deep_val.add_argument("dir", default="deep-output", nargs="?",
-                           help="Workspace directory (default: deep-output)")
+    p_deep_val.add_argument("dir", default=".glue/deep", nargs="?",
+                           help="Workspace directory (default: .glue/deep)")
     p_deep_val.add_argument("--include-reuse-map", action="store_true",
                            help="Also validate reuse-map artifacts (Phase 3)")
 
     p_deep_comp = sub.add_parser("deep-compare", help="Compare multiple repo architecture reports")
-    p_deep_comp.add_argument("dir", default="deep-output", nargs="?",
-                            help="Workspace directory (default: deep-output)")
+    p_deep_comp.add_argument("dir", default=".glue/deep", nargs="?",
+                            help="Workspace directory (default: .glue/deep)")
 
     p_deep_summ = sub.add_parser("deep-summarize", help="Generate final report draft")
-    p_deep_summ.add_argument("dir", default="deep-output", nargs="?",
-                            help="Workspace directory (default: deep-output)")
+    p_deep_summ.add_argument("dir", default=".glue/deep", nargs="?",
+                            help="Workspace directory (default: .glue/deep)")
 
     p_deep_clean = sub.add_parser("deep-clean", help="Clean cloned repos but keep reports")
-    p_deep_clean.add_argument("dir", default="deep-output", nargs="?",
-                             help="Workspace directory (default: deep-output)")
+    p_deep_clean.add_argument("dir", default=".glue/deep", nargs="?",
+                             help="Workspace directory (default: .glue/deep)")
     p_deep_clean.add_argument("--all", action="store_true",
                              help="Also clean logs/ and tasks/")
     p_deep_clean.add_argument("--force", "-f", action="store_true",

@@ -77,7 +77,7 @@ class PluginInterface(ABC):
     metadata: ClassVar[GeneratorMetadata]
 
     @abstractmethod
-    def generate(self, schema: GlueSchema, output_dir: str = "glue-outputs") -> GlueOutputPackage:
+    def generate(self, schema: GlueSchema, output_dir: str = ".glue/search") -> GlueOutputPackage:
         """Generate glue code from a GlueSchema.
 
         Args:

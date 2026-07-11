@@ -10,7 +10,7 @@ def build_architect_task(session: dict, repo_entry: dict, workspace_dir: str) ->
     Args:
         session: Loaded session dict
         repo_entry: Single repo entry from session['candidate_repos']
-        workspace_dir: Absolute path to deep-output/
+        workspace_dir: Absolute path to .glue/deep/
 
     Returns:
         Markdown task prompt string
@@ -52,7 +52,7 @@ Write all outputs to: {os.path.join(workspace_dir, 'repos', slug)}
 1. Read as many relevant files as needed — no artificial limits.
 2. Do NOT install dependencies, build, or run the project.
 3. Do NOT modify files under the source directory.
-4. **Write permission is ONLY for `deep-output/`**.
+4. **Write permission is ONLY for `.glue/deep/`**.
 5. Every claim must cite file paths and line numbers.
 6. `architecture.json` must follow the schema at `polyglot/deep/schemas/architecture.schema.json`.
 7. Must include `confidence` (0.0-1.0) in `architecture.json`.
@@ -65,10 +65,10 @@ Write all outputs to: {os.path.join(workspace_dir, 'repos', slug)}
 ```
 Done: analyzed {repo_entry['name']}.
 Files written:
-- deep-output/repos/{slug}/architecture.md
-- deep-output/repos/{slug}/architecture.json
-- deep-output/repos/{slug}/source_manifest.json
-- deep-output/repos/{slug}/unresolved.md
+- .glue/deep/repos/{slug}/architecture.md
+- .glue/deep/repos/{slug}/architecture.json
+- .glue/deep/repos/{slug}/source_manifest.json
+- .glue/deep/repos/{slug}/unresolved.md
 
 Confidence: <0-1>
 Key gaps: <brief summary>
@@ -80,7 +80,7 @@ def generate_tasks(workspace_dir: str) -> list:
     """Read session.json and generate .architect.task.md for each repo.
 
     Args:
-        workspace_dir: Absolute path to deep-output/
+        workspace_dir: Absolute path to .glue/deep/
 
     Returns:
         List of (slug, task_path) tuples

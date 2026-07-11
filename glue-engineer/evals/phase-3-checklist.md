@@ -47,7 +47,7 @@ _In Claude Code: spawn one glue-reuse-mapper subagent per repo (parallel)_
 ## Step 3: deep-validate --include-reuse-map
 
 ```bash
-python -m polyglot deep-validate deep-output/ --include-reuse-map
+python -m polyglot deep-validate .glue/deep/ --include-reuse-map
 ```
 
 **Checklist:**

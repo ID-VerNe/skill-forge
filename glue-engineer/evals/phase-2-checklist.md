@@ -22,12 +22,12 @@ python -m polyglot deep-init \
 - [ ] All 3 repo source directories exist
 - [ ] All 3 repos recorded in session.json candidate_repos
 - [ ] Commit hashes recorded
-- [ ] `deep-output/tasks/` and `deep-output/logs/` created
+- [ ] `.glue/deep/tasks/` and `.glue/deep/logs/` created
 
 ## Step 2: deep-pack
 
 ```bash
-python -m polyglot deep-pack deep-output/
+python -m polyglot deep-pack .glue/deep/
 ```
 
 **Checklist:**
@@ -50,7 +50,7 @@ _In Claude Code: spawn N glue-repo-architect subagents simultaneously (one per r
 ## Step 4: deep-validate
 
 ```bash
-python -m polyglot deep-validate deep-output/
+python -m polyglot deep-validate .glue/deep/
 ```
 
 **Checklist:**
@@ -63,13 +63,13 @@ python -m polyglot deep-validate deep-output/
 ## Step 5: deep-compare
 
 ```bash
-python -m polyglot deep-compare deep-output/
+python -m polyglot deep-compare .glue/deep/
 ```
 
 **Checklist:**
 
-- [ ] `deep-output/comparison.json` created
-- [ ] `deep-output/comparison.md` created
+- [ ] `.glue/deep/comparison.json` created
+- [ ] `.glue/deep/comparison.md` created
 - [ ] Coverage matrix exists with all repos × all requirements
 - [ ] Matrix shows each repo's status per requirement (supported/partial/missing)
 - [ ] Ranking present (sorted by score)
@@ -79,12 +79,12 @@ python -m polyglot deep-compare deep-output/
 ## Step 6: deep-summarize
 
 ```bash
-python -m polyglot deep-summarize deep-output/
+python -m polyglot deep-summarize .glue/deep/
 ```
 
 **Checklist:**
 
-- [ ] `deep-output/final-report-draft.md` created
+- [ ] `.glue/deep/final-report-draft.md` created
 - [ ] Contains: requirements list, repo-by-repo summaries, coverage matrix
 - [ ] Contains: ranking, evidence counts, known gaps
 - [ ] Contains: summary section with top candidate

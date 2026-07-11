@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 
 def create_workspace(workspace_dir: str):
-    """Create the deep-output/ directory structure."""
+    """Create the .glue/deep/ directory structure."""
     dirs = [
         workspace_dir,
         os.path.join(workspace_dir, "repos"),

@@ -42,7 +42,7 @@ class SubprocessGenerator(PluginInterface):
         version="1.0.0",
     )
 
-    def generate(self, schema: GlueSchema, output_dir: str = "glue-outputs") -> GlueOutputPackage:
+    def generate(self, schema: GlueSchema, output_dir: str = ".glue/search") -> GlueOutputPackage:
         pair_id = schema.pair_id
         pair_dir = os.path.join(output_dir, pair_id)
         gen_dir = os.path.join(pair_dir, "generated")

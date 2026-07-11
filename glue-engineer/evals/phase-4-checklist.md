@@ -13,10 +13,10 @@ _In Claude Code: spawn one glue-integration-planner subagent_
 
 **Checklist:**
 
-- [ ] Subagent reads from `deep-output/` only (does NOT read source)
+- [ ] Subagent reads from `.glue/deep/` only (does NOT read source)
 - [ ] Subagent reads: architecture.json, reuse-map.json, comparison.md
-- [ ] Outputs `deep-output/integration-plan.json`
-- [ ] Outputs `deep-output/integration-plan.md`
+- [ ] Outputs `.glue/deep/integration-plan.json`
+- [ ] Outputs `.glue/deep/integration-plan.md`
 - [ ] Integration plan includes: `recommended_route` (direct_use/fork/compose/build)
 - [ ] Includes route rationale explaining the choice
 - [ ] Includes decision matrix with criteria, scores, weights, evidence
@@ -31,7 +31,7 @@ _In Claude Code: spawn one glue-integration-planner subagent_
 ## Step 2: deep-summarize (integration section)
 
 ```bash
-python -m polyglot deep-summarize deep-output/
+python -m polyglot deep-summarize .glue/deep/
 ```
 
 **Checklist:**
@@ -50,11 +50,11 @@ _In Claude Code: spawn one glue-synthesizer subagent_
 
 **Checklist:**
 
-- [ ] Subagent reads from `deep-output/` only
+- [ ] Subagent reads from `.glue/deep/` only
 - [ ] Reads: session.json, final-report-draft.md, comparison.json, integration-plan.json
 - [ ] Reads: architecture.json for each repo
 - [ ] Does NOT read repository source code
-- [ ] Outputs `deep-output/final-recommendation.md`
+- [ ] Outputs `.glue/deep/final-recommendation.md`
 - [ ] Final recommendation includes: executive summary (1 paragraph)
 - [ ] Includes: decision summary table with scores
 - [ ] Includes: requirements coverage matrix
@@ -71,7 +71,7 @@ python -c "
 import json
 from polyglot.deep.validator import validate_reuse_map  # integration schema check
 # Manual validation:
-plan = json.load(open('deep-output/integration-plan.json'))
+plan = json.load(open('.glue/deep/integration-plan.json'))
 assert plan['recommended_route'] in ('direct_use', 'fork', 'compose', 'build')
 assert len(plan['decision_matrix']) > 0
 assert len(plan['implementation_roadmap']) > 0

@@ -27,7 +27,7 @@ def generate_draft(workspace_dir: str) -> str:
     """Generate a final-report-draft.md from all available artifacts.
 
     Args:
-        workspace_dir: Path to deep-output/
+        workspace_dir: Path to .glue/deep/
 
     Returns:
         Markdown string with the report draft.
