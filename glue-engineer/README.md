@@ -90,9 +90,9 @@ Or merge the permissions into your existing settings.
 ### 4. Verify Installation
 
 ```bash
-# Check polyglot CLI works
-cd ~/.claude/skills/glue-engineer
-python -m polyglot --help
+# Check polyglot CLI works (from any directory — no need to cd to glue-engineer)
+python <path-to-glue-engineer>/polyglot/__main__.py --help
+# Or: PYTHONPATH=<path-to-glue-engineer> python -m polyglot --help
 
 # Subcommands should include:
 #   deep-init      Create workspace + clone repos

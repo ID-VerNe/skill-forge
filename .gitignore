@@ -28,3 +28,9 @@ target/
 # OS
 .DS_Store
 Thumbs.db
+
+# cf-notifier (local notification + email config, not for git)
+/cf-notifier/
+
+# Glue Engineer — polyglot CLI output artifacts
+glue-engineer/.glue/

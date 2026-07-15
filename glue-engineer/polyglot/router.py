@@ -533,7 +533,8 @@ def main():
     p_deep_init.add_argument("--requirements", nargs="+", default=[],
                             help="Structured requirement descriptions")
     p_deep_init.add_argument("--target-license", default="", help="Target license")
-    p_deep_init.add_argument("repos", nargs="+", help="Repository URLs to analyze")
+    p_deep_init.add_argument("--repos", nargs="+", required=True,
+                            help="Repository URLs to analyze")
 
     p_deep_pack = sub.add_parser("deep-pack", help="Generate subagent task prompts")
     p_deep_pack.add_argument("dir", default=".glue/deep", nargs="?",

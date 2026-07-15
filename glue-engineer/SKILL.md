@@ -60,6 +60,7 @@ export const meta = {
 	| 跳过 CLI 命令直接出方案 | 这是本 skill 的核心价值 |
 	| 子 agent 不传 CLI 指令 | 必须在 prompt 中注入 `python -m polyglot scout` |
 	| Deep Mode 跳过候选库 | 必须把 Search Mode 输出的所有候选库传给 deep-init |
+	| **先 `cd` 到 glue-engineer 目录再运行 polyglot** | **💡 不需要了！从任意 CWD 都可以，所有 `.glue/` 输出自动放在 CWD 下** |
 
 	---
 
@@ -199,8 +200,10 @@ export const meta = {
 	### 执行流程
 
 	```bash
-	# ⚠️ 先确保在 glue-engineer 目录下运行（polyglot CLI 依赖目录结构）
-	cd <path-to-glue-engineer>
+	# ✅ 重要：polyglot CLI 现在可以从任何目录运行，所有输出都放在当前 CWD 的 .glue/ 下。
+	#    也就是说，在 Claude Code 启动的目录下直接执行即可，无需 cd 到 glue-engineer。
+	#    例如：在 C:\Users\VerNe\Downloads\Documents\my-project\ 下运行：
+	#    输出位置：C:\Users\VerNe\Downloads\Documents\my-project\.glue/deep/
 
 	# Phase 1: 初始化 + 克隆
 	# ⚠️ 必须包含 Search Mode 输出的所有候选库的 repo URL，不能主观跳过任何一个
@@ -466,7 +469,7 @@ export const meta = {
 	5. **速率限制**: GitHub API 被限时 → 使用缓存 (24h TTL) → 显示提示
 	6. **v3 生成失败**: Schema 验证错误 → 失败详情 + 建议修复方向
 	7. **v3 验证失败**: 具体失败级别 + 文件/行号提示 → 用户决定修复或重新生成
-	8. **deep-init 目录错误**: 如果在非 glue-engineer 目录运行会报 `No module named polyglot` → 必须先 `cd <glue-engineer-path>` 再执行
+	8. **deep-init 目录错误**: ~~如果在非 glue-engineer 目录运行会报 `No module named polyglot` → 必须先 `cd <glue-engineer-path>` 再执行~~ ✅ **已修复**: 现在 `python -m polyglot` 可以从任何目录运行，自动解析 polyglot package 路径。所有 `.glue/` 输出都放在 CWD 下。
 	9. **deep-clean 交互卡住**: `input()` 在 Bash 环境可能异常 → 必须使用 `--force` / `-f` 参数跳过确认
 	10. **Deep Mode 遗漏候选库**: 主 agent 主观跳过某个库 → 规则 6 强制要求传所有候选库
 
