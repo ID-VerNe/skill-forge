@@ -133,7 +133,7 @@ metadata:
 2. Read teams/<team>/team.json ← 获取角色列表
 3. 对每个角色 Read teams/<team>/<slug>.md ← 获取完整 prompt
 4. Read teams/shared/team.json 和 Phase 2-4 的 .md
-5. 创建工作目录 outputs/<team>/
+5. 在用户当前工作目录下创建工作目录 outputs/<team>/（不是 skill 目录下，而是 $(pwd) 即用户启动对话的地方）
 ```
 
 ### Phase 1：Multi-Perspective Scan
@@ -153,7 +153,7 @@ metadata:
    - 在自己上下文里模拟角色（思维链互相污染）
 ```
 
-每个子 agent 的 prompt 末尾追加：`"请将你的完整分析保存到 outputs/<team>/<role>.md 文件"`
+每个子 agent 的 prompt 末尾追加：`"请将你的完整分析保存到 outputs/<team>/<role>.md 文件（相对于当前工作目录 $(pwd)）"`
 
 ### Phase 2：Contradiction Map
 
@@ -178,7 +178,7 @@ metadata:
 ├── 澄清主题 → 如果不够具体，先问用户
 │
 ├── ═══ PHASE 1：Multi-Perspective Scan ═══
-│    ├── 创建工作目录 outputs/<team>/
+│    ├── 创建工作目录 outputs/<team>/（相对于当前工作目录，不是 skill 目录）
 │    ├── 同一 turn 并行启动所有角色 Agent（非background）：
 │    │   从 team.json 读取角色列表，对每个角色：
 │    │   Read teams/<team>/<slug>.md → 获取 prompt

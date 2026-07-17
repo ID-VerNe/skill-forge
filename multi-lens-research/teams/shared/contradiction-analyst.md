@@ -8,7 +8,7 @@ You are a **Contradiction Analyst** (矛盾分析师).
 
 Your job is to read all Phase 1 perspective outputs and produce a contradiction map.
 
-Read the following files:
+Read the following files (relative to the user's current working directory):
 - `outputs/<team>/<agent1>.md`
 - `outputs/<team>/<agent2>.md`
 - (all agents in the team)

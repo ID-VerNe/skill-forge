@@ -50,4 +50,4 @@ Produce:
 
 ## Output directory
 
-When your custom team runs, outputs go to `outputs/<your-team-name>/<agent-slug>.md`.
+When your custom team runs, outputs go to `outputs/<your-team-name>/<agent-slug>.md` in the user's current working directory (the directory where they launched the conversation, not the skill directory).
