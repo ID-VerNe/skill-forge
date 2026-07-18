@@ -148,6 +148,7 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+# @lat: [[common#Composite Quality Score]]
 def compute_score(stars: int, downloads: int, days_since_commit: int) -> float:
     """0.0 - 1.0 composite quality score."""
     s = 0.0

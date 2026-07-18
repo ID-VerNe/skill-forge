@@ -1,0 +1,42 @@
+{
+  "module": "polyglot-router",
+  "version": "1.0.0",
+  "exports": [
+    { "name": "main", "kind": "function", "params": [], "returns": "void" },
+    { "name": "resolve_language", "kind": "function", "params": ["lang"], "returns": "str" },
+    { "name": "import_backend", "kind": "function", "params": ["language", "tool"], "returns": "module" },
+    { "name": "cmd_scout", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_audit", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_analyze", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_list", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_cross_search", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_cap_list", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_cap_match", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_bridge", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_strategies", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_mvp_scope", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_deep_init", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_deep_pack", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_deep_validate", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_deep_compare", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_deep_summarize", "kind": "function", "params": ["args"], "returns": "void" },
+    { "name": "cmd_deep_clean", "kind": "function", "params": ["args"], "returns": "void" }
+  ],
+  "dependencies": {
+    "internal": ["common", "backends", "glue", "deep"],
+    "external": ["argparse", "importlib"]
+  },
+  "consumers": ["__main__.py"],
+  "errors": {
+    "IMPORT_ERROR": { "code": 1, "recovery": "Check language/tool name spelling" },
+    "UNKNOWN_COMMAND": { "code": 0, "recovery": "Print help and exit" }
+  },
+  "entryPoints": ["polyglot/router.py", "polyglot/__main__.py"],
+  "configKeys": ["LANGUAGES", "BACKENDS_DIR"],
+  "commands": [
+    "scout <lang> <keyword>", "audit <lang> <name>", "analyze <lang> <path>",
+    "list", "cross-search <keyword>", "cap-list", "cap-match <src_lang> <src> <dst_lang> <dst>",
+    "bridge <src_lang> <src> <dst_lang> <dst>", "strategies", "mvp-scope <project>",
+    "deep-init --project", "deep-pack", "deep-validate", "deep-compare", "deep-summarize", "deep-clean"
+  ]
+}

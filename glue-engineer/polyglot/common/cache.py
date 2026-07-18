@@ -13,6 +13,7 @@ def _cache_path(key: str) -> str:
     return os.path.join(CACHE_DIR, f"{h}.json")
 
 
+# @lat: [[common#24h TTL Cache]]
 def cache_get(key: str) -> dict | None:
     """Returns cached value or None if missing/expired."""
     path = _cache_path(key)

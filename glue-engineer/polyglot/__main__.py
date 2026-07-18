@@ -1,3 +1,5 @@
+# @lat: [[polyglot-router#Path-agnostic Entry Point]]
+
 # python -m polyglot
 # ═══════════════════════════════════════════════════════════════════════
 # Path-agnostic entry point.

@@ -58,6 +58,7 @@ STRATEGY_RULES = {
 }
 
 
+# @lat: [[glue#Strategy Selector]]
 def select_strategy(
     src: LibraryEndpoint,
     dst: LibraryEndpoint,

@@ -134,6 +134,7 @@ def build_ranking(comparisons: list) -> list:
     return ranked
 
 
+# @lat: [[deep#Structured Comparison]]
 def compare_all(workspace_dir: str) -> dict:
     """Run full comparison and return structured result.
 

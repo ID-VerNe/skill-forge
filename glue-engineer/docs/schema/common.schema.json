@@ -1,0 +1,30 @@
+{
+  "module": "common",
+  "version": "1.0.0",
+  "exports": [
+    { "name": "SearchOutput", "kind": "class", "signature": "schema, tool, language, query, results, errors, metadata" },
+    { "name": "SearchResult", "kind": "class", "signature": "name, version, description, registry_url, stars, downloads, last_commit, license_name, dependencies, score" },
+    { "name": "AuditOutput", "kind": "class", "signature": "schema, tool, language, candidate_name, repo_url, data, errors" },
+    { "name": "AuditData", "kind": "class", "signature": "files_scanned, exports, keywords_found, test_ratio, complexity, community_health, security, verdict" },
+    { "name": "ProbeOutput", "kind": "class", "signature": "schema, tool, language, package, probed_symbols, discrepancies" },
+    { "name": "cache_get", "kind": "function", "params": ["key"], "returns": "dict | None" },
+    { "name": "cache_set", "kind": "function", "params": ["key", "data", "ttl_seconds"], "returns": "void" },
+    { "name": "clone_repo", "kind": "function", "params": ["url", "dest", "depth"], "returns": "tuple[bool, str]" },
+    { "name": "detect_os", "kind": "function", "params": [], "returns": "str" },
+    { "name": "detect_project_ecosystem", "kind": "function", "params": ["path"], "returns": "list[dict]" },
+    { "name": "search_to_md", "kind": "function", "params": ["output"], "returns": "str" },
+    { "name": "audit_to_md", "kind": "function", "params": ["output"], "returns": "str" },
+    { "name": "compute_score", "kind": "function", "params": ["stars", "downloads", "days_since_commit"], "returns": "float" }
+  ],
+  "dependencies": {
+    "internal": [],
+    "external": ["json", "time", "hashlib", "subprocess", "shutil"]
+  },
+  "consumers": ["polyglot-router", "backends", "glue", "deep"],
+  "errors": {
+    "CACHE_READ_ERROR": { "code": null, "recovery": "Return None, continue without cache" },
+    "GIT_CLONE_TIMEOUT": { "code": null, "recovery": "Return error message, caller handles" }
+  },
+  "entryPoints": [],
+  "configKeys": ["CACHE_DIR"]
+}

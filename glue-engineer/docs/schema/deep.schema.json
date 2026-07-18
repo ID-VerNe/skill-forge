@@ -1,0 +1,34 @@
+{
+  "module": "deep",
+  "version": "1.0.0",
+  "exports": [
+    { "name": "create_workspace", "kind": "function", "params": ["workspace_dir"], "returns": "void" },
+    { "name": "create_session", "kind": "function", "params": ["workspace_dir", "project", "requirements", "target_license"], "returns": "dict" },
+    { "name": "load_session", "kind": "function", "params": ["workspace_dir"], "returns": "dict | None" },
+    { "name": "add_repo_to_session", "kind": "function", "params": ["workspace_dir", "session", "name", "url", "slug", "local_path", "commit"], "returns": "dict" },
+    { "name": "url_to_slug", "kind": "function", "params": ["url"], "returns": "str" },
+    { "name": "resolve_repo_url", "kind": "function", "params": ["url"], "returns": "str" },
+    { "name": "clone_repo", "kind": "function", "params": ["url", "target_dir"], "returns": "dict" },
+    { "name": "build_architect_task", "kind": "function", "params": ["session", "repo_entry", "workspace_dir"], "returns": "str" },
+    { "name": "generate_tasks", "kind": "function", "params": ["workspace_dir"], "returns": "list" },
+    { "name": "validate_all", "kind": "function", "params": ["workspace_dir", "include_reuse_map"], "returns": "dict" },
+    { "name": "compare_all", "kind": "function", "params": ["workspace_dir"], "returns": "dict" },
+    { "name": "generate_draft", "kind": "function", "params": ["workspace_dir"], "returns": "str" },
+    { "name": "reuse_mode_for_license", "kind": "function", "params": ["source_license", "target_license"], "returns": "str" },
+    { "name": "is_compatible", "kind": "function", "params": ["source_license", "target_license"], "returns": "bool" },
+    { "name": "explain_compatibility", "kind": "function", "params": ["source_license", "target_license"], "returns": "str" }
+  ],
+  "dependencies": {
+    "internal": [],
+    "external": ["json", "os", "subprocess", "re", "datetime", "shutil"]
+  },
+  "consumers": ["polyglot-router"],
+  "errors": {
+    "CLONE_TIMEOUT": { "code": null, "recovery": "Mark repo as failed, continue with others" },
+    "SESSION_NOT_FOUND": { "code": 1, "recovery": "Run deep-init first" },
+    "CLONE_FAILED": { "code": null, "recovery": "Still add to session with empty commit" },
+    "GIT_NOT_FOUND": { "code": null, "recovery": "Install git or check PATH" }
+  },
+  "entryPoints": ["polyglot/deep/outputs.py", "polyglot/deep/repo_resolver.py"],
+  "configKeys": ["DEFAULT_SESSION", "LICENSE_CATEGORIES", "_REUSE_RULES"]
+}

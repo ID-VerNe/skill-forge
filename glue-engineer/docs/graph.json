@@ -1,0 +1,15 @@
+{
+  "modules": [
+    { "name": "polyglot-router", "dependsOn": ["common", "backends", "glue", "deep"], "usedBy": ["__main__"] },
+    { "name": "common", "dependsOn": [], "usedBy": ["polyglot-router", "backends"] },
+    { "name": "backends", "dependsOn": ["common"], "usedBy": ["polyglot-router", "glue"] },
+    { "name": "glue", "dependsOn": ["backends", "glue/generators"], "usedBy": ["polyglot-router"] },
+    { "name": "glue/generators", "dependsOn": ["glue"], "usedBy": ["glue"] },
+    { "name": "deep", "dependsOn": [], "usedBy": ["polyglot-router"] },
+    { "name": "vtree", "dependsOn": [], "usedBy": [] },
+    { "name": "probe", "dependsOn": [], "usedBy": [] }
+  ],
+  "entryPoints": ["polyglot/__main__.py", "polyglot/router.py"],
+  "techStack": { "language": "Python", "runtime": ">=3.10", "buildSystem": "none (scripts-based)" },
+  "externalDependencies": ["requests>=2.28", "tree-sitter>=0.20 (optional)"]
+}

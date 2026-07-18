@@ -121,6 +121,7 @@ class FunctionMapping:
 # ═══════════════════════════════════════════════════════════════════
 
 @dataclass
+# @lat: [[glue#Failure State Machine]]
 class StatusMachine:
     """Failure-aware state machine for multi-step pipelines.
 

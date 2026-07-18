@@ -102,6 +102,7 @@ def is_strong_copyleft(license_id: str) -> bool:
     return get_category(license_id) == "strong_copyleft"
 
 
+# @lat: [[deep#License Compatibility Engine]]
 def reuse_mode_for_license(source_license: str, target_license: str) -> str:
     """Determine the recommended reuse mode based on source and target licenses.
 

@@ -342,6 +342,7 @@ LICENSE_COMPAT = {
 }
 
 
+# @lat: [[glue#Capability Ontology]]
 def match_capabilities(src: LibraryCapability, dst: LibraryCapability) -> CapabilityAlignment:
     """Compute compatibility alignment between two library capabilities.
 

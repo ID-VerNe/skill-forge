@@ -1,0 +1,33 @@
+{
+  "module": "glue",
+  "version": "1.0.0",
+  "exports": [
+    { "name": "CrossLangScoutEngine", "kind": "class", "params": ["config"], "returns": "batch_search" },
+    { "name": "DedupEngine", "kind": "class", "params": ["title_threshold", "combined_threshold"], "returns": "deduplicate" },
+    { "name": "CapabilityRegistry", "kind": "class", "params": [], "returns": "get, register, match, list_available" },
+    { "name": "GlueSchema", "kind": "class", "params": ["src", "dst", "pair_id", "strategy", "mappings"] },
+    { "name": "FunctionMapping", "kind": "class", "params": ["mapping_id", "src_function", "dst_function", "confidence"] },
+    { "name": "StatusMachine", "kind": "class", "params": ["step_name", "status", "max_retries"] },
+    { "name": "GlueStrategy", "kind": "class", "params": ["mode", "bridge_lang", "host_framework"] },
+    { "name": "LibraryCapability", "kind": "class", "params": ["library", "language", "io_patterns", "data_formats"] },
+    { "name": "CapabilityAlignment", "kind": "class", "params": ["overall_score", "io_compatible", "format_compatible"] },
+    { "name": "match_capabilities", "kind": "function", "params": ["src", "dst"], "returns": "CapabilityAlignment" },
+    { "name": "select_strategy", "kind": "function", "params": ["src", "dst", "alignment"], "returns": "GlueStrategy" },
+    { "name": "generate_glue", "kind": "function", "params": ["schema", "output_dir"], "returns": "GlueOutputPackage" },
+    { "name": "verify_package", "kind": "function", "params": ["package"], "returns": "dict" },
+    { "name": "cross_search", "kind": "function", "params": ["query", "languages", "limit"], "returns": "dict" },
+    { "name": "get_registry", "kind": "function", "params": [], "returns": "CapabilityRegistry" }
+  ],
+  "dependencies": {
+    "internal": ["backends", "glue/generators"],
+    "external": ["threading", "hashlib", "importlib"]
+  },
+  "consumers": ["polyglot-router"],
+  "errors": {
+    "STRATEGY_NOT_FOUND": { "code": null, "recovery": "Fallback to subprocess_json" },
+    "IMPORT_ERROR": { "code": null, "recovery": "Skip language, report in errors dict" },
+    "SCHEMA_VALIDATION_FAILED": { "code": null, "recovery": "Return failure detail + suggestion" }
+  },
+  "entryPoints": ["polyglot/glue/aggregator.py", "polyglot/glue/glue_schema.py"],
+  "configKeys": ["STARTER_REGISTRY", "CROSS_LANG_ALIASES", "WEIGHTS", "LICENSE_COMPAT"]
+}
