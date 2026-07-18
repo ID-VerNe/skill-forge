@@ -32,13 +32,20 @@ git status
 - 查看哪些文件有修改未暂存
 
 ### 4. 身份信息强制覆盖
-每次 commit 前，必须执行：
+每次 commit 前，必须执行身份设置：
+
+```bash
+# Bash
+source scripts/set-identity.sh
+
+# Windows CMD
+scripts\set-identity.cmd
+```
+
+或手动执行：
 ```bash
 git config user.name "ID-VerNe"
 git config user.email "yuu_seeing@foxmail.com"
-```
-并设置环境变量：
-```bash
 export GIT_COMMITTER_NAME="ID-VerNe"
 export GIT_COMMITTER_EMAIL="yuu_seeing@foxmail.com"
 ```
@@ -104,6 +111,15 @@ git status 2>/dev/null || echo "NOT_A_REPO"
 
 ### Step 3: 执行 git add
 用户确认后，逐个执行：
+
+```bash
+# Windows
+bash scripts/stage.sh <file1> <file2> ...
+# 或
+scripts\stage.cmd <file1> <file2>
+```
+
+或手动：
 ```bash
 git add <file1>
 git add <file2>
@@ -148,11 +164,19 @@ ADD:
 
 ### Step 6: 执行 commit
 用户确认后执行：
+
 ```bash
-git config user.name "ID-VerNe" && git config user.email "yuu_seeing@foxmail.com"
-export GIT_COMMITTER_NAME="ID-VerNe"
-export GIT_COMMITTER_EMAIL="yuu_seeing@foxmail.com"
-git commit -m "$MESSAGE"
+# 1. 先将 message 写入临时文件（避免 shell 转义问题）
+cat > /tmp/commit_msg.txt << 'EOF'
+<用户确认的完整 message>
+EOF
+
+# 2. 用脚本执行 commit
+bash scripts/commit.sh /tmp/commit_msg.txt
+# 或 Windows: scripts\commit.cmd %TEMP%\commit_msg.txt
+
+# 3. 清理临时文件
+rm /tmp/commit_msg.txt
 ```
 
 ### Step 7: 执行 push
@@ -166,6 +190,18 @@ git push
 
 - `references/commit-message-conventions.md` — Commit message 格式规范详情
 - `references/git-commit-identity.md` — 身份信息配置规则
+
+## 辅助脚本
+
+`scripts/` 目录包含 3 组脚本（每组分 Windows CMD 和 Bash 两个版本），方便自动化操作：
+
+| 脚本 | 功能 | 使用方式 |
+|------|------|---------|
+| `set-identity.sh` / `.cmd` | 设置 git 身份 (ID-VerNe) + 环境变量 | `source scripts/set-identity.sh` / `scripts\set-identity.cmd` |
+| `stage.sh` / `.cmd` | 逐个 add 文件（禁止批量） | `bash scripts/stage.sh <file1> <file2>` / `scripts\stage.cmd <file1>` |
+| `commit.sh` / `.cmd` | 从文件读取 message，检查 Co-Authored-By，自动设身份后 commit | `bash scripts/commit.sh <msg_file>` / `scripts\commit.cmd <msg_file>` |
+
+**注意：** `set-identity.sh` 需要用 `source` 执行（而非 `bash`），因为需要将环境变量导出到当前 shell 进程。
 
 ## 常见差错
 
