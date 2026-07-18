@@ -22,7 +22,7 @@ Reference: [[polyglot/router.py#import_backend]]
 
 ### 语言别名映射
 
-`LANGUAGES` 字典将用户输入的别名（`py`、`js`、`rs`、`kt`、`crates` 等）映射到标准语言名。支持 npm、crates、vcpkg 等生态别名的直接输入。
+`LANGUAGES` 字典将用户输入的别名（`py`、`js`、`ts`、`rs`、`kt`、`crates` 等）映射到标准语言名。支持 npm、crates、vcpkg 等生态别名的直接输入。TypeScript/ts 映射到 javascript 后端（npm 生态）。
 
 Reference: [[polyglot/router.py#LANGUAGES]]
 

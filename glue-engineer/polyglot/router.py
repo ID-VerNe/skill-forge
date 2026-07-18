@@ -26,6 +26,8 @@ LANGUAGES = {
     "js": "javascript",
     "node": "javascript",
     "npm": "javascript",
+    "typescript": "javascript",
+    "ts": "javascript",
     "rust": "rust",
     "rs": "rust",
     "crates": "rust",
