@@ -6,7 +6,6 @@ import time
 from datetime import datetime, timezone
 
 
-# @lat: [[deep#5-Phase Pipeline]]
 def create_workspace(workspace_dir: str):
     """Create the .glue/deep/ directory structure."""
     dirs = [

@@ -26,8 +26,6 @@ LANGUAGES = {
     "js": "javascript",
     "node": "javascript",
     "npm": "javascript",
-    "typescript": "javascript",
-    "ts": "javascript",
     "rust": "rust",
     "rs": "rust",
     "crates": "rust",
@@ -41,12 +39,10 @@ LANGUAGES = {
 }
 
 
-# @lat: [[polyglot-router#Language Alias Mapping]]
 def resolve_language(lang: str) -> str:
     return LANGUAGES.get(lang, lang)
 
 
-# @lat: [[polyglot-router#Dynamic Backend Import]]
 def import_backend(language: str, tool: str):
     """Dynamically import a backend module."""
     path = os.path.join(BACKENDS_DIR, language, f"{tool}.py")

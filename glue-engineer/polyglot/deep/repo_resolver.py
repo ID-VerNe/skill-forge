@@ -6,7 +6,6 @@ import re
 import json
 
 
-# @lat: [[deep#Workspace Structure]]
 def url_to_slug(url: str) -> str:
     """Derive a filesystem-safe slug from a repo URL or local path.
 

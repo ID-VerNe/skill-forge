@@ -87,7 +87,6 @@ class ScopeReport:
         return "\n".join(lines)
 
 
-# @lat: [[glue#MVP Scoper]]
 class MvpScoper:
     """Classifies features/items into P0/P1/P2 tiers.
 

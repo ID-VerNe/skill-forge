@@ -23,7 +23,6 @@ def _load_architecture(workspace_dir: str, slug: str) -> dict:
     return _load_json(os.path.join(workspace_dir, "repos", slug, "architecture.json"))
 
 
-# @lat: [[deep#Report Generation]]
 def generate_draft(workspace_dir: str) -> str:
     """Generate a final-report-draft.md from all available artifacts.
 

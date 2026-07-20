@@ -76,7 +76,6 @@ Key gaps: <brief summary>
 """
 
 
-# @lat: [[deep#Subagent Task Generation]]
 def generate_tasks(workspace_dir: str) -> list:
     """Read session.json and generate .architect.task.md for each repo.
 

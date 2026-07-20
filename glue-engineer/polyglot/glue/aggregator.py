@@ -56,7 +56,6 @@ def _levenshtein_ratio(a: str, b: str) -> float:
     return 1.0 - (distance / max_len) if max_len > 0 else 1.0
 
 
-# @lat: [[glue#Dedup Engine]]
 class DedupEngine:
     """Multi-layer dedup engine.
 
@@ -175,7 +174,6 @@ class DedupEngine:
         self._seen_author_title.clear()
 
 
-# @lat: [[glue#Cross-Language Search]]
 class CrossLangScoutEngine:
     """Runs parallel searches across multiple language ecosystems.
 

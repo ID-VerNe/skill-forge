@@ -179,7 +179,6 @@ def validate_repo_artifacts(workspace_dir: str, slug: str, include_reuse_map: bo
     return results
 
 
-# @lat: [[deep#Artifact Validation]]
 def validate_all(workspace_dir: str, include_reuse_map: bool = False) -> dict:
     """Validate artifacts for all repos in the session.
 
