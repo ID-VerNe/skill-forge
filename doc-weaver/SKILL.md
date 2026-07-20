@@ -1,6 +1,6 @@
 ---
 name: doc-weaver
-version: 1.0.0
+version: 1.1.0
 description: "项目文档编织器。基于lat.md格式规范，自动为项目生成覆盖所有模块的知识图谱文档，并用并行子agent做源码级比对验证。当用户说'写文档'、'补充文档'、'生成项目文档'、'document this project'、'weave docs'时触发。适用于AI-first的多项目管理场景——文档主要供AI agent阅读，而非人类。"
 metadata:
   requires: []
@@ -16,20 +16,26 @@ metadata:
 
 ## 文档格式规范（继承自 lat.md）
 
-项目文档存放在 `lat.md/` 目录下，使用以下规范：
+项目文档存放在 `docs/` 目录下，按类别分目录组织：
 
 ### 目录结构
 
 ```
-lat.md/
-  <module>.md         # 每个模块一个文件
-  <module>/           # 子模块目录（可选）
-    <submodule>.md
-
-  lat.md              # 根索引：所有文档的入口点
-  Project.md          # [Tier 1] 入口文档：一句话描述 + 模块清单
-  Architecture.md     # 架构总览：模块依赖关系、数据流向、技术选型
-  Glossary.md         # 术语表：每个概念在项目中定义且仅定义一次
+docs/
+  index.md                # 根索引：所有文档的入口点
+  project/
+    index.md              # [Tier 1] 入口文档：一句话描述 + 模块清单
+    architecture.md       # 架构总览：模块依赖关系、数据流向、技术选型
+    glossary.md           # 术语表：每个概念在项目中定义且仅定义一次
+  modules/
+    index.md              # 模块索引
+    <module>.md           # [Tier 2] 模块知识文档，每个模块一个文件
+    <module>/             # 子模块目录（可选）
+      index.md
+      <submodule>.md
+  schema/                 # [Tier 3] 结构化数据
+    <module>.schema.json
+  graph.json              # 全模块依赖图
 ```
 
 ### Section ID
@@ -38,7 +44,7 @@ lat.md/
 
 - 第一段：项目根相对路径，**去掉 `.md` 扩展名**
 - 之后每段：各级标题文本，精确链
-- 示例：`lat.md/auth#OAuth Flow#Token Refresh`
+- 示例：`docs/modules/auth#OAuth Flow#Token Refresh`
 - 根标题（h1）在引用时可省略（解析器自动补全）
 
 ### Wiki Link 语法
@@ -63,13 +69,13 @@ lat.md/
 
 ### 目录索引约定
 
-`lat.md/` 下每个子目录必须有一个同名索引文件（如 `lat.md/tests/tests.md`），包含该目录所有文件的 wiki link 清单：
+`docs/` 下每个子目录必须有一个同名索引文件（如 `docs/modules/modules.md` → 改为 `docs/modules/index.md`），包含该目录所有文件的 wiki link 清单：
 
 ```markdown
-# Tests
+# Modules
 
-- [[tests/unit]] — 单元测试规范
-- [[tests/integration]] — 集成测试规范
+- [[modules/auth]] — 鉴权模块
+- [[modules/database]] — 数据访问层
 ```
 
 ---
@@ -92,23 +98,20 @@ lat.md/
 
 ### Phase 1：生成 Tier 1 入口文档
 
-生成 `lat.md/` 根目录下的索引和入口文件：
+生成 `docs/` 目录下的索引和入口文件：
 
-**`lat.md/lat.md`** — 根索引：
+**`docs/index.md`** — 根索引：
 ```markdown
-# lat.md
-
-项目 lat.md/ 目录的入口。以下为所有文档清单：
-
-- [[Project]] — 项目概述与模块清单
-- [[Architecture]] — 架构设计与模块依赖
-- [[Glossary]] — 术语表
-- [[auth]] — 鉴权模块
-- [[api]] — API 路由层
-- [[database]] — 数据访问层
+# docs
+- [[project/index]] — 项目概述与模块清单
+- [[project/architecture]] — 架构设计与模块依赖
+- [[project/glossary]] — 术语表
+- [[modules/auth]] — 鉴权模块
+- [[modules/api]] — API 路由层
+- [[modules/database]] — 数据访问层
 ```
 
-**`lat.md/Project.md`** — 项目入口文档（Tier 1，~1K tokens）：
+**`docs/project/index.md`** — 项目入口文档（Tier 1，~1K tokens）：
 ```markdown
 # Project
 
@@ -117,22 +120,24 @@ lat.md/
 
 ## Modules
 
-- [[auth]] — 用户鉴权，OAuth 2.0，JWT 管理
-- [[api]] — HTTP API 路由与中间件
-- [[database]] — 数据访问层，迁移管理
-- [[worker]] — 后台任务队列处理
-- [[config]] — 配置管理
+- [[modules/auth]] — 用户鉴权，OAuth 2.0，JWT 管理
+- [[modules/api]] — HTTP API 路由与中间件
+- [[modules/database]] — 数据访问层，迁移管理
+- [[modules/worker]] — 后台任务队列处理
+- [[modules/config]] — 配置管理
 
 ## Dependency Graph
 
-依赖关系见 [[Architecture#Module Dependencies]]。
+依赖关系见 [[project/architecture#Module Dependencies]]。
 ```
 
-**`lat.md/Architecture.md`** — 架构总览
+**`docs/project/architecture.md`** — 架构总览
+
+**`docs/project/glossary.md`** — 术语表
 
 ### Phase 2：生成 Tier 2 模块知识文档
 
-对 Phase 0 识别出的**每个模块**，生成一个 markdown 文档：
+对 Phase 0 识别出的**每个模块**，生成一个 markdown 文档到 `docs/modules/` 下：
 
 模板：
 ```markdown
@@ -161,26 +166,25 @@ Reference: [[src/module/file.ts#SymbolName]]
 
 该模块依赖的其他模块和原因：
 
-- [[database]] — 持久化存储用户数据
-- [[config]] — 读取配置参数
+- [[modules/database]] — 持久化存储用户数据
+- [[modules/config]] — 读取配置参数
 
 ## Consumed By
 
 哪些模块使用本模块：
 
-- [[api]] — 通过 service 层调用鉴逻辑
-- [[worker]] — 在后台任务中使用
+- [[modules/api]] — 通过 service 层调用鉴逻辑
+- [[modules/worker]] — 在后台任务中使用
 
 ## Error Conditions
 
-可机器解析的错误码和恢复路径（见 [[module.schema.json]]）
+可机器解析的错误码和恢复路径（见 [[schema/module.schema.json]]）
 ```
 
 **关键规则**：
 - 每个 section 必须有 ≤250 字符的前导段落
 - 涉及其他模块的必须用 `[[wiki link]]`
 - 涉及源码符号的必须用 `[[src/path#symbol]]`
-- 每个文件遵循 directory index 约定
 
 ### Phase 3：生成 Tier 3 结构化数据
 
@@ -225,7 +229,7 @@ Reference: [[src/module/file.ts#SymbolName]]
 
 在源码中添加 `@lat:` 注解。规则：
 
-1. 对 `lat.md/` 中每个描述了代码行为的 leaf section，在对应源码中添加 `// @lat: [[section-id]]`
+1. 对 `docs/modules/` 中每个描述了代码行为的 leaf section，在对应源码中添加 `// @lat: [[section-id]]`
 2. 放在对应的函数/类/测试前一行
 3. 不要重复——每个 section 对应一个注释
 4. 不要在简单 getter/setter 或明显无业务含义的代码上添加
@@ -240,7 +244,7 @@ Reference: [[src/module/file.ts#SymbolName]]
 
 ```
 你是 doc-weaver 验证 agent。
-你的任务：比对 `lat.md/<module>.md` 和源代码，找出所有不一致。
+你的任务：比对 `docs/modules/<module>.md` 和源代码，找出所有不一致。
 
 请做以下检查：
 
@@ -271,7 +275,7 @@ Reference: [[src/module/file.ts#SymbolName]]
     {
       "severity": "error" | "warning",
       "category": "doc_claim_not_in_code" | "code_feature_not_documented" | "wrong_dependency" | "incorrect_error" | "behavior_mismatch" | "broken_symbol_ref",
-      "docLocation": "lat.md/auth#OAuth Flow#Token Refresh",
+      "docLocation": "docs/modules/auth#OAuth Flow#Token Refresh",
       "codeLocation": "src/auth/token.ts:42",
       "description": "文档声明 refreshToken 返回类型为 Token，但源码返回类型为 { accessToken, refreshToken }",
       "suggestion": "更新文档返回类型为 { accessToken: string, refreshToken: string }"
@@ -320,7 +324,7 @@ Reference: [[src/module/file.ts#SymbolName]]
 4. **@lat: 注解不冗余**：一个 leaf section 对应一个 `@lat:` 注解，不重复
 5. **第一次运行覆盖所有模块**：后续运行只处理变更的模块
 6. **Section ID 不可变**：一旦发布，不轻易修改 section ID（wiki link 会断）
-7. **Project.md 是唯一入口**：AI agent 到达项目后首先读 Project.md，决定加载哪些模块文档
+7. **docs/project/index.md 是唯一入口**：AI agent 到达项目后首先读 docs/project/index.md，决定加载哪些模块文档
 8. **永不自动 commit**：文档生成和验证完成后，将结果报告给用户，由用户决定何时、以什么 message 提交。不允许在流程末尾执行 `git add`、`git commit` 或 `git push`
 
 ---
@@ -362,5 +366,5 @@ Reference: [[src/module/file.ts#SymbolName]]
 |------|------|------|
 | Agent 回答"我不确定" | 文档覆盖不足 | 补写该模块的 Tier 2 文档 |
 | Agent 说"以 xxx 库为例"但用了自己的知识 | 缺少使用示例 | 在 Project.md 或 README 中添加最小示例 |
-| Agent 漏掉某个核心模块 | 索引缺失 | 检查 lat.md → Project.md 的 wiki link 链是否完整 |
+| Agent 漏掉某个核心模块 | 索引缺失 | 检查 docs/index.md → docs/project/index.md 的 wiki link 链是否完整 |
 | Agent 错误描述实现方式 | 文档行为描述与源码不一致 | Phase 5 验证未通过，修正文档或代码 |
