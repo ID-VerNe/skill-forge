@@ -36,6 +36,9 @@ LANGUAGES = {
     "cpp": "c_cpp",
     "c_cpp": "c_cpp",
     "vcpkg": "c_cpp",
+    "php": "php",
+    "composer": "php",
+    "packagist": "php",
 }
 
 

@@ -1,7 +1,7 @@
 # polyglot — Multi-Language Glue Engineer Toolkit
 
 Language-specific backends for searching, auditing, analyzing, and installing packages
-across 6 ecosystems: Python, JavaScript/TypeScript, Rust, Java, Kotlin, C/C++.
+across 7 ecosystems: Python, JavaScript/TypeScript, Rust, Java, Kotlin, C/C++, PHP.
 
 ## Quick Start
 ```bash
