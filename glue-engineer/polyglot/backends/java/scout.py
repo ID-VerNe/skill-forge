@@ -19,6 +19,9 @@ try:
 except ImportError:
     requests = None  # type: ignore
 
+from polyglot.common.cache import cache_get, cache_set, cache_get_stale
+from polyglot.common.retry import retry_call
+
 
 SOLR_SEARCH_URL = "https://search.maven.org/solrsearch/select"
 REQUEST_TIMEOUT = 15  # seconds
@@ -26,65 +29,86 @@ REQUEST_TIMEOUT = 15  # seconds
 
 def search(query: str, limit: int = 5) -> dict:
     """Search Maven Central. Returns dict matching SearchOutput schema."""
+    cache_key = f"scout:java:{query}:{limit}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        cached["metadata"]["cache_hit"] = True
+        return cached
+
     start = time.time()
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    output: dict = {
-        "schema": "polyglot-output-v1",
-        "tool": "scout",
-        "language": "java",
-        "query": query,
-        "timestamp": timestamp,
-        "results": [],
-        "errors": [],
-        "metadata": {
-            "duration_ms": 0,
-            "cache_hit": False,
-            "has_more": False,
-        },
-    }
-
     if requests is None:
-        output["errors"].append(
-            "The 'requests' library is not installed. Run: pip install requests"
+        return _error_output(
+            "The 'requests' library is not installed. Run: pip install requests",
+            start, timestamp,
         )
-        output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
-        return output
 
-    try:
+    def _http_get():
         resp = requests.get(
             SOLR_SEARCH_URL,
             params={"q": query, "rows": limit, "wt": "json"},
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.Timeout:
-        output["errors"].append(
-            f"Request to Maven Central timed out after {REQUEST_TIMEOUT}s"
-        )
-        output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
-        return output
-    except requests.exceptions.ConnectionError as exc:
-        output["errors"].append(f"Connection error: {exc}")
-        output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
-        return output
-    except requests.exceptions.RequestException as exc:
-        output["errors"].append(f"HTTP request failed: {exc}")
-        output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
-        return output
-    except ValueError as exc:
-        output["errors"].append(f"Failed to parse JSON response: {exc}")
-        output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
-        return output
+        return resp.json()
 
+    data, attempts, http_error = retry_call(
+        _http_get,
+        max_retries=3,
+        retryable_exceptions=(
+            requests.ConnectionError, requests.Timeout, requests.RequestException,
+        ),
+    )
+
+    if http_error is not None:
+        return _handle_fetch_error(cache_key, query, limit, http_error, start, timestamp)
+
+    return _process_results(cache_key, data, query, limit, start, timestamp)
+
+
+def _error_output(msg: str, start, timestamp) -> dict:
+    return {
+        "schema": "polyglot-output-v1",
+        "tool": "scout",
+        "language": "java",
+        "query": "",
+        "timestamp": timestamp,
+        "results": [],
+        "errors": [msg],
+        "metadata": {"duration_ms": int((time.time() - start) * 1000), "cache_hit": False, "has_more": False},
+    }
+
+
+def _handle_fetch_error(cache_key, query, limit, error, start, timestamp) -> dict:
+    stale = cache_get_stale(cache_key)
+    if stale is not None:
+        stale["metadata"]["cache_hit"] = True
+        return stale
+
+    output = {
+        "schema": "polyglot-output-v1",
+        "tool": "scout",
+        "language": "java",
+        "query": query,
+        "timestamp": timestamp,
+        "results": [],
+        "errors": [str(error)[:200]],
+        "metadata": {},
+    }
+
+    output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
+    cache_set(cache_key, output)
+    return output
+
+
+def _process_results(cache_key, data, query, limit, start, timestamp) -> dict:
     response_body = data.get("response", {})
     docs = response_body.get("docs", [])
     num_found = response_body.get("numFound", 0)
-    output["metadata"]["has_more"] = int(num_found) > len(docs)
-
     now_epoch_ms = int(time.time() * 1000)
 
+    results = []
     for doc in docs:
         artifact_id = doc.get("id", "")
         group_id = doc.get("g", "")
@@ -93,20 +117,17 @@ def search(query: str, limit: int = 5) -> dict:
         version_count = int(doc.get("versionCount", 0) or 0)
         timestamp_ms = doc.get("timestamp", 0) or 0
 
-        # Build the Maven-style coordinate: groupId:artifactId -> groupId/artifactId
         coord_path = artifact_id.replace(":", "/")
         registry_url = (
             f"https://search.maven.org/artifact/{coord_path}/{latest_version}/jar"
         )
 
-        # Recency: timestamp from Solr is epoch in milliseconds
         if timestamp_ms:
             days_since = max(0, (now_epoch_ms - int(timestamp_ms)) / 86_400_000)
             recency = 0.3 if days_since <= 30 else (0.2 if days_since <= 365 else 0.1)
         else:
             recency = 0.1
 
-        # Composite score: version count + recency
         score = min(version_count / 100 * 0.5 + recency * 0.5, 1.0)
 
         last_commit_str = ""
@@ -115,7 +136,7 @@ def search(query: str, limit: int = 5) -> dict:
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(timestamp_ms) / 1000)
             )
 
-        output["results"].append({
+        results.append({
             "name": artifact_id,
             "version": latest_version,
             "description": f"{group_id}:{artifact_name}" if group_id and artifact_name else artifact_id,
@@ -128,11 +149,25 @@ def search(query: str, limit: int = 5) -> dict:
             "score": round(score, 4),
         })
 
-    output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
+    output = {
+        "schema": "polyglot-output-v1",
+        "tool": "scout",
+        "language": "java",
+        "query": query,
+        "timestamp": timestamp,
+        "results": results,
+        "errors": [],
+        "metadata": {
+            "duration_ms": int((time.time() - start) * 1000),
+            "cache_hit": False,
+            "has_more": int(num_found) > len(results),
+        },
+    }
 
-    if not output["results"] and not output["errors"]:
+    if not results:
         output["errors"].append(f"No results found for query '{query}'")
 
+    cache_set(cache_key, output)
     return output
 
 

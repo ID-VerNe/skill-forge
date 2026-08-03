@@ -13,93 +13,106 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import requests
 
+from polyglot.common.cache import cache_get, cache_set, cache_get_stale
+from polyglot.common.retry import retry_call
+
 
 NPM_SEARCH_URL = "https://registry.npmjs.org/-/v1/search"
 
 
 def search(query: str, limit: int = 5) -> dict:
     """Search npm registry. Returns dict matching SearchOutput schema."""
+    cache_key = f"scout:javascript:{query}:{limit}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        cached["metadata"]["cache_hit"] = True
+        return cached
+
     start = time.monotonic()
     errors = []
     results = []
 
-    try:
+    def _http_get():
         resp = requests.get(
             NPM_SEARCH_URL,
             params={"text": query, "size": limit},
             timeout=15,
         )
         resp.raise_for_status()
-        data = resp.json()
+        return resp.json()
 
-        now_float = time.time()
-        for obj in data.get("objects", []):
-            pkg = obj.get("package", {})
-            score_detail = obj.get("score", {}).get("detail", {})
-            flags = obj.get("flags", {})
+    data, attempts, http_error = retry_call(
+        _http_get,
+        max_retries=3,
+        retryable_exceptions=(requests.ConnectionError, requests.Timeout, requests.RequestException),
+    )
 
-            name = pkg.get("name", "")
-            version = pkg.get("version", "")
-            description = pkg.get("description", "")
-            registry_url = (pkg.get("links") or {}).get("npm", "")
-            repo_url = (pkg.get("links") or {}).get("repository", "")
-            date_str = pkg.get("date", "")
+    if http_error is None:
+        try:
+            for obj in data.get("objects", []):
+                pkg = obj.get("package", {})
+                score_detail = obj.get("score", {}).get("detail", {})
+                flags = obj.get("flags", {})
 
-            # ── stars ──
-            stars = flags.get("unstable", False) if isinstance(flags, dict) else False
-            # npm search flags don't directly give star count;
-            # fall back to score detail field for a rough proxy
-            stars = int(
-                score_detail.get("popularity", 0) * 10000
-                if score_detail
-                else 0
-            )
+                name = pkg.get("name", "")
+                version = pkg.get("version", "")
+                description = pkg.get("description", "")
+                registry_url = (pkg.get("links") or {}).get("npm", "")
+                repo_url = (pkg.get("links") or {}).get("repository", "")
+                date_str = pkg.get("date", "")
 
-            if score_detail:
-                downloads = int(score_detail.get("downloads", 0))
-            else:
-                downloads = 0
+                # ── stars ──
+                stars = flags.get("unstable", False) if isinstance(flags, dict) else False
+                stars = int(
+                    score_detail.get("popularity", 0) * 10000
+                    if score_detail
+                    else 0
+                )
 
-            # ── downloads_ratio ──
-            downloads_ratio = min(downloads / 1_000_000, 1.0)
+                if score_detail:
+                    downloads = int(score_detail.get("downloads", 0))
+                else:
+                    downloads = 0
 
-            # ── recency ──
-            days_since = _days_since(date_str) if date_str else 999
-            if days_since <= 30:
-                recency = 0.3
-            elif days_since <= 365:
-                recency = 0.2
-            else:
-                recency = 0.1
+                # ── downloads_ratio ──
+                downloads_ratio = min(downloads / 1_000_000, 1.0)
 
-            # ── composite score ──
-            score = min(stars / 10000 * 0.4 + downloads_ratio * 0.3 + recency * 0.3, 1.0)
+                # ── recency ──
+                days_since = _days_since(date_str) if date_str else 999
+                if days_since <= 30:
+                    recency = 0.3
+                elif days_since <= 365:
+                    recency = 0.2
+                else:
+                    recency = 0.1
 
-            results.append({
-                "name": name,
-                "version": version,
-                "description": description,
-                "registry_url": registry_url,
-                "stars": stars,
-                "downloads": downloads,
-                "last_commit": date_str,
-                "license_name": pkg.get("license", ""),
-                "dependencies": [],
-                "score": round(score, 4),
-            })
+                # ── composite score ──
+                score = min(stars / 10000 * 0.4 + downloads_ratio * 0.3 + recency * 0.3, 1.0)
 
-        has_more = len(results) >= limit
+                results.append({
+                    "name": name,
+                    "version": version,
+                    "description": description,
+                    "registry_url": registry_url,
+                    "stars": stars,
+                    "downloads": downloads,
+                    "last_commit": date_str,
+                    "license_name": pkg.get("license", ""),
+                    "dependencies": [],
+                    "score": round(score, 4),
+                })
 
-    except requests.RequestException as e:
-        errors.append(str(e))
-        has_more = False
-    except (KeyError, ValueError, TypeError) as e:
-        errors.append(f"Parse error: {e}")
+            has_more = len(results) >= limit
+        except (KeyError, ValueError, TypeError) as e:
+            errors.append(f"Parse error: {e}")
+            has_more = False
+    else:
+        errors.append(str(http_error)[:200])
         has_more = False
 
     duration_ms = int((time.monotonic() - start) * 1000)
 
-    return {
+    result = {
         "schema": "polyglot-output-v1",
         "tool": "scout",
         "language": "javascript",
@@ -113,6 +126,20 @@ def search(query: str, limit: int = 5) -> dict:
             "has_more": has_more,
         },
     }
+
+    if http_error is None:
+        cache_set(cache_key, result)
+        return result
+
+    # Stale fallback
+    stale = cache_get_stale(cache_key)
+    if stale is not None:
+        stale["metadata"]["cache_hit"] = True
+        return stale
+
+    # Cache the error result so subsequent calls don't re-hit the network
+    cache_set(cache_key, result)
+    return result
 
 
 def _days_since(iso_date: str) -> int:

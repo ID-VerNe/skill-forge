@@ -21,6 +21,9 @@ try:
 except ImportError:
     requests = None  # type: ignore
 
+from polyglot.common.cache import cache_get, cache_set, cache_get_stale
+from polyglot.common.retry import retry_call
+
 
 VCPKG_CODE_SEARCH_URL = "https://api.github.com/search/code"
 VCPKG_RAW_BASE = "https://raw.githubusercontent.com/microsoft/vcpkg/master/ports"
@@ -30,6 +33,12 @@ USER_AGENT = "polyglot/1.0"
 
 def search(query: str, limit: int = 5) -> dict:
     """Search vcpkg ports. Returns dict matching SearchOutput schema."""
+    cache_key = f"scout:c_cpp:{query}:{limit}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        cached["metadata"]["cache_hit"] = True
+        return cached
+
     start = time.time()
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -55,7 +64,7 @@ def search(query: str, limit: int = 5) -> dict:
         output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
         return output
 
-    try:
+    def _http_get():
         resp = requests.get(
             VCPKG_CODE_SEARCH_URL,
             params={
@@ -67,114 +76,121 @@ def search(query: str, limit: int = 5) -> dict:
             },
             timeout=REQUEST_TIMEOUT,
         )
-
         if resp.status_code == 403 and "rate limit" in resp.text.lower():
-            output["errors"].append(
-                "GitHub API rate limited. Returning empty results."
-            )
-            output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
-            return output
-
+            # Rate limit — not a transient error, no retry will help.
+            # Signal via a special sentinel rather than raising, because
+            # retry_call would otherwise keep retrying a RuntimeError.
+            return {"_rate_limited": True}
         resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.Timeout:
-        output["errors"].append(
-            f"Request to GitHub API timed out after {REQUEST_TIMEOUT}s"
-        )
+        return resp.json()
+
+    data, attempts, http_error = retry_call(
+        _http_get,
+        max_retries=2,  # fewer retries — GitHub rate limit won't clear quickly
+        retryable_exceptions=(
+            requests.ConnectionError, requests.Timeout, requests.RequestException,
+        ),
+    )
+
+    # Check for rate-limit sentinel
+    if isinstance(data, dict) and data.get("_rate_limited"):
+        output["errors"].append("GitHub API rate limited. Returning empty results.")
+        stale = cache_get_stale(cache_key)
+        if stale is not None:
+            stale["metadata"]["cache_hit"] = True
+            return stale
+        cache_set(cache_key, output)
         output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
         return output
-    except requests.exceptions.ConnectionError as exc:
-        output["errors"].append(f"Connection error: {exc}")
+
+    if http_error is not None:
+        output["errors"].append(str(http_error)[:200])
+        stale = cache_get_stale(cache_key)
+        if stale is not None:
+            stale["metadata"]["cache_hit"] = True
+            return stale
+        cache_set(cache_key, output)
         output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
         return output
-    except requests.exceptions.RequestException as exc:
-        output["errors"].append(f"HTTP request failed: {exc}")
-        output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
-        return output
-    except ValueError as exc:
-        output["errors"].append(f"Failed to parse JSON response: {exc}")
-        output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
-        return output
 
-    items = data.get("items", [])
-    total_count = data.get("total_count", 0)
+    try:
+        items = data.get("items", [])
+        total_count = data.get("total_count", 0)
 
-    # Deduplicate by port directory name
-    seen_ports: set = set()
-    port_results: list = []
-    version_map: dict = {}
+        seen_ports: set = set()
+        port_results: list = []
+        version_map: dict = {}
 
-    for item in items:
-        path: str = item.get("path", "")
-        # Extract port directory name from path like "ports/<port-name>/..."
-        match = re.match(r"^ports/([^/]+)/", path)
-        if not match:
-            continue
-        port_name = match.group(1)
-        if port_name in seen_ports:
-            continue
-        seen_ports.add(port_name)
+        for item in items:
+            path: str = item.get("path", "")
+            match = re.match(r"^ports/([^/]+)/", path)
+            if not match:
+                continue
+            port_name = match.group(1)
+            if port_name in seen_ports:
+                continue
+            seen_ports.add(port_name)
 
-        html_url = item.get("html_url", "")
-        # Rewrite to the port directory URL on GitHub
-        port_url = f"https://github.com/microsoft/vcpkg/tree/master/ports/{port_name}"
+            port_url = f"https://github.com/microsoft/vcpkg/tree/master/ports/{port_name}"
 
-        # Try to fetch vcpkg.json for version info (non-blocking if it fails)
-        version = ""
-        if port_name not in version_map:
-            try:
-                vcpkg_resp = requests.get(
-                    f"{VCPKG_RAW_BASE}/{port_name}/vcpkg.json",
-                    headers={"User-Agent": USER_AGENT},
-                    timeout=5,
-                )
-                if vcpkg_resp.status_code == 200:
-                    vcpkg_data = vcpkg_resp.json()
-                    version = vcpkg_data.get("version", "")
-                    if not version:
-                        version = vcpkg_data.get("version-string", "")
-            except requests.RequestException:
-                # Fallback: try CONTROL file format (older vcpkg ports)
+            version = ""
+            if port_name not in version_map:
                 try:
-                    ctrl_resp = requests.get(
-                        f"{VCPKG_RAW_BASE}/{port_name}/CONTROL",
+                    vcpkg_resp = requests.get(
+                        f"{VCPKG_RAW_BASE}/{port_name}/vcpkg.json",
                         headers={"User-Agent": USER_AGENT},
                         timeout=5,
                     )
-                    if ctrl_resp.status_code == 200:
-                        for line in ctrl_resp.text.splitlines():
-                            if line.startswith("Version:"):
-                                version = line.split(":", 1)[1].strip()
-                                break
+                    if vcpkg_resp.status_code == 200:
+                        vcpkg_data = vcpkg_resp.json()
+                        version = vcpkg_data.get("version", "")
+                        if not version:
+                            version = vcpkg_data.get("version-string", "")
                 except requests.RequestException:
-                    pass
-            version_map[port_name] = version
+                    try:
+                        ctrl_resp = requests.get(
+                            f"{VCPKG_RAW_BASE}/{port_name}/CONTROL",
+                            headers={"User-Agent": USER_AGENT},
+                            timeout=5,
+                        )
+                        if ctrl_resp.status_code == 200:
+                            for line in ctrl_resp.text.splitlines():
+                                if line.startswith("Version:"):
+                                    version = line.split(":", 1)[1].strip()
+                                    break
+                    except requests.RequestException:
+                        pass
+                version_map[port_name] = version
 
-        version = version_map.get(port_name, "")
+            version = version_map.get(port_name, "")
 
-        port_results.append({
-            "name": port_name,
-            "version": version,
-            "description": "",
-            "registry_url": port_url,
-            "stars": 0,
-            "downloads": 0,
-            "last_commit": "",
-            "license_name": "",
-            "dependencies": [],
-            "score": 0.5,  # neutral default
-        })
+            port_results.append({
+                "name": port_name,
+                "version": version,
+                "description": "",
+                "registry_url": port_url,
+                "stars": 0,
+                "downloads": 0,
+                "last_commit": "",
+                "license_name": "",
+                "dependencies": [],
+                "score": 0.5,
+            })
 
-        if len(port_results) >= limit:
-            break
+            if len(port_results) >= limit:
+                break
 
-    output["results"] = port_results
-    output["metadata"]["has_more"] = int(total_count) > len(port_results)
+        output["results"] = port_results
+        output["metadata"]["has_more"] = int(total_count) > len(port_results)
+    except (KeyError, ValueError, TypeError) as exc:
+        output["errors"].append(f"Parse error: {exc}")
+
     output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
 
     if not output["results"] and not output["errors"]:
         output["errors"].append(f"No results found for query '{query}'")
 
+    cache_set(cache_key, output)
     return output
 
 

@@ -13,72 +13,82 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import requests
 
+from polyglot.common.cache import cache_get, cache_set, cache_get_stale
+from polyglot.common.retry import retry_call
+
 
 PACKAGIST_SEARCH_URL = "https://packagist.org/search.json"
 
 
 def search(query: str, limit: int = 5) -> dict:
     """Search Packagist registry. Returns dict matching SearchOutput schema."""
+    cache_key = f"scout:php:{query}:{limit}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        cached["metadata"]["cache_hit"] = True
+        return cached
+
     start = time.monotonic()
     errors = []
     results = []
 
-    try:
+    def _http_get():
         resp = requests.get(
             PACKAGIST_SEARCH_URL,
             params={"q": query, "per_page": limit},
             timeout=15,
         )
         resp.raise_for_status()
-        data = resp.json()
+        return resp.json()
 
-        for pkg in data.get("results", []):
-            name = pkg.get("name", "")
-            description = pkg.get("description", "")
-            url = pkg.get("url", "")
-            repo_url = _extract_repo_url(pkg)
+    data, attempts, http_error = retry_call(
+        _http_get,
+        max_retries=3,
+        retryable_exceptions=(requests.ConnectionError, requests.Timeout, requests.RequestException),
+    )
 
-            # Parse vendor/package name
-            if "/" in name:
-                vendor, package = name.split("/", 1)
-            else:
-                vendor, package = "", name
+    if http_error is None:
+        try:
+            for pkg in data.get("results", []):
+                name = pkg.get("name", "")
+                description = pkg.get("description", "")
+                url = pkg.get("url", "")
+                repo_url = _extract_repo_url(pkg)
 
-            # ── stars / favers ──
-            stars = pkg.get("favers", 0) or 0
+                if "/" in name:
+                    vendor, package = name.split("/", 1)
+                else:
+                    vendor, package = "", name
 
-            # ── downloads ──
-            downloads = pkg.get("downloads", 0) or 0
+                stars = pkg.get("favers", 0) or 0
+                downloads = pkg.get("downloads", 0) or 0
+                abandoned = pkg.get("abandoned", False)
+                date_str = ""
 
-            # ── recency from abandoned flag ──
-            abandoned = pkg.get("abandoned", False)
-            date_str = ""
+                results.append({
+                    "name": name,
+                    "version": "",
+                    "description": description,
+                    "registry_url": url,
+                    "stars": stars,
+                    "downloads": downloads,
+                    "last_commit": date_str,
+                    "license_name": pkg.get("license", ""),
+                    "dependencies": [],
+                    "score": _compute_score(stars, downloads, abandoned),
+                })
 
-            results.append({
-                "name": name,
-                "version": "",  # Packagist search results don't include version
-                "description": description,
-                "registry_url": url,
-                "stars": stars,
-                "downloads": downloads,
-                "last_commit": date_str,
-                "license_name": pkg.get("license", ""),
-                "dependencies": [],
-                "score": _compute_score(stars, downloads, abandoned),
-            })
-
-        has_more = len(results) >= limit
-
-    except requests.RequestException as e:
-        errors.append(str(e))
-        has_more = False
-    except (KeyError, ValueError, TypeError) as e:
-        errors.append(f"Parse error: {e}")
+            has_more = len(results) >= limit
+        except (KeyError, ValueError, TypeError) as e:
+            errors.append(f"Parse error: {e}")
+            has_more = False
+    else:
+        errors.append(str(http_error)[:200])
         has_more = False
 
     duration_ms = int((time.monotonic() - start) * 1000)
 
-    return {
+    result = {
         "schema": "polyglot-output-v1",
         "tool": "scout",
         "language": "php",
@@ -93,12 +103,24 @@ def search(query: str, limit: int = 5) -> dict:
         },
     }
 
+    if http_error is None:
+        cache_set(cache_key, result)
+        return result
+
+    stale = cache_get_stale(cache_key)
+    if stale is not None:
+        stale["metadata"]["cache_hit"] = True
+        return stale
+
+    # Cache the error result so subsequent calls don't re-hit the network
+    cache_set(cache_key, result)
+    return result
+
 
 def _extract_repo_url(pkg: dict) -> str:
     """Extract repository URL from Packagist search result."""
     url = pkg.get("repository", "") or ""
     if url.startswith("git@"):
-        # Convert git@github.com:vendor/package.git → https://github.com/vendor/package
         url = url.replace(":", "/").replace("git@", "https://").replace(".git", "")
     return url
 

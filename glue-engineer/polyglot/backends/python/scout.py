@@ -7,20 +7,23 @@ Returns structured search results following the unified polyglot schema.
 
 import json
 import os
+import random
 import re
 import sys
 import time
 import traceback
 
-# Ensure project root is importable so "from common.schema import ..." works
-_project_root = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..")
+# Ensure the polyglot package root is on sys.path so "from common.X import Y" works
+_polyglot_root = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
 )
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
+if _polyglot_root not in sys.path:
+    sys.path.insert(0, _polyglot_root)
 
 import requests
 from common.schema import compute_score, now_iso
+from common.cache import cache_get, cache_set, cache_get_stale
+from common.retry import retry_call
 
 # Fix GBK encoding crash on Chinese Windows (emoji/Unicode in terminal output)
 try:
@@ -36,6 +39,16 @@ _BROWSER_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
+}
+
+# Alternate User-Agent for retry-after-CF
+_ALT_HEADERS = {
+    **_BROWSER_HEADERS,
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/17.0 Safari/605.1.15"
+    ),
 }
 
 
@@ -114,6 +127,7 @@ def _fetch_html_search(query: str, limit: int) -> list[dict]:
     """Broad PyPI search via HTML scraping.
 
     Returns a list of raw package names found (for further detail lookup).
+    On Cloudflare detection, retries once with an alternate User-Agent.
     """
     names = []
     try:
@@ -124,9 +138,14 @@ def _fetch_html_search(query: str, limit: int) -> list[dict]:
         if resp.status_code != 200:
             return names
 
-        # If Cloudflare is blocking, bail out
+        # If Cloudflare is blocking, retry once with alternate User-Agent
         if "cf-browser-verification" in resp.text:
-            return names
+            # MUTANT: removed ALT_HEADERS retry
+            pass
+            if resp.status_code != 200:
+                return names
+            if "cf-browser-verification" in resp.text:
+                return names
 
         snippets = resp.text.split('class="package-snippet"')[1:]
         for snippet in snippets[:limit]:
@@ -214,30 +233,48 @@ def search(query: str, limit: int = 5) -> dict:
 
     Returns a plain dict (not a dataclass instance) matching SearchOutput.
     """
+    cache_key = f"scout:python:{query}:{limit}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        cached["metadata"]["cache_hit"] = True
+        return cached
+
     start = time.time()
     errors: list[str] = []
     results: list[dict] = []
 
-    # ── 1. Exact match via JSON API ──
-    try:
+    # ── 1. Exact match via JSON API (with retry) ──
+    def _fetch_exact_with_retry():
         raw = _fetch_exact(query)
-        if raw:
-            info = raw.get("info", {})
-            result = _build_result(
-                raw,
-                name=info.get("name", query),
-                version=info.get("version", ""),
-                description=info.get("summary", ""),
-            )
-            results.append(result)
-    except requests.exceptions.ConnectionError as e:
-        errors.append(f"ConnectionError during exact lookup: {e}")
-    except requests.exceptions.Timeout as e:
-        errors.append(f"Timeout during exact lookup: {e}")
-    except Exception as e:
-        errors.append(f"Exact-lookup error: {e}")
+        if raw is None:
+            raise RuntimeError(f"Exact lookup failed for '{query}'")
+        return raw
 
-    # ── 2. Fallback / broad search via HTML ──
+    try:
+        raw, attempts, exact_error = retry_call(
+            _fetch_exact_with_retry,
+            max_retries=2,
+            retryable_exceptions=(requests.ConnectionError, requests.Timeout),
+        )
+    except RuntimeError as e:
+        # RuntimeError is raised when _fetch_exact returns None (404/not-found).
+        # It's not retryable, so we catch it here and treat as a normal error.
+        raw = None
+        exact_error = e
+
+    if exact_error is None:
+        info = raw.get("info", {})
+        result = _build_result(
+            raw,
+            name=info.get("name", query),
+            version=info.get("version", ""),
+            description=info.get("summary", ""),
+        )
+        results.append(result)
+    else:
+        errors.append(f"Exact-lookup error: {str(exact_error)[:200]}")
+
+    # ── 2. Fallback / broad search via HTML (only if we need more results) ──
     if len(results) < limit:
         try:
             snippets = _fetch_html_search(query, limit)
@@ -267,7 +304,7 @@ def search(query: str, limit: int = 5) -> dict:
 
     duration_ms = int((time.time() - start) * 1000)
 
-    return {
+    output = {
         "schema": "polyglot-output-v1",
         "tool": "scout",
         "language": "python",
@@ -281,6 +318,10 @@ def search(query: str, limit: int = 5) -> dict:
             "has_more": len(results) > limit,
         },
     }
+
+    # Always cache the result (even empty) to avoid repeated network requests
+    cache_set(cache_key, output)
+    return output
 
 
 # ───── CLI Entry Point ─────
