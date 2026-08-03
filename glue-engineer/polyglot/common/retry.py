@@ -9,6 +9,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
+# @lat: [[common#Key Concepts#Retry]]
 def retry_call(
     fn,
     max_retries=3,

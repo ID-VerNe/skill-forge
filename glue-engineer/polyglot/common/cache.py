@@ -71,6 +71,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 # ───── Public API ─────
 
 
+# @lat: [[common#Key Concepts#Cache]]
 def cache_get(key: str) -> dict | None:
     """Return cached value or None if missing/expired."""
     try:
@@ -86,6 +87,7 @@ def cache_get(key: str) -> dict | None:
     return None
 
 
+# @lat: [[common#Key Concepts#Cache]]
 def cache_get_stale(key: str) -> dict | None:
     """Return cached value even if expired, or None if never cached.
 
@@ -105,6 +107,7 @@ def cache_get_stale(key: str) -> dict | None:
     return None
 
 
+# @lat: [[common#Key Concepts#Cache]]
 def cache_set(key: str, data: dict, ttl_seconds: int = 86400) -> None:
     """Cache data with TTL (default 24h)."""
     try:
@@ -130,6 +133,7 @@ def cache_set(key: str, data: dict, ttl_seconds: int = 86400) -> None:
         pass
 
 
+# @lat: [[common#Key Concepts#Cache]]
 def cache_clean(older_than_seconds: int = 86400 * 7) -> int:
     """Remove expired entries and entries older than ``older_than_seconds``.
 
@@ -148,6 +152,7 @@ def cache_clean(older_than_seconds: int = 86400 * 7) -> int:
         return 0
 
 
+# @lat: [[common#Key Concepts#Cache]]
 def cache_stats() -> dict:
     """Return cache statistics: total entries, expired entries, db size."""
     try:

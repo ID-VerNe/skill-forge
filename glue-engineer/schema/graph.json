@@ -1,0 +1,21 @@
+{
+  "modules": [
+    { "name": "polyglot", "dependsOn": ["deep", "glue", "backends", "common", "vtree"], "usedBy": ["scripts", "tests", "evals"] },
+    { "name": "deep", "dependsOn": ["common"], "usedBy": ["polyglot", "agents"] },
+    { "name": "glue", "dependsOn": ["common", "backends"], "usedBy": ["polyglot"] },
+    { "name": "backends", "dependsOn": ["common"], "usedBy": ["polyglot", "glue", "tests"] },
+    { "name": "common", "dependsOn": [], "usedBy": ["polyglot", "deep", "glue", "backends", "vtree"] },
+    { "name": "vtree", "dependsOn": ["common"], "usedBy": ["polyglot"] },
+    { "name": "scripts", "dependsOn": ["polyglot"], "usedBy": [] },
+    { "name": "agents", "dependsOn": ["deep"], "usedBy": ["evals"] },
+    { "name": "evals", "dependsOn": ["polyglot", "agents"], "usedBy": [] },
+    { "name": "tests", "dependsOn": ["backends", "deep", "glue"], "usedBy": [] }
+  ],
+  "entryPoints": ["polyglot/__main__.py", "polyglot/router.py"],
+  "techStack": {
+    "language": "Python",
+    "runtime": "Python 3.10+",
+    "databases": ["SQLite"],
+    "keyLibraries": ["requests"]
+  }
+}
