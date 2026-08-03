@@ -39,6 +39,10 @@ LANGUAGES = {
     "php": "php",
     "composer": "php",
     "packagist": "php",
+    "go": "go",
+    "golang": "go",
+    "golang.org": "go",
+    "pkg.go.dev": "go",
 }
 
 
