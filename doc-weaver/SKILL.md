@@ -1,51 +1,82 @@
 ---
 name: doc-weaver
-version: 1.1.0
-description: "项目文档编织器。基于lat.md格式规范，自动为项目生成覆盖所有模块的知识图谱文档，并用并行子agent做源码级比对验证。当用户说'写文档'、'补充文档'、'生成项目文档'、'document this project'、'weave docs'时触发。适用于AI-first的多项目管理场景——文档主要供AI agent阅读，而非人类。"
+version: 2.1.0
+description: "项目文档编织器。基于lat.md格式规范，使用lat.md工具链，自动为项目生成覆盖所有模块的知识图谱文档到docs/目录，并用lat check做验证。当用户说'写文档'、'补充文档'、'生成项目文档'、'document this project'、'weave docs'时触发。文档主要供AI agent阅读，而非人类。"
 metadata:
-  requires: []
+  requires: [lat.md]
 ---
 
-# doc-weaver v1 — AI-First 项目文档编织器
+# doc-weaver v2.1 — 基于 lat.md 工具链的文档编织器
 
-> **核心理念**: 不是用 lat.md 的工具链，而是用 Claude Code 的 agent 能力，实现他的**格式规范**和**验证逻辑**。
->
-> 文档由 AI agent 生成，由 AI agent 维护，由 AI agent 验证。人类只需在关键决策点给出设计意图。
+> **核心理念**: 使用 lat.md 的工具链，写文档到 `docs/` 目录，通过目录 junction/symlink 让 `lat.md/` → `docs/`，使 `lat check` 能直接验证文档。
 
----
+## 前置条件
+
+目标项目必须已安装 `lat.md` CLI 并创建了 `lat.md/` → `docs/` 的目录 junction：
+
+```bash
+npm install -g lat.md
+# 在项目根目录：
+mkdir -p docs
+lat init                     # 创建 lat.md/ 目录
+mv lat.md/*.md docs/         # 把初始文件移到 docs/
+rmdir lat.md                 # 删除原目录
+# Windows: 创建 junction
+cmd.exe /c "mklink /J lat.md docs"
+# Linux/macOS: 创建 symlink
+ln -s docs lat.md
+```
 
 ## 文档格式规范（继承自 lat.md）
 
-项目文档存放在 `docs/` 目录下，按类别分目录组织：
+项目文档存放在 `docs/` 目录下，遵循 lat.md 的格式规范。
 
 ### 目录结构
 
 ```
 docs/
-  index.md                # 根索引：所有文档的入口点
-  project/
-    index.md              # [Tier 1] 入口文档：一句话描述 + 模块清单
-    architecture.md       # 架构总览：模块依赖关系、数据流向、技术选型
-    glossary.md           # 术语表：每个概念在项目中定义且仅定义一次
-  modules/
-    index.md              # 模块索引
-    <module>.md           # [Tier 2] 模块知识文档，每个模块一个文件
-    <module>/             # 子模块目录（可选）
-      index.md
-      <submodule>.md
-  schema/                 # [Tier 3] 结构化数据
-    <module>.schema.json
-  graph.json              # 全模块依赖图
+  lat.md                  # 根索引：所有文档的入口点
+  Project.md              # [Tier 1] 入口文档：一句话描述 + 模块清单
+  Architecture.md         # 架构总览：模块依赖关系、数据流向、技术选型
+  Glossary.md             # 术语表：每个概念在项目中定义且仅定义一次
+  <module>.md             # [Tier 2] 模块知识文档，每个模块一个文件
+  <module>/               # 子模块目录（可选）
+    <submodule>.md
+schema/                   # [Tier 3] 结构化数据（项目根目录，不是 docs/ 下）
+  graph.json              # 全模块依赖图（必需）
+  <module>.schema.json    # 模块结构化 schema（可选）
 ```
+
+> **注意**: `schema/` 目录放在项目根目录，而非 `docs/` 下。因为 `lat check` 只接受 `lat.md/` 目录下的 `.md` 文件，JSON 文件放在 `docs/schema/` 会导致验证错误。
 
 ### Section ID
 
 每个 section 拥有层次化 ID：`file#Heading#Subheading#Subsubheading`
 
 - 第一段：项目根相对路径，**去掉 `.md` 扩展名**
-- 之后每段：各级标题文本，精确链
-- 示例：`docs/modules/auth#OAuth Flow#Token Refresh`
+- 示例：`docs/backends#Supported Languages#Python`
 - 根标题（h1）在引用时可省略（解析器自动补全）
+- 源码引用：`[[lib.rs#GpuMode]]`（项目相对路径，不是 `src/` 前缀）
+
+### Wiki Link 语法
+
+```
+// @lat: [[lib.rs#GpuMode]]     // TypeScript, JavaScript, Rust, Go, C
+# @lat: [[lib.rs#GpuMode]]      // Python
+```
+
+`@lat` 注解的 section ID 使用**短格式**：`[[file.rs#SymbolName]]` 或 `[[file#Heading#Subheading]]`，不要使用完整层级路径 `[[lat.md/file#h1#h2#h3]]`。
+
+### 前文规则
+
+每个 section **必须**有前导段落：紧跟在 heading 后的第一段文字，**≤250 字符**（不计 wiki link 语法），保证搜索摘要的简洁性。
+
+**前导段落必须是有意义的描述，而非通用模板**。以下写法是禁止的：
+- ❌ `"Key concepts overview: ..."` — 无信息量
+- ❌ `"Dependencies overview: ..."` — 无信息量
+- ❌ `"Error conditions overview: ..."` — 无信息量
+
+✅ 正确写法：`"Core types shared across both binaries — GpuMode, Config, AppOverride, and Error — used by the CLI and GUI entry points."`
 
 ### Wiki Link 语法
 
@@ -54,43 +85,53 @@ docs/
 | `[[target]]` | 链接到 `target.md` 文件的根 section |
 | `[[target#Heading]]` | 链接到 `target.md` 中的特定 heading |
 | `[[target\|alias]]` | 带别名的链接 |
-| `[[src/auth.ts#validateToken]]` | 链接到源码符号 |
+| `[[lib.rs#GpuMode]]` | 链接到源码符号（项目相对路径，无 `src/` 前缀） |
+
+**关键规则**：文档中的源码引用格式为 `[[path/to/file.rs#SymbolName]]`，**绝对禁止**使用 `[[src/path/to/file.rs#SymbolName]]`（`src/` 前缀会导致 `lat check` 报 `file not found` 错误）。
 
 ### 源码注解
 
 ```
-// @lat: [[section-id]]     // TypeScript, JavaScript, Rust, Go, C
-# @lat: [[section-id]]      // Python
+// @lat: [[lib.rs#GpuMode]]     // TypeScript, JavaScript, Rust, Go, C
+# @lat: [[lib.rs#GpuMode]]      // Python
 ```
 
-### 前文规则
-
-每个 section **必须**有前导段落：紧跟在 heading 后的第一段文字，**≤250 字符**（不计 wiki link 语法），保证搜索摘要的简洁性。
-
-### 目录索引约定
-
-`docs/` 下每个子目录必须有一个同名索引文件（如 `docs/modules/modules.md` → 改为 `docs/modules/index.md`），包含该目录所有文件的 wiki link 清单：
-
-```markdown
-# Modules
-
-- [[modules/auth]] — 鉴权模块
-- [[modules/database]] — 数据访问层
-```
+`@lat` 注解的 section ID 使用**短格式**：`[[file.rs#SymbolName]]` 或 `[[file#Heading#Subheading]]`，不要使用完整层级路径 `[[lat.md/file#h1#h2#h3]]`。
 
 ---
 
 ## 核心工作流
 
-整个流程分为 5 个阶段，按顺序执行。
+整个流程分为 5 个阶段，按顺序执行。**Orchestrator agent 必须为每个 Phase 派出独立的子 agent 执行**，而非自己直接写文件。
 
-### Phase 0：项目扫描（项目级上下文收集）
+### 架构总览
+
+```
+你（主 agent）
+  └── Orchestrator（子 agent）
+       ├── Phase 0: 自己扫描项目
+       ├── Phase 1: 子 agent → 写 Tier 1 文档
+       │   └── 完成后跑 lat check → 不通过则修复重试
+       ├── Phase 2: 并行子 agent（每个模块一个）
+       │   ├── agent → <module>.md
+       │   ├── agent → <module>.md
+       │   └── ...
+       │   └── 完成后跑 lat check → 不通过则修复重试
+       ├── Phase 3: 子 agent → 生成结构化数据
+       │   └── 完成后跑 lat check → 不通过则修复重试
+       ├── Phase 4: 子 agent → 添加 @lat 注解
+       │   └── 完成后跑 lat check → 不通过则修复重试
+       └── Phase 5: 子 agent → 最终验证
+            └── 跑 lat check → 修复所有错误 → 报告结果
+```
+
+### Phase 0：项目扫描（Orchestrator 自己执行）
 
 在开始写任何文档之前，**先扫描整个项目**收集上下文：
 
 1. 读取 `package.json` / `Cargo.toml` / `pyproject.toml` / `go.mod` 获取项目元数据和技术栈
 2. 读取 `README.md` / `CLAUDE.md` 获取现有项目描述
-3. 扫描 `src/` 或源码根目录，识别所有顶级模块/包
+3. 扫描源码根目录，识别所有顶级模块/包
 4. 对每个模块，快速扫描其 exports、关键 types/interfaces、外部依赖
 5. 识别 entry points（main、HTTP handlers、CLI commands）
 
@@ -98,20 +139,20 @@ docs/
 
 ### Phase 1：生成 Tier 1 入口文档
 
-生成 `docs/` 目录下的索引和入口文件：
+**派出一个子 agent**，生成 `docs/` 目录下的索引和入口文件：
 
-**`docs/index.md`** — 根索引：
+**`docs/lat.md`** — 根索引：
 ```markdown
 # docs
-- [[project/index]] — 项目概述与模块清单
-- [[project/architecture]] — 架构设计与模块依赖
-- [[project/glossary]] — 术语表
-- [[modules/auth]] — 鉴权模块
-- [[modules/api]] — API 路由层
-- [[modules/database]] — 数据访问层
+
+- [[Project]] — 项目概述与模块清单
+- [[Architecture]] — 架构设计与模块依赖
+- [[Glossary]] — 术语表
+- [[auth]] — 鉴权模块
+- [[api]] — API 路由层
 ```
 
-**`docs/project/index.md`** — 项目入口文档（Tier 1，~1K tokens）：
+**`docs/Project.md`** — 项目入口文档（Tier 1，~1K tokens）：
 ```markdown
 # Project
 
@@ -120,100 +161,94 @@ docs/
 
 ## Modules
 
-- [[modules/auth]] — 用户鉴权，OAuth 2.0，JWT 管理
-- [[modules/api]] — HTTP API 路由与中间件
-- [[modules/database]] — 数据访问层，迁移管理
-- [[modules/worker]] — 后台任务队列处理
-- [[modules/config]] — 配置管理
+- [[auth]] — 用户鉴权，OAuth 2.0，JWT 管理
+- [[api]] — HTTP API 路由与中间件
 
 ## Dependency Graph
 
-依赖关系见 [[project/architecture#Module Dependencies]]。
+依赖关系见 [[Architecture#Module Dependencies]]。
 ```
 
-**`docs/project/architecture.md`** — 架构总览
+**`docs/Architecture.md`** — 架构总览
 
-**`docs/project/glossary.md`** — 术语表
+**`docs/Glossary.md`** — 术语表
+
+**Phase 1 输出检查清单**（子 agent 必须遵守）：
+- [ ] 每个文件有 `# Title` 根标题
+- [ ] 每个 section 有 ≤250 字符的前导段落
+- [ ] `lat.md` 包含了所有文档的 wiki link 条目
+- [ ] 所有 wiki link 指向的文件将在 Phase 2 中创建
+- [ ] 源码引用使用项目相对路径，**不加 `src/` 前缀**
+
+**完成后**：Orchestrator 跑 `lat check`，不通过则让子 agent 修复，通过后才进入 Phase 2。
 
 ### Phase 2：生成 Tier 2 模块知识文档
 
-对 Phase 0 识别出的**每个模块**，生成一个 markdown 文档到 `docs/modules/` 下：
+**并行派出子 agent（每个模块一个）**，对 Phase 0 识别出的每个模块生成一个 markdown 文档到 `docs/` 下：
 
-模板：
-```markdown
-# 模块名
+子 agent 的 prompt 模板（**必须包含以下约束**）：
 
-一句概述：这个模块负责什么、为什么存在。
+```
+你正在为 {module_name} 模块写文档。
+输出文件：docs/{module_name}.md
 
-## Responsibilities
+## 结构要求
 
-- 核心职责 1
-- 核心职责 2
+# {Module display name}
+
+一句概述（≤250 字符）：这个模块负责什么、为什么存在。
 
 ## Key Concepts
 
-### 概念名
+### {概念名}
 
-概念解释。内部机制概要。
+概念解释（≤250 字符）。内部机制概要。
 
-Reference: [[src/module/file.ts#SymbolName]]
+Reference: [[file.rs#SymbolName]]  （项目相对路径，不加 src/ 前缀）
 
-### 概念名 2
+### {概念名 2}
 
 ...
 
 ## Dependencies
 
-该模块依赖的其他模块和原因：
-
-- [[modules/database]] — 持久化存储用户数据
-- [[modules/config]] — 读取配置参数
+列出该模块依赖的其他模块和外部 crate。**必须包含两项**：
+1. 内部模块依赖（wiki link 链接到其他模块文档）
+2. 外部 crate 依赖（列出 crate 名称和用途）
 
 ## Consumed By
 
 哪些模块使用本模块：
 
-- [[modules/api]] — 通过 service 层调用鉴逻辑
-- [[modules/worker]] — 在后台任务中使用
+- [[other_module]] — 使用说明
 
 ## Error Conditions
 
-可机器解析的错误码和恢复路径（见 [[schema/module.schema.json]]）
+该模块特有的错误条件。**只列本模块产生的错误**，不要重复其他模块已列出的错误。
+
+## 关键规则（必须遵守）
+
+1. 每个 section 必须有 ≤250 字符的前导段落，**且必须是有意义的描述**。禁止使用 `"Key concepts overview: ..."`、`"Dependencies overview: ..."` 等无信息量的通用模板。
+2. 涉及其他模块的必须用 `[[wiki link]]`
+3. 涉及源码符号的必须用 `[[file.rs#SymbolName]]`（项目相对路径，**不加 src/ 前缀**）
+4. 不要创建重复的 section（检查是否有内容相同的 heading）
+5. 一个概念只写一次，不要在不同 section 里重复描述
+6. 对每个有文档价值的函数/结构体/枚举，在源码中找到对应位置并记录引用
+7. 在 Dependencies 节中，**同时列出内部模块和外部 crate**，两者缺一不可
+8. **源码引用格式必须是 `[[file.rs#SymbolName]]`**，绝对禁止 `[[src/file.rs#SymbolName]]`
 ```
 
-**关键规则**：
-- 每个 section 必须有 ≤250 字符的前导段落
-- 涉及其他模块的必须用 `[[wiki link]]`
-- 涉及源码符号的必须用 `[[src/path#symbol]]`
+**并行执行**：
+- 所有模块的 agent 同时启动（使用 Agent 工具，同一 turn 全部派出）
+- 每个 agent 独立写自己的文件，互不依赖
 
-### Phase 3：生成 Tier 3 结构化数据
+**完成后**：Orchestrator 跑 `lat check`，不通过则让对应模块的子 agent 修复，全部通过后才进入 Phase 3。
 
-对每个模块，生成机器可读的 JSON schema：
+### Phase 3：生成结构化数据（必需）
 
-**`docs/schema/<module>.schema.json`**：
-```json
-{
-  "module": "auth",
-  "version": "1.0.0",
-  "exports": [
-    { "name": "login", "kind": "function", "params": ["email", "password"], "returns": "Token" },
-    { "name": "refreshToken", "kind": "function", "params": ["token"], "returns": "Token" }
-  ],
-  "dependencies": {
-    "internal": ["database", "redis"],
-    "external": ["jsonwebtoken"]
-  },
-  "consumers": ["api", "websocket"],
-  "errors": {
-    "TOKEN_EXPIRED": { "code": 401, "recovery": "Call refreshToken" },
-    "INVALID_CREDENTIALS": { "code": 403, "recovery": null }
-  },
-  "entryPoints": ["src/auth/service.ts"],
-  "configKeys": ["JWT_SECRET", "JWT_EXPIRY"]
-}
-```
+**派出一个子 agent**，生成机器可读的 JSON 结构化数据到 `schema/`（项目根目录）：
 
-同时生成 **`docs/graph.json`** — 全模块依赖图：
+**必须生成** `schema/graph.json` — 全模块依赖图：
 ```json
 {
   "modules": [
@@ -225,82 +260,55 @@ Reference: [[src/module/file.ts#SymbolName]]
 }
 ```
 
+**可选生成** `docs/schema/<module>.schema.json` — 各模块的 exports、dependencies、errors 等结构化描述。
+
+**完成后**：Orchestrator 跑 `lat check`，不通过则修复，通过后才进入 Phase 4。
+
 ### Phase 4：添加源码注解
 
-在源码中添加 `@lat:` 注解。规则：
+**派出子 agent（每个模块一个，或所有模块合并到一个 agent）**，在源码中添加 `@lat:` 注解。规则：
 
-1. 对 `docs/modules/` 中每个描述了代码行为的 leaf section，在对应源码中添加 `// @lat: [[section-id]]`
+1. 对 `docs/` 中每个描述了代码行为的 leaf section，在对应源码中添加 `# @lat: [[section-id]]` 或 `// @lat: [[section-id]]`
 2. 放在对应的函数/类/测试前一行
 3. 不要重复——每个 section 对应一个注释
 4. 不要在简单 getter/setter 或明显无业务含义的代码上添加
+5. 源码引用路径使用项目相对路径，**不加 `src/` 前缀**
+6. 注意：Python 文件用 `# @lat:`，JavaScript/TypeScript/Rust/Go/C 文件用 `// @lat:`
+7. **覆盖范围要求**：所有文档中提到的函数、结构体、枚举、常量都应有 `@lat` 注解。包括有文档价值的私有函数（如 `load_config()`、`save_state()` 等有业务含义的私有辅助函数）。
+8. **`@lat` 注解格式**：使用短格式 `[[file.rs#SymbolName]]` 或 `[[file#Heading#Subheading]]`，**不要**使用完整层级路径如 `[[lat.md/file#h1#h2#h3]]`。`lat check` 接受的格式是 `[[file.rs#SymbolName]]`（文件引用符号）或 `[[file#Heading#Subheading]]`（文档引用）。
 
-### Phase 5：并行源码级比对验证（关键步骤）
+**完成后**：Orchestrator 跑 `lat check`，检查 `@lat:` 注解是否指向真实存在的 section。不通过则修复，通过后才进入 Phase 5。
 
-这是整个流程的**质量保证环节**。派出**并行子 agent**，每个模块一个，做源码级比对。
+### Phase 5：最终验证
 
-#### 验证协议
+**派出一个子 agent**，执行最终验证。**该子 agent 的职责是运行 `lat check` 并修复所有错误**，直到全部通过。
 
-每个验证 agent 的 prompt 模板：
-
-```
-你是 doc-weaver 验证 agent。
-你的任务：比对 `docs/modules/<module>.md` 和源代码，找出所有不一致。
-
-请做以下检查：
-
-1. **接口完整性检查**：文档中描述的 exports、函数签名、参数、返回值是否与源码一致？
-   - 文档写了但代码没有 → `doc_claim_not_in_code`
-   - 代码有但文档没写 → `code_feature_not_documented`
-
-2. **依赖关系检查**：文档中声明的 dependencies/consumers 是否正确？
-   - 源码中 import/require 了但文档没提 → 遗漏依赖
-   - 文档声明了但源码中没有 import → 过期依赖
-
-3. **错误条件检查**：文档中描述的 error codes 和 recovery 路径是否真实存在？
-   - 文档写了某个 error 但源码中从未 throw → 虚构错误
-   - 源码中 throw 了某个 error 但文档没记录 → 遗漏错误
-
-4. **行为描述检查**：文档中的业务逻辑描述是否准确反映了源码实现？
-   - 文档说"使用 JWT"但源码用 session → 描述错误
-   - 文档描述了一个流程但实际代码逻辑不同 → 描述不准确
-
-5. **符号引用检查**：文档中的 `[[src/path#symbol]]` 引用是否都指向真实存在的符号？
-
-输出格式（JSON）：
-```json
-{
-  "module": "auth",
-  "verdict": "passed" | "needs_fix" | "failed",
-  "issues": [
-    {
-      "severity": "error" | "warning",
-      "category": "doc_claim_not_in_code" | "code_feature_not_documented" | "wrong_dependency" | "incorrect_error" | "behavior_mismatch" | "broken_symbol_ref",
-      "docLocation": "docs/modules/auth#OAuth Flow#Token Refresh",
-      "codeLocation": "src/auth/token.ts:42",
-      "description": "文档声明 refreshToken 返回类型为 Token，但源码返回类型为 { accessToken, refreshToken }",
-      "suggestion": "更新文档返回类型为 { accessToken: string, refreshToken: string }"
-    }
-  ]
-}
+```bash
+# 从项目根目录运行
+cd <project-root>
+lat check
 ```
 
-验证完成后输出 SUMMARY：
-- 总问题数
-- 按严重程度/类型分类
-- 推荐操作：自动修复 / 需人工判断
-```
+#### 验证规则
 
-#### 并行执行
+`lat check` 自动检查：
+1. **Wiki 链接完整性**：所有 `[[target]]` 引用是否指向真实存在的文件或 section
+2. **源码引用完整性**：所有 `[[path/to/file#symbol]]` 引用是否指向真实存在的文件
+3. **前导段落规则**：每个 section 是否有 ≤250 字符的前导段落
+4. **根索引完整性**：根索引 (`lat.md`) 是否列出了所有文档
+5. **代码引用检查**：`# @lat:` / `// @lat:` 注解是否指向真实存在的 section
 
-所有模块的验证 agent **同时启动**（使用 Agent 工具的非 background 模式）。
+#### 修复策略
 
-#### 结果汇总 + 修复
-
-汇总所有验证结果后，根据严重程度决定修复策略：
-
-- **error 级别 + 可自动修复**（如符号引用错了、参数名过时）→ 自动修复
-- **error 级别 + 需判断**（如行为描述不准确）→ 报告给用户
-- **warning 级别**（如遗漏了次要 feature）→ 记录但不阻塞
+- 如果 `lat check` 报错，按错误信息逐条修复：
+  - `broken link` → 修复 wiki link 路径或创建缺失的目标文件
+  - `no leading paragraph` → 在 heading 后添加前导段落
+  - `missing entries` → 在根索引中添加缺失的文档条目
+  - `file not found` → 修复源码引用路径（使用项目相对路径，不加 `src/` 前缀）
+  - `code ref not found` → `@lat:` 注解指向的 section 不存在，修正注解或修正 section ID
+  - `section not covered` → 文档中的 section 没有对应的 `@lat:` 注解，添加注解
+- 修复后重新运行 `lat check` 直到全部通过
+- **重复修复的次数上限为 5 轮**，超过后向用户报告剩余问题
 
 ---
 
@@ -319,23 +327,28 @@ Reference: [[src/module/file.ts#SymbolName]]
 ## 关键规则
 
 1. **Phase 0 必须先跑**：不要凭已有知识写文档，必须先扫描项目代码获取真实结构
-2. **Phase 5 不可跳过**：所有文档生成/更新后，必须做并行源码级验证
-3. **Tier 3 结构化数据的生成时机**：在 Phase 2 生成完 markdown 文档后立即生成，保证 schema 反映最新设计
+2. **Phase 5 不可跳过**：所有文档生成/更新后，必须运行 `lat check` 做验证
+3. **Phase 5 使用 `lat check` 而非自定义 agent**：利用 lat.md 工具链的机械验证能力，稳定且快速
 4. **@lat: 注解不冗余**：一个 leaf section 对应一个 `@lat:` 注解，不重复
-5. **第一次运行覆盖所有模块**：后续运行只处理变更的模块
-6. **Section ID 不可变**：一旦发布，不轻易修改 section ID（wiki link 会断）
-7. **docs/project/index.md 是唯一入口**：AI agent 到达项目后首先读 docs/project/index.md，决定加载哪些模块文档
-8. **永不自动 commit**：文档生成和验证完成后，将结果报告给用户，由用户决定何时、以什么 message 提交。不允许在流程末尾执行 `git add`、`git commit` 或 `git push`
-
----
+5. **@lat: 注解覆盖完整**：所有有文档价值的函数（包括私有辅助函数）都应有注解
+6. **第一次运行覆盖所有模块**：后续运行只处理变更的模块
+7. **Section ID 不可变**：一旦发布，不轻易修改 section ID（wiki link 会断）
+8. **Project.md 是唯一入口**：AI agent 到达项目后首先读 Project.md，决定加载哪些模块文档
+9. **源码引用不加 `src/` 前缀**：使用项目根相对路径，如 `[[lib.rs#GpuMode]]`。**绝对禁止** `[[src/lib.rs#GpuMode]]`
+10. **永不自动 commit**：文档生成和验证完成后，将结果报告给用户，由用户决定何时、以什么 message 提交。不允许在流程末尾执行 `git add`、`git commit` 或 `git push`
+11. **每个 Phase 完成后立即验证**：Orchestrator 在每个 Phase 完成后跑 `lat check`，不通过不进下一 Phase
+12. **所有 Phase 需派出子 agent**：Phase 1-5 全部由独立的子 agent 执行，Orchestrator 只负责协调和验证
+13. **Dependencies 节必须同时包含内部模块和外部 crate**：两者缺一不可，避免不同 agent 的粒度不一致
+14. **禁止重复内容**：同一概念在整个文档集中只出现一次，子 agent 应先检查是否存在再写
+15. **前导段落禁止通用模板**：禁止使用 `"Key concepts overview: ..."`、`"Dependencies overview: ..."` 等无信息量的写法。每个前导段落必须是有意义的描述
+16. **`@lat` 注解使用短格式**：`[[file.rs#SymbolName]]` 或 `[[file#Heading#Subheading]]`，**不要**使用完整层级路径 `[[lat.md/file#h1#h2#h3]]`
+17. **`schema/` 放在项目根目录**：非 `docs/schema/`，因为 `lat check` 只接受 `lat.md/` 下的 `.md` 文件，JSON 在 `docs/schema/` 会导致验证错误
 
 ---
 
 ## 端到端示例：为 AI agent 准备一个完整的文档体验
 
-编写完成后，项目的文档应该能让一个**从未看过源码的 AI agent** 在几分钟内准确回答以下所有问题。用 glue-engineer 在 doc-weaver 上测试时，Explore agent 仅凭文档（0 行源码）就给出了准确的项目理解。
-
-以下是一个成功的端到端验证流程：
+编写完成后，项目的文档应该能让一个**从未看过源码的 AI agent** 在几分钟内准确回答以下所有问题。
 
 ### 验证方法
 
@@ -366,5 +379,5 @@ Reference: [[src/module/file.ts#SymbolName]]
 |------|------|------|
 | Agent 回答"我不确定" | 文档覆盖不足 | 补写该模块的 Tier 2 文档 |
 | Agent 说"以 xxx 库为例"但用了自己的知识 | 缺少使用示例 | 在 Project.md 或 README 中添加最小示例 |
-| Agent 漏掉某个核心模块 | 索引缺失 | 检查 docs/index.md → docs/project/index.md 的 wiki link 链是否完整 |
+| Agent 漏掉某个核心模块 | 索引缺失 | 检查 root index → Project.md 的 wiki link 链是否完整 |
 | Agent 错误描述实现方式 | 文档行为描述与源码不一致 | Phase 5 验证未通过，修正文档或代码 |
