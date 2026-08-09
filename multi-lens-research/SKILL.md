@@ -22,6 +22,7 @@ metadata:
 
 | 关键词 | 团队 | 角色 |
 |--------|------|------|
+| 自动完成全流程/全自动/一口气跑完/auto/full auto/run all | 自动模式 | 所有 Phase 自动运行，不暂停确认 |
 | 研究/话题/深度分析/默认 | `teams/default/` | 实践者/学者/怀疑论者/经济学家/历史学家 |
 | 论文/审阅/投稿 | `teams/paper-review/` | 支持性审稿人/反对性审稿人/方法论审稿人/竞争性审稿人/跨学科桥梁 |
 | 代码/功能/PR | `teams/code-review/` | 架构师/用户倡导者/极简主义者/安全性能工程师/业务分析师 |
@@ -34,6 +35,8 @@ metadata:
 | 设计/UX/产品 | `teams/product-design/` | 用户研究员/产品经理/视觉设计师/无障碍专家 |
 | 创业/商业/MVP | `teams/startup-advisor/` | 创业者导师/风险投资分析师/市场进入策略师/技术合伙视角 |
 | 自定义 | `teams/custom/<name>/` | 用户自定义角色 |
+
+**自动模式：** 如果用户输入包含"自动完成全流程"、"全自动"、"一口气跑完"、"auto"、"full auto"、"run all"等关键词，进入自动模式。自动模式匹配到的团队不变，但跳过所有 Phase 间的用户确认，直接跑完 4 个 Phase。在自动模式下，非自动模式关键词同样用于选择团队（例如"多视角自动分析一下XXX"→ 选中 default 团队并自动跑完）。
 
 **加载流程：**
 1. 从用户输入识别场景关键词
@@ -84,6 +87,7 @@ metadata:
 ```
 你（Coordinator）
 ├── 识别场景 → 加载 teams/<team>/team.json → 读取角色 .md 文件
+├── 判断是否 auto_mode（用户输入含"自动完成"/"全自动"/"auto"等）
 ├── 澄清主题（如不够具体 → 先 AskUserQuestion）
 │
 ├── ═══ Phase 1：Multi-Perspective Scan ═══
@@ -93,17 +97,17 @@ metadata:
 │    │   ...
 │    ├── 等待所有 agent 完成
 │    ├── 展示每个角色的核心结论摘要
-│    ├── 问用户：是否继续 Phase 2？
+│    ├── （auto_mode 则自动继续，否则问用户）
 │    │
 ├── ═══ Phase 2：Contradiction Map ═══
 │    ├── Agent("矛盾分析师", 从 teams/shared/ 加载 prompt)
 │    ├── 展示矛盾地图
-│    ├── 问用户：是否继续 Phase 3？
+│    ├── （auto_mode 则自动继续，否则问用户）
 │    │
 ├── ═══ Phase 3：Synthesis ═══
 │    ├── Agent("综合简报师", 从 teams/shared/ 加载 prompt)
 │    ├── 展示综合简报
-│    ├── 问用户：是否继续 Phase 4？
+│    ├── （auto_mode 则自动继续，否则问用户）
 │    │
 └── ═══ Phase 4：Peer Review ═══
      ├── Agent("同行评审员", 从 teams/shared/ 加载 prompt)
@@ -116,8 +120,8 @@ metadata:
 
 | 规则 | 说明 |
 |------|------|
-| ❌ 禁止合并 Phase | 每个 Phase 必须独立运行，用户确认后才进下一阶段 |
-| ❌ 禁止跳过用户确认 | 每个 Phase 完成后必须展示摘要，问"是否继续下一步" |
+| ❌ 禁止合并 Phase | 每个 Phase 必须独立运行（自动模式下也保持独立，但跳过用户确认步骤） |
+| 🟢 自动模式例外 | 如果用户输入包含"自动完成全流程"、"全自动"、"auto"、"run all"等关键词，跳过所有 Phase 间的用户确认，自动跑完完整的 4 步流程。每个 Phase 的输出仍然展示摘要，但不等待用户确认直接进入下一 Phase |
 | ❌ 禁止分批启动 Phase 1 | 所有角色必须在同一 turn 全量并行启动 |
 | ❌ 禁止在自己上下文模拟角色 | 必须通过 Agent 工具派出独立子 agent |
 | ✅ 必须从 teams/ 加载 prompt | 不要凭记忆写角色 prompt，去 Read 对应的 .md 文件 |
@@ -130,10 +134,12 @@ metadata:
 
 ```
 1. 从用户输入识别场景关键词（见上面的关键词表）
-2. Read teams/<team>/team.json ← 获取角色列表
-3. 对每个角色 Read teams/<team>/<slug>.md ← 获取完整 prompt
-4. Read teams/shared/team.json 和 Phase 2-4 的 .md
-5. 在用户当前工作目录下创建工作目录 outputs/<team>/（不是 skill 目录下，而是 $(pwd) 即用户启动对话的地方）
+2. 如果关键词包含"自动完成全流程"、"全自动"、"一口气跑完"、"auto"、"full auto"、"run all"等 → auto_mode = true
+3. 非自动模式关键词同样用于选择团队（例如"多视角自动分析一下XXX"→ 选中 default 团队 + auto_mode）
+4. 匹配 teams/<team>/team.json ← 获取角色列表
+5. 对每个角色 Read teams/<team>/<slug>.md ← 获取完整 prompt
+6. Read teams/shared/team.json 和 Phase 2-4 的 .md
+7. 在用户当前工作目录下创建工作目录 outputs/<team>/（不是 skill 目录下，而是 $(pwd) 即用户启动对话的地方）
 ```
 
 ### Phase 1：Multi-Perspective Scan
@@ -175,6 +181,9 @@ metadata:
 你（Coordinator）
 │
 ├── 识别场景关键词 → 加载 teams/<team>/ 和 teams/shared/
+│   ├── 如果关键词包含"自动完成全流程"/"全自动"/"auto"/"run all"等
+│   │   → 进入自动模式（auto_mode = true）
+│   └── 否则 → 标准模式（auto_mode = false）
 ├── 澄清主题 → 如果不够具体，先问用户
 │
 ├── ═══ PHASE 1：Multi-Perspective Scan ═══
@@ -186,24 +195,27 @@ metadata:
 │    ├── 等待所有 agent 完成
 │    ├── 收集每个角色的输出
 │    ├── 展示每个角色的核心结论摘要
-│    ├── 问用户：是否继续 Phase 2？
-│    │   是 → 继续
-│    │   否 → 结束，或按用户要求调整
-│    │
+│    ├── （auto_mode）→ 自动继续 Phase 2，不询问
+│    └── （标准模式）→ 问用户：是否继续 Phase 2？
+│        是 → 继续
+│        否 → 结束，或按用户要求调整
+│
 ├── ═══ PHASE 2：Contradiction Map ═══
 │    ├── Read teams/shared/contradiction-analyst.md → 获取 prompt
 │    ├── Agent("矛盾分析师", {读取 Phase 1 的所有文件并分析})
 │    ├── 读取矛盾地图
 │    ├── 展示核心矛盾点、共识和盲区
-│    ├── 问用户：是否继续 Phase 3？
-│    │
+│    ├── （auto_mode）→ 自动继续 Phase 3，不询问
+│    └── （标准模式）→ 问用户：是否继续 Phase 3？
+│
 ├── ═══ PHASE 3：Synthesis ═══
 │    ├── Read teams/shared/synthesis-briefer.md → 获取 prompt
 │    ├── Agent("综合简报师", {读取 Phase 1+2 的所有文件})
 │    ├── 读取综合简报
 │    ├── 展示 5 个关键发现 + 可操作建议
-│    ├── 问用户：是否继续 Phase 4？
-│    │
+│    ├── （auto_mode）→ 自动继续 Phase 4，不询问
+│    └── （标准模式）→ 问用户：是否继续 Phase 4？
+│
 └── ═══ PHASE 4：Peer Review ═══
      ├── Read teams/shared/peer-reviewer.md → 获取 prompt
      ├── Agent("同行评审员", {读取简报文件})
@@ -220,8 +232,8 @@ metadata:
 3. **英文提示词保持原文**：子 agent 的 prompt 保留英文原文效果最佳。你的交互（展示给用户看、问问题）用中文。
 4. **盲点优先**：Phase 2 的盲点分析往往是整个分析中最有价值的部分。
 5. **共识≈真相**：如果所有角色都同意一个观点，它有极大概率是真的。
-6. **先问再跑**：如果主题不够具体，先问 2-3 个澄清问题再开始。
-7. **可中断、可迭代**：任何一步的输出如果用户不满意，可以要求重新调整某一角色的 prompt 强度或换一个角色，重新跑那个子 agent。
+6. **先问再跑**：如果主题不够具体，先问 2-3 个澄清问题再开始（自动模式下仍应澄清模糊主题，但不要询问"是否继续下一 Phase"这类流程性问题）。
+7. **可中断、可迭代**：任何一步的输出如果用户不满意，可以要求重新调整某一角色的 prompt 强度或换一个角色，重新跑那个子 agent（自动模式下同样适用；用户可随时打断，打断后转回标准确认模式）。
 8. **自定义团队**：用户可以创建 `teams/custom/<name>/` 文件夹，放入自己的 team.json + 角色 .md 文件，skill 会自动发现。详见 `teams/custom/README.md`。
 
 ---
