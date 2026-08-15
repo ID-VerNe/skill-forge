@@ -55,7 +55,10 @@ ls .handoffs/handoff-*.md 2>/dev/null
 执行 git 提取脚本获取数据：
 
 ```bash
-bash scripts/git-extract.sh
+# 脚本在 skill 目录下：~/.claude/skills/handoff/scripts/git-extract.sh
+# 可用 .cmd 版本（Windows）
+bash ~/.claude/skills/handoff/scripts/git-extract.sh    # Bash
+# 或 scripts\git-extract.cmd                             # Windows CMD
 ```
 
 ### 1. 收集数据
