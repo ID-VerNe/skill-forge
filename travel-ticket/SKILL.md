@@ -1,8 +1,7 @@
-export const meta = {
-  name: 'travel-ticket',
-  description: '查火车票和机票。火车票：余票、票价、中转换乘、车站搜索、经停站。机票：航班价格、时刻、机型、碳排放。支持单程/往返。',
-  metadata: { requires: [python] },
-};
+---
+name: travel-ticket
+description: 查火车票和机票。火车票：余票、票价、中转换乘、车站搜索、经停站。机票：航班价格、时刻、机型、碳排放。支持单程/往返。
+---
 
 # 出行票务查询 Skill
 

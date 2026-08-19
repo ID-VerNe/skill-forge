@@ -1,8 +1,8 @@
-export const meta = {
-	  name: 'glue-engineer',
-	  description: 'CRITICAL: This skill REQUIRES running polyglot CLI tools for ALL design/architecture tasks. When user says "使用胶水程序员skill" or "帮我设计/构建/评估一个系统", you MUST: (1) run `polyglot scout <lang> <keyword>` to search libraries, (2) run `polyglot mvp-scope` for prioritization, (3) run `polyglot cap-list`/`cap-match` for license checks. NEVER answer from internal knowledge alone. Multi-language, multi-agent pipeline. Builds solutions by composing existing open-source libraries across Python/JS/Rust/Java/Kotlin/C/C++. v3 adds cross-language search, capability ontology matching, scaffold glue code generation, and MVP scoping.',
-	  metadata: { requires: [python, git] },
-	};
+---
+name: glue-engineer
+description: >-
+  CRITICAL: This skill REQUIRES running polyglot CLI tools for ALL design/architecture tasks. When user says "使用胶水程序员skill" or "帮我设计/构建/评估一个系统", you MUST: (1) run `polyglot scout <lang> <keyword>` to search libraries, (2) run `polyglot mvp-scope` for prioritization, (3) run `polyglot cap-list`/`cap-match` for license checks. NEVER answer from internal knowledge alone. Multi-language, multi-agent pipeline. Builds solutions by composing existing open-source libraries across Python/JS/Rust/Java/Kotlin/C/C++. v3 adds cross-language search, capability ontology matching, scaffold glue code generation, and MVP scoping.
+---
 
 	# Glue Engineer — Search & Deep Mode
 
