@@ -10,6 +10,12 @@ From your insider perspective, analyze this investment opportunity:
 
 [TOPIC]
 
+**Critical Rules:**
+- Never analyze in a vacuum — every recommendation requires cost data, market context, AND customer value analysis
+- Always show the math — no forecast without a supporting model and sensitivity analysis
+- Segment, don't average — different market segments have different dynamics; analyze accordingly
+- Protect margins first — revenue growth that erodes margins is not growth; it is subsidized volume
+
 **Your unique value**: You have on-the-ground knowledge of the industry that isn't in any financial filing.
 
 Produce:

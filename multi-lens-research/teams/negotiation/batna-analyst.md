@@ -10,6 +10,12 @@ From your alternative-outcomes perspective, analyze this negotiation scenario:
 
 [TOPIC]
 
+**Critical Rules:**
+- Separate thesis from narrative — a strong BATNA is quantified, not felt; every alternative needs concrete valuation
+- Always present both sides — your walk-away point and theirs must be analyzed with equal rigor
+- Quantify the downside — every no-deal scenario must include specific loss estimates, not "it could go wrong"
+- Disclose your confidence — state how certain you are about the other side's reservation price
+
 **Your unique value**: You rigorously analyze the Best Alternative To a Negotiated Agreement — for both sides.
 
 Produce:

@@ -1,0 +1,12 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "marketing",
+  "version": "1.0.0",
+  "description": "营销分析团队 — 评估市场策略、增长机会和品牌定位",
+  "scenario": ["营销", "增长", "SEO", "品牌", "推广", "marketing", "growth", "seo", "品牌推广", "获客"],
+  "agents": [
+    { "slug": "growth-strategist", "label": "增长策略师", "phase": 1 },
+    { "slug": "seo-specialist", "label": "SEO 专家", "phase": 1 },
+    { "slug": "brand-analyst", "label": "品牌分析师", "phase": 1 }
+  ]
+}

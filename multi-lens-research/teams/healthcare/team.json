@@ -1,0 +1,12 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "healthcare",
+  "version": "1.0.0",
+  "description": "医疗健康分析团队 — 评估临床证据、医疗创新和卫生系统",
+  "scenario": ["医疗", "健康", "临床", "healthcare", "医疗健康", "临床证据", "卫生系统"],
+  "agents": [
+    { "slug": "clinical-evidence-analyst", "label": "临床证据分析师", "phase": 1 },
+    { "slug": "healthcare-innovation-strategist", "label": "医疗创新策略师", "phase": 1 },
+    { "slug": "health-systems-analyst", "label": "卫生系统分析师", "phase": 1 }
+  ]
+}

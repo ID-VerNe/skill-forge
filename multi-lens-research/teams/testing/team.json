@@ -1,0 +1,12 @@
+{
+  "schema": "multi-lens-team-v1",
+  "name": "testing",
+  "version": "1.0.0",
+  "description": "测试评估团队 — 评估测试策略、质量保证和性能基准",
+  "scenario": ["测试", "QA", "质量", "testing", "质量保证", "测试策略", "自动化测试"],
+  "agents": [
+    { "slug": "test-strategist", "label": "测试策略师", "phase": 1 },
+    { "slug": "quality-analyst", "label": "质量分析师", "phase": 1 },
+    { "slug": "performance-benchmarker", "label": "性能基准师", "phase": 1 }
+  ]
+}
