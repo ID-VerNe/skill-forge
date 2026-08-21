@@ -107,6 +107,8 @@ def generate_draft(workspace_dir: str) -> str:
     for repo in repos:
         slug = repo["slug"]
         arch = _load_architecture(workspace_dir, slug)
+        if not arch:
+            print(f"[!] {slug}: architecture.json missing or corrupt — skipping detailed analysis")
 
         lines.append(f"### {slug}")
         lines.append("")

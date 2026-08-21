@@ -7,135 +7,23 @@ per-mapping confidence scores.
 
 CRITICAL: This produces candidate mappings at ~60-74% precision.
 All mappings are labeled with confidence scores and review requirements.
+
+Role classification keywords live in role_keywords.py.
+Return-type transform guessing lives in return_transform.py.
 """
 
-import re
-from typing import Optional
-
 from polyglot.glue.glue_schema import (
-    FunctionSignature,
     FunctionMapping,
     ParamMapping,
     TransformRule,
 )
+from polyglot.glue.role_keywords import classify_function_role
+from polyglot.glue.return_transform import guess_return_transform
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Role classification keywords (per language)
+# Role classification + return type transform (imported above)
 # ═══════════════════════════════════════════════════════════════════
-
-ROLE_KEYWORDS = {
-    "serialize": [
-        "dumps", "dump", "encode", "serialize", "to_json", "to_string",
-        "to_bytes", "marshal", "pack", "write_json", "jsonify",
-    ],
-    "deserialize": [
-        "loads", "load", "decode", "deserialize", "from_json", "from_string",
-        "parse", "unmarshal", "unpack", "read_json",
-    ],
-    "fetch": [
-        "get", "request", "fetch", "download", "read", "query", "select",
-        "find", "search", "list", "all", "get_by", "find_by", "first",
-    ],
-    "send": [
-        "post", "put", "patch", "delete", "send", "upload", "write",
-        "update", "create", "insert", "save", "store", "submit",
-    ],
-    "transform": [
-        "map", "filter", "reduce", "transform", "convert", "apply",
-        "flat_map", "flatten", "sort", "group", "aggregate",
-    ],
-    "open": [
-        "open", "connect", "init", "create", "new", "builder", "build",
-        "from_path", "from_file", "from_reader",
-    ],
-    "close": [
-        "close", "disconnect", "shutdown", "stop", "release", "free",
-    ],
-}
-
-
-def classify_function_role(name: str) -> tuple[str, float]:
-    """Classify a function's semantic role based on its name.
-
-    Returns (role, confidence) where confidence is 0.0-1.0.
-    """
-    name_lower = name.lower()
-
-    best_role = "unknown"
-    best_score = 0.0
-
-    for role, keywords in ROLE_KEYWORDS.items():
-        for kw in keywords:
-            if kw in name_lower:
-                # Exact match at start/end or after underscore gets higher confidence
-                if name_lower == kw:
-                    score = 0.95
-                elif name_lower.startswith(kw + "_") or name_lower.endswith("_" + kw):
-                    score = 0.85
-                elif "_" + kw + "_" in name_lower:
-                    score = 0.75
-                else:
-                    score = 0.60  # substring match
-
-                if score > best_score:
-                    best_score = score
-                    best_role = role
-
-    return best_role, best_score
-
-
-def guess_return_transform(
-    src_return: str,
-    dst_return: str,
-    src_lang: str,
-    dst_lang: str,
-) -> TransformRule:
-    """Guess the return type transform between two functions.
-
-    Rules:
-    - Same type and same language -> identity
-    - Both string types -> identity
-    - str/bytes <-> json -> type_cast (basic)
-    - Different languages -> subprocess_json serialization
-    - Default -> identity with review note
-    """
-    src_low = src_return.lower().strip()
-    dst_low = dst_return.lower().strip()
-
-    if not src_low and not dst_low:
-        return TransformRule(kind="identity", expr="pass_through")
-    if src_low == dst_low:
-        return TransformRule(kind="identity", expr="pass_through")
-
-    # Both string-like
-    str_types = {"str", "string", "&str", "string?", "string!"}
-    if src_low in str_types and dst_low in str_types:
-        return TransformRule(kind="identity", expr="pass_through")
-
-    # JSON -> JSON is identity (they meet at JSON)
-    if "json" in src_low and "json" in dst_low:
-        return TransformRule(kind="identity", expr="pass_through")
-
-    # Bytes <-> String
-    if src_low in ("bytes", "vec<u8>", "byte[]") and dst_low in ("str", "string"):
-        return TransformRule(kind="type_cast", expr=".decode('utf-8')",
-                             params={"from": src_return, "to": dst_return})
-    if src_low in ("str", "string") and dst_low in ("bytes", "vec<u8>", "byte[]"):
-        return TransformRule(kind="type_cast", expr=".encode('utf-8')",
-                             params={"from": src_return, "to": dst_return})
-
-    # Cross-language: JSON serialization
-    if src_lang != dst_lang:
-        return TransformRule(kind="type_cast",
-                             expr="json.dumps/loads bridge",
-                             params={"strategy": "subprocess_json",
-                                     "from": src_return, "to": dst_return})
-
-    # Generic type cast (same language)
-    return TransformRule(kind="type_cast",
-                         expr=f"# TODO: manual cast from {src_return} to {dst_return}",
-                         params={"from": src_return, "to": dst_return})
 
 
 class FunctionMatcher:

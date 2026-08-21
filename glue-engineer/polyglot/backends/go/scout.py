@@ -17,7 +17,8 @@ import requests
 
 from polyglot.common.cache import cache_get, cache_set, cache_get_stale
 from polyglot.common.retry import retry_call
-from polyglot.common.github import batch_stars, parse_github_slug
+from polyglot.common.github import batch_stars
+from polyglot.common.gh_slug import parse_github_slug
 
 PKG_GO_DEV_SEARCH_URL = "https://pkg.go.dev/search"
 

@@ -20,6 +20,22 @@ def _load_architecture(workspace_dir: str, slug: str) -> dict:
         return {}
 
 
+def _load_all_architectures(workspace_dir: str, session: dict) -> dict:
+    """Load architecture.json for every repo, emitting one warning per failure.
+
+    Returns:
+        dict[str, dict] — slug -> arch dict (empty dict on failure)
+    """
+    archs = {}
+    for repo in session.get("candidate_repos", []):
+        slug = repo["slug"]
+        arch = _load_architecture(workspace_dir, slug)
+        if not arch:
+            print(f"[!] {slug}: architecture.json missing or corrupt — treating as unanalyzed")
+        archs[slug] = arch
+    return archs
+
+
 def _normalize_status(val) -> str:
     """Normalize a gap status to supported/partial/missing."""
     if isinstance(val, str):
@@ -31,7 +47,7 @@ def _normalize_status(val) -> str:
     return "missing"
 
 
-def build_coverage_matrix(workspace_dir: str, session: dict) -> dict:
+def build_coverage_matrix(workspace_dir: str, session: dict, archs: dict = None) -> dict:
     """Build a requirements-coverage matrix from all architecture reports.
 
     Returns:
@@ -44,12 +60,9 @@ def build_coverage_matrix(workspace_dir: str, session: dict) -> dict:
     if not repos or not requirements:
         return {"requirements": [], "repos": [], "matrix": []}
 
-    # Load all architecture reports
-    archs = {}
-    for repo in repos:
-        slug = repo["slug"]
-        arch = _load_architecture(workspace_dir, slug)
-        archs[slug] = arch
+    # Load all architecture reports once
+    if archs is None:
+        archs = _load_all_architectures(workspace_dir, session)
 
     # Build matrix rows
     matrix = []
@@ -75,18 +88,22 @@ def build_coverage_matrix(workspace_dir: str, session: dict) -> dict:
     }
 
 
-def build_repo_comparisons(workspace_dir: str, session: dict) -> list:
+def build_repo_comparisons(workspace_dir: str, session: dict, archs: dict = None) -> list:
     """Build side-by-side comparison of all repos.
 
     Returns:
         List of dicts, one per repo, with comparison fields.
     """
     repos = session.get("candidate_repos", [])
+
+    if archs is None:
+        archs = _load_all_architectures(workspace_dir, session)
+
     comparisons = []
 
     for repo in repos:
         slug = repo["slug"]
-        arch = _load_architecture(workspace_dir, slug)
+        arch = archs.get(slug, {})
 
         gaps = arch.get("known_gaps", [])
         gap_summary = ", ".join(
@@ -146,8 +163,9 @@ def compare_all(workspace_dir: str) -> dict:
     if not session:
         return {"error": "No session.json found"}
 
-    matrix = build_coverage_matrix(workspace_dir, session)
-    comparisons = build_repo_comparisons(workspace_dir, session)
+    archs = _load_all_architectures(workspace_dir, session)
+    matrix = build_coverage_matrix(workspace_dir, session, archs)
+    comparisons = build_repo_comparisons(workspace_dir, session, archs)
     ranking = build_ranking(comparisons)
 
     return {

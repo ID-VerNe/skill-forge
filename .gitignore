@@ -34,3 +34,12 @@ Thumbs.db
 
 # Glue Engineer — polyglot CLI output artifacts
 glue-engineer/.glue/
+
+# ip-as-logo-skill — junction 到 ~/.claude/skills,不作为仓库内容
+/ip-as-logo-skill/
+
+# skills 目录 junction/拷贝 — 所属 Claude skills 体系,不作为仓库内容
+/huashu-design/
+/resume-tailoring-skill/
+/OfficeCLI/
+/interfaces-skills/

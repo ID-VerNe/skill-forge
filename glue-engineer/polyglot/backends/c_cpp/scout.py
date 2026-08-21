@@ -23,6 +23,7 @@ except ImportError:
 
 from polyglot.common.cache import cache_get, cache_set, cache_get_stale
 from polyglot.common.retry import retry_call
+from polyglot.common.gh_auth import is_authenticated, resolve_token
 
 
 VCPKG_CODE_SEARCH_URL = "https://api.github.com/search/code"
@@ -64,22 +65,36 @@ def search(query: str, limit: int = 5) -> dict:
         output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
         return output
 
+    # GitHub /search/code REQUIRES authentication — fail fast if no token.
+    if not is_authenticated():
+        output["errors"].append(
+            "GitHub /search/code requires authentication. "
+            "Set GITHUB_TOKEN or run `gh auth login`."
+        )
+        output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
+        return output
+
     def _http_get():
+        tok = resolve_token()
+        creds = {"Authorization": f"Bearer {tok}"} if tok else {}
+        # Use raw URL to avoid requests percent-encoding `+` as `%2B`.
+        # GitHub code search uses `+` as space separator (e.g., "fmt+repo:...").
+        url = f"{VCPKG_CODE_SEARCH_URL}?q={query}+repo:microsoft/vcpkg+path:ports"
         resp = requests.get(
-            VCPKG_CODE_SEARCH_URL,
-            params={
-                "q": f"{query}+repo:microsoft/vcpkg+path:ports",
-            },
+            url,
             headers={
                 "Accept": "application/vnd.github.v3+json",
                 "User-Agent": USER_AGENT,
+                **creds,
             },
             timeout=REQUEST_TIMEOUT,
         )
+        if resp.status_code == 401:
+            # Auth required / bad token — not transient, won't self-resolve.
+            # Signal via a special sentinel rather than retrying.
+            return {"_auth_required": True}
         if resp.status_code == 403 and "rate limit" in resp.text.lower():
             # Rate limit — not a transient error, no retry will help.
-            # Signal via a special sentinel rather than raising, because
-            # retry_call would otherwise keep retrying a RuntimeError.
             return {"_rate_limited": True}
         resp.raise_for_status()
         return resp.json()
@@ -99,6 +114,16 @@ def search(query: str, limit: int = 5) -> dict:
         if stale is not None:
             stale["metadata"]["cache_hit"] = True
             return stale
+        cache_set(cache_key, output)
+        output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
+        return output
+
+    # Check for auth-required sentinel — 401 won't self-resolve, don't retry
+    if isinstance(data, dict) and data.get("_auth_required"):
+        output["errors"].append(
+            "GitHub /search/code requires authentication. "
+            "Set GITHUB_TOKEN or run `gh auth login`."
+        )
         cache_set(cache_key, output)
         output["metadata"]["duration_ms"] = int((time.time() - start) * 1000)
         return output

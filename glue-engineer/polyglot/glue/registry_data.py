@@ -1,0 +1,225 @@
+"""
+polyglot/glue/registry_data.py — Starter capability registry data.
+
+Manually curated top ~20 libraries per ecosystem, describing their
+semantic capabilities (IO patterns, data formats, error models, etc.).
+"""
+
+from polyglot.glue.capability_types import LibraryCapability
+
+
+STARTER_REGISTRY = {
+    # ── Python: HTTP ──
+    "python:requests": LibraryCapability(
+        library="requests", language="python", version="2.32.0",
+        io_patterns=["fetch", "send"],
+        data_formats_in=["url", "params", "headers"],
+        data_formats_out=["http_response", "bytes", "text"],
+        data_shape_constraints={"timeout_support": True, "streaming": True},
+        protocol=["http", "https"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "ConnectionError", "kind": "recoverable"},
+                          {"name": "Timeout", "kind": "recoverable"},
+                          {"name": "HTTPError", "kind": "recoverable"}],
+        concurrency_model={"thread_safe": True, "async_compatible": False},
+        lifecycle={"init_required": False, "close_required": False},
+        license="Apache-2.0",
+    ),
+    "python:httpx": LibraryCapability(
+        library="httpx", language="python", version="0.27.0",
+        io_patterns=["fetch", "send"],
+        data_formats_in=["url", "params", "headers"],
+        data_formats_out=["http_response", "bytes", "text", "json"],
+        data_shape_constraints={"timeout_support": True, "streaming": True},
+        protocol=["http", "https", "http2"],
+        runtime_reqs={"async": True, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "RequestError", "kind": "recoverable"},
+                          {"name": "TimeoutException", "kind": "recoverable"},
+                          {"name": "HTTPStatusError", "kind": "recoverable"}],
+        concurrency_model={"thread_safe": True, "async_compatible": True},
+        lifecycle={"init_required": False, "close_required": False},
+        license="BSD-3-Clause",
+    ),
+
+    # ── Python: Serialization ──
+    "python:orjson": LibraryCapability(
+        library="orjson", language="python", version="3.10.15",
+        io_patterns=["serialize", "deserialize"],
+        data_formats_in=["python_object"],
+        data_formats_out=["json_bytes"],
+        data_shape_constraints={"nan_support": "none", "infinity_support": "none",
+                                "none_handling": "null", "max_depth": 512},
+        protocol=["native_api"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "JSONEncodeError", "kind": "fatal", "recovery": "catch_exception"},
+                          {"name": "JSONDecodeError", "kind": "fatal", "recovery": "catch_exception"}],
+        concurrency_model={"thread_safe": True, "async_compatible": False},
+        lifecycle={"init_required": False, "close_required": False},
+        license="Apache-2.0",
+    ),
+    "python:json": LibraryCapability(
+        library="json", language="python", version="stdlib",
+        io_patterns=["serialize", "deserialize"],
+        data_formats_in=["python_object"],
+        data_formats_out=["json_str"],
+        data_shape_constraints={"nan_support": "converts_to_null", "infinity_support": "converts_to_null",
+                                "none_handling": "null", "max_depth": "default_recursive"},
+        protocol=["native_api"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "ValueError", "kind": "fatal", "recovery": "catch_exception"}],
+        concurrency_model={"thread_safe": True, "async_compatible": False},
+        lifecycle={"init_required": False, "close_required": False},
+        license="PSF",
+    ),
+
+    # ── Rust: Serialization ──
+    "rust:serde": LibraryCapability(
+        library="serde", language="rust", version="1.0.0",
+        io_patterns=["serialize", "deserialize"],
+        data_formats_in=["rust_struct"],
+        data_formats_out=["serialized_bytes"],
+        data_shape_constraints={"derive_macro": True, "custom_deserialize": True},
+        protocol=["derive_macro", "custom_impl"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "Error", "kind": "fatal", "recovery": "propagate"}],
+        concurrency_model={"thread_safe": True, "async_compatible": True},
+        lifecycle={"init_required": False, "close_required": False},
+        license="Apache-2.0",
+    ),
+    "rust:serde_json": LibraryCapability(
+        library="serde_json", language="rust", version="1.0.0",
+        io_patterns=["serialize", "deserialize"],
+        data_formats_in=["rust_struct", "json_bytes"],
+        data_formats_out=["json_bytes", "json_str"],
+        data_shape_constraints={"nan_support": "none", "infinity_support": "none"},
+        protocol=["native_api"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "Error", "kind": "fatal", "recovery": "propagate"}],
+        concurrency_model={"thread_safe": True, "async_compatible": True},
+        lifecycle={"init_required": False, "close_required": False},
+        license="Apache-2.0",
+    ),
+
+    # ── Rust: HTTP ──
+    "rust:reqwest": LibraryCapability(
+        library="reqwest", language="rust", version="0.12.0",
+        io_patterns=["fetch", "send"],
+        data_formats_in=["url", "headers"],
+        data_formats_out=["http_response", "bytes", "text"],
+        protocol=["http", "https"],
+        runtime_reqs={"async": True, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "Error", "kind": "recoverable"}],
+        concurrency_model={"thread_safe": True, "async_compatible": True},
+        lifecycle={"init_required": False, "close_required": False},
+        license="Apache-2.0",
+    ),
+
+    # ── JavaScript: HTTP ──
+    "javascript:axios": LibraryCapability(
+        library="axios", language="javascript", version="1.7.0",
+        io_patterns=["fetch", "send"],
+        data_formats_in=["url", "params", "headers"],
+        data_formats_out=["http_response", "json", "text"],
+        protocol=["http", "https"],
+        runtime_reqs={"async": True, "sync": False, "threadsafe": True},
+        error_categories=[{"name": "AxiosError", "kind": "recoverable"}],
+        concurrency_model={"thread_safe": True, "async_compatible": True},
+        lifecycle={"init_required": False, "close_required": False},
+        license="MIT",
+    ),
+    "javascript:lodash": LibraryCapability(
+        library="lodash", language="javascript", version="4.17.21",
+        io_patterns=["transform", "query"],
+        data_formats_in=["array", "object", "collection"],
+        data_formats_out=["array", "object", "value"],
+        protocol=["native_api"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": True},
+        error_categories=[],
+        concurrency_model={"thread_safe": True, "async_compatible": False},
+        lifecycle={"init_required": False, "close_required": False},
+        license="MIT",
+    ),
+
+    # ── Java: Serialization ──
+    "java:jackson": LibraryCapability(
+        library="jackson", language="java", version="2.17.0",
+        io_patterns=["serialize", "deserialize"],
+        data_formats_in=["java_object", "json_bytes", "json_str"],
+        data_formats_out=["json_bytes", "json_str", "java_object"],
+        data_shape_constraints={"annotations": True, "custom_serializer": True},
+        protocol=["native_api"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "JsonProcessingException", "kind": "fatal", "recovery": "catch_exception"}],
+        concurrency_model={"thread_safe": True, "async_compatible": False},
+        lifecycle={"init_required": True, "close_required": False, "global_init": False},
+        license="Apache-2.0",
+    ),
+    "java:gson": LibraryCapability(
+        library="gson", language="java", version="2.11.0",
+        io_patterns=["serialize", "deserialize"],
+        data_formats_in=["java_object", "json_str"],
+        data_formats_out=["json_str", "java_object"],
+        protocol=["native_api"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "JsonSyntaxException", "kind": "fatal", "recovery": "catch_exception"},
+                          {"name": "JsonIOException", "kind": "fatal", "recovery": "catch_exception"}],
+        concurrency_model={"thread_safe": False, "async_compatible": False},
+        lifecycle={"init_required": False, "close_required": False},
+        license="Apache-2.0",
+    ),
+
+    # ── Kotlin: Serialization ──
+    "kotlin:kotlinx-serialization": LibraryCapability(
+        library="kotlinx-serialization", language="kotlin", version="1.7.0",
+        io_patterns=["serialize", "deserialize"],
+        data_formats_in=["kotlin_object", "json_str"],
+        data_formats_out=["json_str", "kotlin_object"],
+        data_shape_constraints={"compile_time_plugin": True, "annotation_driven": True},
+        protocol=["compiler_plugin", "native_api"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "SerializationException", "kind": "fatal", "recovery": "catch_exception"}],
+        concurrency_model={"thread_safe": True, "async_compatible": False},
+        lifecycle={"init_required": False, "close_required": False},
+        license="Apache-2.0",
+    ),
+
+    # ── C/C++: Serialization ──
+    "c_cpp:nlohmann-json": LibraryCapability(
+        library="nlohmann-json", language="c_cpp", version="3.11.0",
+        io_patterns=["serialize", "deserialize"],
+        data_formats_in=["cpp_object", "json_str"],
+        data_formats_out=["json_str", "cpp_object"],
+        data_shape_constraints={"header_only": True, "cxx11_required": True},
+        protocol=["native_api"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": False},
+        error_categories=[{"name": "parse_error", "kind": "fatal", "recovery": "catch_exception"},
+                          {"name": "type_error", "kind": "fatal", "recovery": "catch_exception"}],
+        concurrency_model={"thread_safe": False, "async_compatible": False},
+        lifecycle={"init_required": False, "close_required": False},
+    ),
+
+    # ── Python: Data processing ──
+    "python:pandas": LibraryCapability(
+        library="pandas", language="python", version="2.2.0",
+        io_patterns=["read", "write", "transform", "aggregate"],
+        data_formats_in=["csv", "json", "parquet", "excel", "sql", "dataframe"],
+        data_formats_out=["csv", "json", "parquet", "excel", "sql", "dataframe"],
+        protocol=["native_api"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": False},
+        error_categories=[{"name": "ValueError", "kind": "fatal", "recovery": "catch_exception"}],
+        concurrency_model={"thread_safe": False, "async_compatible": False},
+        lifecycle={"init_required": False, "close_required": False},
+    ),
+    "python:polars": LibraryCapability(
+        library="polars", language="python", version="1.0.0",
+        io_patterns=["read", "write", "transform", "aggregate"],
+        data_formats_in=["csv", "json", "parquet", "dataframe"],
+        data_formats_out=["csv", "json", "parquet", "dataframe"],
+        protocol=["native_api"],
+        runtime_reqs={"async": False, "sync": True, "threadsafe": True},
+        error_categories=[{"name": "ComputeError", "kind": "fatal", "recovery": "catch_exception"},
+                          {"name": "SchemaError", "kind": "fatal", "recovery": "catch_exception"}],
+        concurrency_model={"thread_safe": True, "async_compatible": False},
+        lifecycle={"init_required": False, "close_required": False},
+    ),
+}
