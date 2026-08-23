@@ -9,6 +9,7 @@
     "source_path",
     "commit",
     "one_line_summary",
+    "language",
     "core_modules",
     "key_types",
     "platform_apis",

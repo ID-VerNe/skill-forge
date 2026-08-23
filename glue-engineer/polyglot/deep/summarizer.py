@@ -95,9 +95,24 @@ def generate_draft(workspace_dir: str) -> str:
         if ranking:
             lines.append("### Ranking")
             lines.append("")
-            lines.append(f"1. **{ranking[0]['slug']}** — score {ranking[0]['score']} (confidence {ranking[0]['confidence']})")
+            top = ranking[0]
+            lines.append(
+                f"1. **{top['slug']}** — score {top['score']} "
+                f"(coverage {top.get('coverage_ratio', '?')}, "
+                f"confidence {top['confidence']})"
+            )
             for r in ranking[1:]:
-                lines.append(f"{r['rank']}. {r['slug']} — score {r['score']} (confidence {r['confidence']})")
+                lines.append(
+                    f"{r['rank']}. {r['slug']} — score {r['score']} "
+                    f"(coverage {r.get('coverage_ratio', '?')}, "
+                    f"confidence {r['confidence']})"
+                )
+            lines.append("")
+        elif comparison.get("validation_failed"):
+            lines.append("### Ranking")
+            lines.append("")
+            lines.append("*Ranking suppressed — architecture reports incomplete. "
+                        "Run subagents first, then `deep-validate`.*")
             lines.append("")
 
     # Section 3: Repo-by-repo summaries

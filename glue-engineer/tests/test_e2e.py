@@ -28,7 +28,7 @@ FAIL = 0
 TIMING = []
 
 
-def test(name, fn):
+def _run(name, fn):
     global PASS, FAIL
     start = time.time()
     try:
@@ -186,7 +186,7 @@ def test_scout_c_cpp():
 
 def test_cli_list():
     """Test CLI by importing router and calling the list function."""
-    from polyglot.router import cmd_list
+    from polyglot.commands.scout import cmd_list
     import argparse
     args = argparse.Namespace(format="json")
     try:
@@ -553,7 +553,7 @@ def test_v3_generator_dispatcher():
 
 def test_v3_cli_strategies():
     """Test CLI 'strategies' command."""
-    from polyglot.router import cmd_strategies
+    from polyglot.commands.glue import cmd_strategies
     import argparse
     import io
     from contextlib import redirect_stdout
@@ -570,7 +570,7 @@ def test_v3_cli_strategies():
 
 def test_v3_cli_cap_list():
     """Test CLI 'cap-list' command."""
-    from polyglot.router import cmd_cap_list
+    from polyglot.commands.glue import cmd_cap_list
     import argparse
     import io
     from contextlib import redirect_stdout
@@ -585,7 +585,7 @@ def test_v3_cli_cap_list():
 
 def test_v3_cli_bridge_dry_run():
     """Test CLI 'bridge --dry-run' command."""
-    from polyglot.router import cmd_bridge
+    from polyglot.commands.glue import cmd_bridge
     import argparse
     import io
     from contextlib import redirect_stdout
@@ -617,66 +617,66 @@ if __name__ == "__main__":
 
     print("[1/6] Common Infrastructure")
     print("-" * 40)
-    test("schema", test_schema)
-    test("cache", test_cache)
-    test("platform", test_platform)
-    test("git check", test_git)
-    test("reporters", test_reporters)
+    _run("schema", test_schema)
+    _run("cache", test_cache)
+    _run("platform", test_platform)
+    _run("git check", test_git)
+    _run("reporters", test_reporters)
     print()
 
     print("[2/6] Language Scouts (live API)")
     print("-" * 40)
-    test("python scout", test_scout_python)
-    test("javascript scout", test_scout_javascript)
-    test("rust scout", test_scout_rust)
-    test("java scout", test_scout_java)
-    test("kotlin scout", test_scout_kotlin)
-    test("c_cpp scout", test_scout_c_cpp)
+    _run("python scout", test_scout_python)
+    _run("javascript scout", test_scout_javascript)
+    _run("rust scout", test_scout_rust)
+    _run("java scout", test_scout_java)
+    _run("kotlin scout", test_scout_kotlin)
+    _run("c_cpp scout", test_scout_c_cpp)
     print()
 
     print("[3/6] CLI Router")
     print("-" * 40)
-    test("cli list", test_cli_list)
+    _run("cli list", test_cli_list)
     print()
 
     print("[4/6] Python Backend")
     print("-" * 40)
-    test("python analyst", test_python_analyst)
+    _run("python analyst", test_python_analyst)
     print()
 
     print("[5/6] Probe Templates")
     print("-" * 40)
-    test("probe files exist", test_probe_templates_exist)
+    _run("probe files exist", test_probe_templates_exist)
     print()
 
     print("[6/6] Backend Metadata")
     print("-" * 40)
-    test("FEATURES.json all backends", test_backend_features)
+    _run("FEATURES.json all backends", test_backend_features)
     print()
 
     print("[7/7] v3 Glue Infrastructure")
     print("-" * 40)
-    test("v3 glue schema", test_v3_glue_schema)
-    test("v3 aggregator", test_v3_aggregator)
-    test("v3 capability ontology", test_v3_capability)
-    test("v3 function matcher", test_v3_function_matcher)
-    test("v3 strategy selector", test_v3_strategy_selector)
+    _run("v3 glue schema", test_v3_glue_schema)
+    _run("v3 aggregator", test_v3_aggregator)
+    _run("v3 capability ontology", test_v3_capability)
+    _run("v3 function matcher", test_v3_function_matcher)
+    _run("v3 strategy selector", test_v3_strategy_selector)
     print()
 
     print("[8/8] v3 Generators")
     print("-" * 40)
-    test("v3 import generator", test_v3_import_generator)
-    test("v3 subprocess generator", test_v3_subprocess_generator)
-    test("v3 pyo3 generator", test_v3_pyo3_generator)
-    test("v3 ffi generator", test_v3_ffi_generator)
-    test("v3 generator dispatcher", test_v3_generator_dispatcher)
+    _run("v3 import generator", test_v3_import_generator)
+    _run("v3 subprocess generator", test_v3_subprocess_generator)
+    _run("v3 pyo3 generator", test_v3_pyo3_generator)
+    _run("v3 ffi generator", test_v3_ffi_generator)
+    _run("v3 generator dispatcher", test_v3_generator_dispatcher)
     print()
 
     print("[9/9] v3 CLI Commands")
     print("-" * 40)
-    test("v3 cli strategies", test_v3_cli_strategies)
-    test("v3 cli cap-list", test_v3_cli_cap_list)
-    test("v3 cli bridge dry-run", test_v3_cli_bridge_dry_run)
+    _run("v3 cli strategies", test_v3_cli_strategies)
+    _run("v3 cli cap-list", test_v3_cli_cap_list)
+    _run("v3 cli bridge dry-run", test_v3_cli_bridge_dry_run)
     print()
 
     print("=" * 60)

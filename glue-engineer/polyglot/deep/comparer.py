@@ -88,6 +88,29 @@ def build_coverage_matrix(workspace_dir: str, session: dict, archs: dict = None)
     }
 
 
+def _count_source_lines(source_path: str) -> int:
+    """Count total non-blank source lines under a path (fast estimation).
+
+    Skips vendor/.git/node_modules/__pycache__/target dirs. Used to surface
+    large-repo size in the comparison (a proxy for subagent context risk).
+    """
+    if not source_path or not os.path.isdir(source_path):
+        return 0
+    total = 0
+    source_exts = (".py", ".rs", ".go", ".js", ".ts", ".java", ".kt", ".c", ".cpp", ".h", ".hpp")
+    for root, dirs, files in os.walk(source_path):
+        dirs[:] = [d for d in dirs if d not in (".git", "vendor", "node_modules", "__pycache__", "target")]
+        for f in files:
+            if f.endswith(source_exts):
+                path = os.path.join(root, f)
+                try:
+                    with open(path, "rb") as fh:
+                        total += sum(1 for line in fh if line != b"\n")
+                except Exception:
+                    pass
+    return total
+
+
 def build_repo_comparisons(workspace_dir: str, session: dict, archs: dict = None) -> list:
     """Build side-by-side comparison of all repos.
 
@@ -126,6 +149,10 @@ def build_repo_comparisons(workspace_dir: str, session: dict, archs: dict = None
             "key_type_count": len(arch.get("key_types", [])),
             "platform_api_count": len(arch.get("platform_apis", [])),
             "commit": arch.get("commit", repo.get("commit", "")),
+            "source_files": {
+                "total_lines": _count_source_lines(arch.get("source_path", "")),
+                "files_read": len(arch.get("core_modules", [])),
+            },
         })
 
     # Sort by confidence descending
@@ -133,15 +160,31 @@ def build_repo_comparisons(workspace_dir: str, session: dict, archs: dict = None
     return comparisons
 
 
-def build_ranking(comparisons: list) -> list:
-    """Build a simple ranking based on confidence and evidence depth."""
+def build_ranking(comparisons: list, matrix: dict) -> list:
+    """Build a ranking based on coverage, confidence, and evidence depth."""
+    requirements = matrix.get("requirements", [])
+    req_count = max(len(requirements), 1)
     ranked = []
-    for i, c in enumerate(comparisons):
-        score = c["confidence"] * 0.6 + min(c["evidence_count"] / 20, 1.0) * 0.4
+    for c in comparisons:
+        supported = 0
+        partial = 0
+        for row in matrix.get("matrix", []):
+            status = row.get(c["slug"], "missing")
+            if status == "supported":
+                supported += 1
+            elif status == "partial":
+                partial += 1
+        coverage_ratio = (supported * 1.0 + partial * 0.5) / req_count
+
+        score = coverage_ratio * 0.4 + c["confidence"] * 0.3 + min(c["evidence_count"] / 20, 1.0) * 0.3
         ranked.append({
-            "rank": i + 1,
+            "rank": 0,
             "slug": c["slug"],
             "score": round(score, 2),
+            "coverage_ratio": round(coverage_ratio, 2),
+            "supported": supported,
+            "partial": partial,
+            "missing": req_count - supported - partial,
             "confidence": c["confidence"],
             "evidence_count": c["evidence_count"],
         })
@@ -154,19 +197,44 @@ def build_ranking(comparisons: list) -> list:
 def compare_all(workspace_dir: str) -> dict:
     """Run full comparison and return structured result.
 
+    Runs validation first. If any repo is missing required fields, returns
+    a result with `validation_failed: True` and an empty ranking instead of
+    producing a misleading score-based ranking.
+
     Returns:
-        dict with keys: project, matrix, comparisons, ranking
+        dict with keys: project, matrix, comparisons, ranking,
+        and optionally validation_failed / validation_errors / warning
     """
     from polyglot.deep.outputs import load_session
+    from polyglot.deep.validator import validate_all
 
     session = load_session(workspace_dir)
     if not session:
         return {"error": "No session.json found"}
 
+    # Validation gate: refuse to rank if architecture data is incomplete.
+    validation = validate_all(workspace_dir)
+    if not validation["all_pass"]:
+        errors = [entry[0] for entry in validation["summary"]
+                  if isinstance(entry, tuple) and entry and "[x]" in entry[0]]
+        return {
+            "project": session.get("project", ""),
+            "matrix": {"requirements": [], "repos": [], "matrix": []},
+            "comparisons": [],
+            "ranking": [],
+            "validation_failed": True,
+            "validation_errors": errors,
+            "warning": (
+                "DATA INCOMPLETE: architecture reports are missing required fields. "
+                "Ranking is unreliable and has been suppressed. "
+                "Run subagents first, then `deep-validate` to confirm all checks pass."
+            ),
+        }
+
     archs = _load_all_architectures(workspace_dir, session)
     matrix = build_coverage_matrix(workspace_dir, session, archs)
     comparisons = build_repo_comparisons(workspace_dir, session, archs)
-    ranking = build_ranking(comparisons)
+    ranking = build_ranking(comparisons, matrix)
 
     return {
         "project": session.get("project", ""),
@@ -181,6 +249,19 @@ def format_matrix_markdown(result: dict) -> str:
     lines = []
     lines.append(f"# Comparison Matrix: {result.get('project', 'Unnamed')}")
     lines.append("")
+
+    # Validation gate banner: surface incomplete data before any numbers.
+    if result.get("validation_failed"):
+        lines.append("> **DATA INCOMPLETE**: architecture reports are missing required fields.")
+        lines.append("> Ranking has been suppressed — it would be unreliable.")
+        lines.append("> Run subagents first, then `deep-validate` to confirm all checks pass.")
+        lines.append("")
+        errors = result.get("validation_errors", [])
+        if errors:
+            lines.append("**Validation errors:**")
+            for err in errors[:10]:
+                lines.append(f"- {err}")
+            lines.append("")
 
     matrix = result.get("matrix", {})
     requirements = matrix.get("requirements", [])
@@ -213,10 +294,15 @@ def format_matrix_markdown(result: dict) -> str:
     lines.append("")
     ranking = result.get("ranking", [])
     if ranking:
-        lines.append("| Rank | Repo | Score | Confidence | Evidence |")
-        lines.append("|------|------|-------|------------|----------|")
+        lines.append("| Rank | Repo | Score | Coverage | Confidence | Evidence |")
+        lines.append("|------|------|-------|----------|------------|----------|")
         for r in ranking:
-            lines.append(f"| {r['rank']} | {r['slug']} | {r['score']} | {r['confidence']} | {r['evidence_count']} |")
+            lines.append(
+                f"| {r['rank']} | {r['slug']} | {r['score']} | "
+                f"{r.get('coverage_ratio', '?')} | {r['confidence']} | {r['evidence_count']} |"
+            )
+    elif result.get("validation_failed"):
+        lines.append("*Ranking suppressed — see DATA INCOMPLETE banner above.*")
     lines.append("")
 
     # Repo comparisons
@@ -232,6 +318,8 @@ def format_matrix_markdown(result: dict) -> str:
         lines.append(f"- **Key types**: {c['key_type_count']}")
         lines.append(f"- **Platform APIs**: {c['platform_api_count']}")
         lines.append(f"- **Known gaps**: {c['known_gaps_summary']}")
+        sf = c.get("source_files", {})
+        lines.append(f"- **Source size**: {sf.get('total_lines', '?')} lines ({sf.get('files_read', '?')} modules read)")
         lines.append("")
 
     return "\n".join(lines)
@@ -265,9 +353,18 @@ def main(workspace_dir: str, output_dir: str = None):
     matrix = result.get("matrix", {})
     req_count = len(matrix.get("requirements", []))
     repo_count = len(matrix.get("repos", []))
-    print(f"\n[v] Compared {repo_count} repos across {req_count} requirements")
     ranking = result.get("ranking", [])
+    if result.get("validation_failed"):
+        print(f"\n[!] DATA INCOMPLETE — ranking suppressed.")
+        print(f"    Run subagents first, then `deep-validate` to confirm all checks pass.")
+        errors = result.get("validation_errors", [])
+        if errors:
+            print(f"    {len(errors)} validation error(s) — see comparison.md for details.")
+        return 0
+
+    print(f"\n[v] Compared {repo_count} repos across {req_count} requirements")
     if ranking:
-        print(f"    Top: {ranking[0]['slug']} (score={ranking[0]['score']})")
+        print(f"    Top: {ranking[0]['slug']} (score={ranking[0]['score']}, "
+              f"coverage={ranking[0].get('coverage_ratio', '?')})")
 
     return 0

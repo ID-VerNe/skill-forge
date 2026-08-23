@@ -83,13 +83,28 @@ class TestGoLookup:
 class TestProxyFallback:
     """proxy_fallback.get retries without proxy on ProxyError."""
 
-    def test_happy_path(self):
+    def test_happy_path(self, monkeypatch):
         """When the first request succeeds, no fallback is used."""
         from polyglot.common.proxy_fallback import get as proxy_get
 
+        # Mock requests.get so the test is deterministic and network-independent.
+        # The first (proxy) call succeeds, so the second (no-proxy) call must NOT run.
+        call_count = 0
+
+        def _fake_get(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            resp = requests.Response()
+            resp.status_code = 200
+            resp._content = b"ok"
+            resp.encoding = "utf-8"
+            return resp
+
+        monkeypatch.setattr(requests, "get", _fake_get)
         resp, used_no_proxy = proxy_get("https://example.com", timeout=5)
-        assert resp.status_code in (200, 404)  # 200 OK or 404 redirect
+        assert resp.status_code == 200
         assert used_no_proxy is False
+        assert call_count == 1  # happy path: exactly one call, no fallback
 
     def test_fallback_on_proxy_error(self, monkeypatch):
         """When the first request raises ProxyError, fallback retries."""

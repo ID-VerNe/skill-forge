@@ -5,6 +5,36 @@ import os
 import sys
 
 
+def validate_architecture_schema(arch: dict) -> list:
+    """Validate architecture.json against the JSON Schema using jsonschema.
+
+    Catches type/structure/enum violations that field-presence checks miss:
+    e.g. `confidence` as an object instead of a number, `evidence` entries using
+    a `lines` string instead of `line_start`/`line_end` ints, `known_gaps`
+    entries using custom field names instead of `requirement`/`status`.
+
+    Returns:
+        List of (status, message) tuples — each violation is a hard error ('x').
+    """
+    import jsonschema
+
+    schema_path = os.path.join(os.path.dirname(__file__), "schemas", "architecture.schema.json")
+    with open(schema_path, encoding="utf-8") as f:
+        schema = json.load(f)
+
+    errors = []
+    try:
+        # Use Draft202012Validator to collect ALL violations, not just the first.
+        cls = jsonschema.validators.validator_for(schema)
+        validator = cls(schema)
+        for err in validator.iter_errors(arch):
+            path = " → ".join(str(p) for p in err.absolute_path) if err.absolute_path else "root"
+            errors.append(("x", f"schema violation at '{path}': {err.message}"))
+    except jsonschema.SchemaError as e:
+        errors.append(("!", f"schema file itself is invalid: {e.message}"))
+    return errors
+
+
 def validate_reuse_map(workspace_dir: str, slug: str) -> list:
     """Validate reuse-map.json for a single repo if it exists.
 
@@ -122,14 +152,16 @@ def validate_repo_artifacts(workspace_dir: str, slug: str, include_reuse_map: bo
     # 3. Required fields in architecture.json
     required_fields = [
         "repo", "slug", "source_path", "commit", "one_line_summary",
-        "core_modules", "key_types", "platform_apis", "known_gaps",
-        "confidence", "evidence",
+        "language", "core_modules", "key_types", "platform_apis",
+        "known_gaps", "confidence", "evidence",
     ]
     missing = [f for f in required_fields if f not in arch]
     if missing:
         results.append(("x", f"architecture.json missing fields: {', '.join(missing)}"))
     else:
         results.append(("v", "architecture.json has all required fields"))
+        # 3b. Strict schema validation (type/structure/enum) via jsonschema
+        results.extend(validate_architecture_schema(arch))
 
     # 4. confidence in 0-1
     conf = arch.get("confidence", -1)
