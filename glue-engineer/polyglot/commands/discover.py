@@ -51,17 +51,29 @@ def cmd_discover(args):
             if backend_lang:
                 try:
                     mod = import_backend(backend_lang, "scout")
-                    # Search by repo name (last segment after /) for ecosystem match
-                    pkg_name = repo["name"].split("/")[-1] if "/" in repo["name"] else repo["name"]
-                    detail = mod.search(pkg_name, limit=1)
-                    if detail and detail.get("results"):
-                        d = detail["results"][0]
-                        enriched["version"] = d.get("version", "") or enriched["version"]
-                        enriched["downloads"] = d.get("downloads", 0) or enriched["downloads"]
-                        enriched["registry_url"] = d.get("registry_url", "") or enriched["registry_url"]
-                        enriched["license_name"] = d.get("license_name", "") or enriched["license_name"]
-                        enriched["dependencies"] = d.get("dependencies", [])
-                        enriched["ecosystem_lookup"] = True
+                    if backend_lang == "go":
+                        # Go modules are keyed by their full module path, not
+                        # the short repo name. Use proxy.golang.org exact lookup
+                        # (not pkg.go.dev text search) for accurate version.
+                        module_path = f"github.com/{repo['name']}"
+                        detail = mod.lookup(module_path)
+                        if detail:
+                            enriched["version"] = detail.get("version", "") or enriched["version"]
+                            enriched["last_commit"] = detail.get("last_commit", "") or enriched["last_commit"]
+                            enriched["registry_url"] = f"https://pkg.go.dev/{module_path}"
+                            enriched["ecosystem_lookup"] = True
+                    else:
+                        # Search by repo name (last segment after /) for ecosystem match
+                        pkg_name = repo["name"].split("/")[-1] if "/" in repo["name"] else repo["name"]
+                        detail = mod.search(pkg_name, limit=1)
+                        if detail and detail.get("results"):
+                            d = detail["results"][0]
+                            enriched["version"] = d.get("version", "") or enriched["version"]
+                            enriched["downloads"] = d.get("downloads", 0) or enriched["downloads"]
+                            enriched["registry_url"] = d.get("registry_url", "") or enriched["registry_url"]
+                            enriched["license_name"] = d.get("license_name", "") or enriched["license_name"]
+                            enriched["dependencies"] = d.get("dependencies", [])
+                            enriched["ecosystem_lookup"] = True
                 except Exception as e:
                     # Ecosystem lookup is optional enrichment — failures are non-fatal
                     pass

@@ -14,7 +14,7 @@ Reference: [[polyglot/__main__.py]]
 
 ### CLI Dispatcher
 
-`polyglot/router.py` parses subcommands and dispatches to the appropriate module. Supports: `scout`, `cross-search`, `cap-list`, `cap-match`, `bridge`, `mvp-scope`, `deep-init`, `deep-validate`, `deep-compare`, `deep-summarize`, `deep-clean`.
+`polyglot/router.py` parses subcommands and dispatches to the appropriate module. Supports: `scout`, `audit`, `analyze`, `list`, `cross-search`, `cap-list`, `cap-match`, `bridge`, `strategies`, `mvp-scope`, `discover`, `deep-init`, `deep-pack`, `deep-validate`, `deep-compare`, `deep-summarize`, `deep-clean`.
 
 Reference: [[polyglot/router.py]]
 

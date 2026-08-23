@@ -247,6 +247,7 @@ python -m polyglot deep-clean [dir] --all   # also clean tasks/ and logs/
 python -m polyglot scout python "pdf parser"
 python -m polyglot scout rust "serialization"
 python -m polyglot cross-search "json parser" --languages python,rust
+python -m polyglot discover "byd vehicle" --qualifiers "language:python" --sort stars
 python -m polyglot cap-list
 python -m polyglot cap-match python orjson rust serde_json
 python -m polyglot bridge python orjson rust serde_json

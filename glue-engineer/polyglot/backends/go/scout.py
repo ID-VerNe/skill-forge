@@ -19,8 +19,10 @@ from polyglot.common.cache import cache_get, cache_set, cache_get_stale
 from polyglot.common.retry import retry_call
 from polyglot.common.github import batch_stars
 from polyglot.common.gh_slug import parse_github_slug
+from polyglot.common.proxy_fallback import get as proxy_get
 
 PKG_GO_DEV_SEARCH_URL = "https://pkg.go.dev/search"
+GO_MODULE_PROXY = "https://proxy.golang.org"
 
 _BROWSER_HEADERS = {
     "User-Agent": (
@@ -291,10 +293,52 @@ def _days_since(iso_date: str) -> int:
         return 999
 
 
+def lookup(module_path: str) -> dict | None:
+    """Exact version lookup via the Go module proxy.
+
+    Queries ``https://proxy.golang.org/{module_path}/@latest`` — the Go
+    ecosystem's authoritative "latest version" endpoint (analogous to PyPI's
+    /pypi/{name}/json).  Returns ``{"version":..., "last_commit":...}`` on
+    success, or None on 404 (not a Go module) or any network failure.
+
+    Uses the shared proxy_fallback so a temporarily-unavailable local proxy
+    is retried without the proxy.  Results are cached for 24h; negative
+    results (404) are cached for 1h to avoid hammering the proxy.
+    """
+    cache_key = f"go:lookup:{module_path}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        # An empty dict is the negative-cache sentinel.
+        return None if cached == {} else cached
+
+    try:
+        resp, _ = proxy_get(
+            f"{GO_MODULE_PROXY}/{module_path}/@latest", timeout=10
+        )
+        if resp.status_code == 404:
+            cache_set(cache_key, {}, ttl_seconds=3600)
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        result = {
+            "version": data.get("Version", ""),
+            "last_commit": data.get("Time", ""),
+        }
+        cache_set(cache_key, result, ttl_seconds=86400)
+        return result
+    except (requests.ConnectionError, requests.Timeout, ValueError):
+        return None
+
+
 # ── Minimal smoke test ──
 if __name__ == "__main__":
+    import json as _json
+    print("=== search ===")
     out = search("gin", limit=3)
     print(f"Found {len(out['results'])} results, errors={len(out['errors'])}")
     for r in out["results"]:
         print(f"  {r['name']} ({r['version']}) — stars={r['stars']}, "
               f"downloads={r['downloads']}, score={r['score']:.3f}")
+    print("=== lookup ===")
+    lu = lookup("github.com/gin-gonic/gin")
+    print(_json.dumps(lu, indent=2, ensure_ascii=False))

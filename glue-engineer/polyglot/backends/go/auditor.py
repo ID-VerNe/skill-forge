@@ -1,8 +1,8 @@
 """
 polyglot/backends/go/auditor.py — Go module auditor backend.
 
-Fetches module metadata from pkg.go.dev and attempts to extract
-exported symbols from the module's source code on GitHub.
+Fetches module metadata via the Go module proxy (proxy.golang.org/@latest)
+and attempts to extract exported symbols from the module's source on GitHub.
 """
 
 import sys
@@ -18,9 +18,6 @@ from polyglot.common.cache import cache_get, cache_set, cache_get_stale
 from polyglot.common.retry import retry_call
 
 
-PKG_GO_DEV_MOD_URL = "https://api.gpkg.go.dev/mod"
-
-
 def audit(name: str, version: str = "") -> dict:
     """Audit a Go module. Returns dict matching AuditOutput schema."""
     cache_key = f"audit:go:{name}:{version or 'latest'}"
@@ -32,27 +29,28 @@ def audit(name: str, version: str = "") -> dict:
     start = time.monotonic()
     errors = []
 
-    # Fetch module info from pkg.go.dev
+    # Resolve the latest version + commit time via the module proxy.
     ver = version or "latest"
-    mod_info, _, err = _fetch_module_info(name, ver)
-    if err:
-        errors.append(str(err)[:200])
+    mod_info = _fetch_module_info(name, ver)
+    if isinstance(mod_info, str) and mod_info.startswith("error:"):
+        errors.append(mod_info[6:].strip()[:200])
+        mod_info = None
 
     exports = []
     repo_url = ""
 
     if mod_info:
-        # Try to extract repo URL from module path
+        resolved_version = mod_info.get("version", ver)
         repo_url = _path_to_repo_url(name)
 
         # Attempt to fetch source from GitHub raw
         if repo_url and "github.com" in repo_url:
-            gh_exports = _fetch_github_exports(repo_url, name, ver)
+            gh_exports = _fetch_github_exports(repo_url, name, resolved_version)
             if gh_exports:
                 exports.extend(gh_exports)
             else:
                 # Fallback: try proxy.golang.org for source
-                gh_exports = _fetch_proxy_exports(name, ver)
+                gh_exports = _fetch_proxy_exports(name, resolved_version)
                 if gh_exports:
                     exports.extend(gh_exports)
 
@@ -87,42 +85,26 @@ def audit(name: str, version: str = "") -> dict:
     return result
 
 
-def _fetch_module_info(name: str, version: str) -> tuple:
-    """Fetch module info from pkg.go.dev API."""
-    url = f"{PKG_GO_DEV_MOD_URL}/{name}@{version}"
+def _fetch_module_info(name: str, version: str) -> dict | None:
+    """Fetch module version info via the Go module proxy.
 
-    def _get():
-        resp = requests.get(url, timeout=15, headers={"Accept": "application/json"})
-        if resp.status_code == 200:
-            try:
-                return resp.json()
-            except ValueError:
-                pass
-        # Try the overview endpoint as fallback
-        resp2 = requests.get(
-            f"https://api.gpkg.go.dev/{name}",
-            timeout=15,
-            headers={"Accept": "application/json"},
-        )
-        if resp2.status_code == 200:
-            try:
-                return resp2.json()
-            except ValueError:
-                pass
-        # Try gh-pages-style endpoint
-        resp3 = requests.get(
-            f"https://pkg.go.dev/{name}?tab=doc&goos=linux&goarch=amd64",
-            timeout=15,
-        )
-        resp3.raise_for_status()
-        return None
+    Uses ``https://proxy.golang.org/{module}/@latest`` (the authoritative
+    "latest version" endpoint) and returns ``{"version":..., "last_commit":...}``.
+    Returns None on 404 or network failure; an "error: ..." string on the
+    "latest" sentinel being requested but the proxy yielding a non-200.
+    """
+    from polyglot.backends.go.scout import lookup
 
-    data, attempts, err = retry_call(
-        _get,
-        max_retries=2,
-        retryable_exceptions=(requests.ConnectionError, requests.Timeout, requests.RequestException),
-    )
-    return data, attempts, err
+    # If the caller asked for a pinned version we can still get the latest
+    # commit time via the @latest endpoint — version pinning for symbol
+    # extraction is best-effort here.
+    result = lookup(name)
+    if result is None:
+        return "error: module not found on proxy.golang.org (404 or network error)"
+    return {
+        "version": result.get("version", version if version != "latest" else ""),
+        "last_commit": result.get("last_commit", ""),
+    }
 
 
 def _path_to_repo_url(path: str) -> str:

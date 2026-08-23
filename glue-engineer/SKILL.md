@@ -1,7 +1,7 @@
 ---
 name: glue-engineer
 description: >-
-  CRITICAL: This skill REQUIRES running polyglot CLI tools for ALL design/architecture tasks. When user says "使用胶水程序员skill" or "帮我设计/构建/评估一个系统", you MUST: (1) run `polyglot scout <lang> <keyword>` to search libraries, (2) run `polyglot mvp-scope` for prioritization, (3) run `polyglot cap-list`/`cap-match` for license checks. NEVER answer from internal knowledge alone. Multi-language, multi-agent pipeline. Builds solutions by composing existing open-source libraries across Python/JS/Rust/Java/Kotlin/C/C++. v3 adds cross-language search, capability ontology matching, scaffold glue code generation, and MVP scoping.
+  CRITICAL: This skill REQUIRES running polyglot CLI tools for ALL design/architecture tasks. When user says "使用胶水程序员skill" or "帮我设计/构建/评估一个系统", you MUST: (1) run `polyglot scout <lang> <keyword>` to search libraries, (2) run `polyglot mvp-scope` for prioritization, (3) run `polyglot cap-list`/`cap-match` for license checks. NEVER answer from internal knowledge alone. Multi-language, multi-agent pipeline. Builds solutions by composing existing open-source libraries across Python/JS/Rust/Java/Kotlin/C/C++. v3 adds cross-language search, capability ontology matching, scaffold glue code generation, and MVP scoping. Also supports `polyglot discover` for GitHub repo search (项目级/找"有没有人做过") versus `scout` (包级/找要装的库).
 ---
 
 	# Glue Engineer — Search & Deep Mode
@@ -46,7 +46,19 @@ description: >-
 	  │       ├─ 是 → 执行 ===MODE: DEEP=== 子流程
 	  │       └─ 否 → 结束，输出最终方案
 	  │
-	  └─ 单纯搜库/审计/匹配/生成胶水代码？
+	  ├─ 找"有没有人做过 X" / GitHub 仓库检索 / 非生态注册表项目？
+  │   ↓
+  │   ╔══════════════════════════════════╗
+  │   ║     ===MODE: DISCOVER===         ║
+  │   ║  python -m polyglot discover      ║
+  │   ║  (无需询问，直接执行)             ║
+  │   ╚══════════════════════════════════╝
+  │
+  │   python -m polyglot discover "<keyword>" --limit N
+  │     [--qualifiers "stars:>50 language:python"] [--sort stars]
+  │   → 输出 GitHub 仓库列表（星数/license/描述），Go repo 自动补 version
+  │
+  └─ 单纯搜库/审计/匹配/生成胶水代码？
 	      ↓
 	      直接跑对应的 CLI 命令，返回结果
 	```
@@ -56,6 +68,7 @@ description: >-
 	| ❌ 禁止行为 | ✅ 正确做法 |
 	|------------|------------|
 	| 使用 Claude Web Search 检索库信息 | 必须用 `python -m polyglot scout` |
+	| 用 `gh search repos` 或 WebSearch 查 GitHub 仓库 | 必须用 `python -m polyglot discover`（复用 gh 鉴权 + 缓存 + 评分 + enrichment） |
 	| 靠内部知识列库名 | 必须跑 CLI 获取真实版本号/许可证/下载量 |
 	| 跳过 CLI 命令直接出方案 | 这是本 skill 的核心价值 |
 	| 子 agent 不传 CLI 指令 | 必须在 prompt 中注入 `python -m polyglot scout` |
@@ -68,6 +81,7 @@ description: >-
 
 	| 你想干什么 | 怎么说 |
 	|-----------|--------|
+	| 🐙 **GitHub 仓库检索** | **`检索一下有没有[X]的开源项目`, `GitHub 上有没有人做过[X]`, `找[X]的逆向或非官方 SDK 项目`** |
 	| 🔍 跨生态搜索库 | `帮我找一个[语言]的[功能]库` |
 	| 🌐 多语言同时搜索 | `同时搜索 Rust 的序列化库和 Python 的 HTTP 客户端` |
 	| ⚖️ 对比几个库 | `对比一下[A]和[B]` |
@@ -299,6 +313,19 @@ description: >-
 	python -m polyglot cross-search "HTTP client" --languages python,javascript
 	```
 
+	### GitHub 仓库检索类（discover）
+	```bash
+	# 检索 GitHub 仓库（项目级：找"有没有人做过 X"）
+	python -m polyglot discover "byd remote monitor"
+	python -m polyglot discover "byd vehicle" --qualifiers "language:python" --sort stars
+	python -m polyglot discover "websocket library" --qualifiers "language:go" --sort stars --limit 5
+	python -m polyglot discover "ffmpeg" --limit 10 --no-enrich   # 跳过生态补全
+	```
+
+	> **scout vs discover 语义区分**
+	> - `scout` = **包级**检索，查生态注册表（PyPI/npm/crates/Maven/pkg.go.dev），返回"要装的库"+ 版本/下载量。
+	> - `discover` = **项目级**检索，查 GitHub 仓库（`gh search repos`），返回"有没有人做过"+ 星数/license，可选 enrichment 补生态数据。Go repo 通过 `proxy.golang.org/@latest` 精确补 version。
+
 	### 能力匹配类
 	```bash
 	# 查看能力注册表
@@ -472,6 +499,9 @@ description: >-
 	8. **deep-init 目录错误**: ~~如果在非 glue-engineer 目录运行会报 `No module named polyglot` → 必须先 `cd <glue-engineer-path>` 再执行~~ ✅ **已修复**: 现在 `python -m polyglot` 可以从任何目录运行，自动解析 polyglot package 路径。所有 `.glue/` 输出都放在 CWD 下。
 	9. **deep-clean 交互卡住**: `input()` 在 Bash 环境可能异常 → 必须使用 `--force` / `-f` 参数跳过确认
 	10. **Deep Mode 遗漏候选库**: 主 agent 主观跳过某个库 → 规则 6 强制要求传所有候选库
+	11. **discover 返回 0 结果**: gh 搜索词太宽泛/太窄 → 换关键词或放宽 `--qualifiers`；如报 `gh CLI is not authenticated` → 提示用户 `gh auth login`。
+	12. **discover Go repo 未补 version**: `proxy.golang.org` 对非 Go 模块返回 404 → 属正常（该 repo 不是 Go 模块），保留 gh 原始数据。
+	13. **audit go 报 module not found**: `proxy.golang.org/{module}/@latest` 返回 404 → 模块不存在或拼写错误；旧的 `api.gpkg.go.dev` 死域名路径已移除。
 
 	---
 
