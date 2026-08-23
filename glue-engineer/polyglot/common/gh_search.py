@@ -1,18 +1,16 @@
 """
-polyglot/common/gh_search.py — GitHub repository search via `gh search repos --json`.
+polyglot/common/gh_search.py — GitHub repository search via REST API.
 
-Wraps the authenticated `gh` CLI for structured repo search.  This avoids:
-- Direct REST API authentication plumbing (gh handles OAuth token management)
-- Rate limit self-management (gh uses the authenticated 30 req/min budget)
-- A 9th copy-paste backend directory (this is a shared module, not a backend)
+Uses direct GitHub Search API with proxy_fallback (to handle flaky proxies)
+and retry (to handle transient network failures).  Falls back to stale cache
+when all attempts fail.
 
-The `gh` CLI must be installed and authenticated (`gh auth login`).  If either
-condition is not met, the module returns empty results with a clear error.
+Token is resolved from environment or `gh auth token` via gh_auth.py.
+Authenticated requests get 30 req/min; unauthenticated get 10 req/min.
 """
 
 import json
 import os
-import subprocess
 import sys
 import time
 
@@ -20,12 +18,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from polyglot.common.cache import cache_get, cache_set, cache_get_stale
 from polyglot.common.schema import compute_score
+from polyglot.common.gh_auth import TOKEN
+from polyglot.common.proxy_fallback import get as proxy_get
+from polyglot.common.retry import retry_call
 
 
 # Cache TTL — hourly is fine for repo search results
 _SEARCH_TTL = 3600
 
-# Fields requested from `gh search repos --json`
+# Fields requested from GitHub Search API
 _GH_FIELDS = "fullName,stargazersCount,forksCount,language,description,url,updatedAt,license"
 
 # Default sort is gh's native relevance sorting (best match), which the
@@ -35,6 +36,9 @@ _DEFAULT_SORT = ""
 
 def search(query: str, limit: int = 5, qualifiers: str = "", sort: str = "") -> dict:
     """Search GitHub repositories by keyword.
+
+    Uses direct GitHub REST API with proxy fallback + retry.
+    Falls back to stale cache when all network attempts fail.
 
     Args:
         query: The search keyword (e.g. "h264 decode", "pdf parser")
@@ -56,46 +60,71 @@ def search(query: str, limit: int = 5, qualifiers: str = "", sort: str = "") -> 
     errors = []
     results = []
 
-    # Build the gh command
+    # Build the search query
     search_query = query
     if qualifiers:
         search_query = f"{query} {qualifiers}"
 
+    # GitHub Search API endpoint
+    url = "https://api.github.com/search/repositories"
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "polyglot-scout/1.0",
+    }
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+
+    params = {
+        "q": search_query,
+        "per_page": min(limit, 20),
+        "page": 1,
+    }
+    if sort and sort not in ("best-match", ""):
+        params["sort"] = sort
+
+    # Build the fetch function for retry + proxy fallback
+    def _fetch():
+        resp, used_no_proxy = proxy_get(url, timeout=20, headers=headers, params=params)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 401:
+            raise PermissionError("GitHub API token is invalid or expired")
+        if resp.status_code == 403:
+            # Rate limited — check if it's due to secondary rate limit
+            raise RuntimeError(f"GitHub API rate limited (403): {resp.headers.get('X-RateLimit-Remaining', '?')} remaining")
+        if resp.status_code == 422:
+            data = resp.json()
+            msg = data.get("message", "") or data.get("errors", [{}])[0].get("message", "")
+            raise ValueError(f"GitHub API validation error (422): {msg}")
+        raise RuntimeError(f"GitHub API returned {resp.status_code}")
+
     try:
-        cmd = [
-            "gh", "search", "repos", search_query,
-            "--limit", str(min(limit, 20)),
-            "--json", _GH_FIELDS,
-        ]
-        if sort and sort not in ("best-match", ""):
-            cmd += ["--sort", sort]  # gh native: stars | updated | forks
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            encoding="utf-8",  # gh outputs UTF-8; Windows defaults to gbk
-            timeout=30,
+        data, attempts, last_error = retry_call(
+            _fetch,
+            max_retries=2,
+            base_delay=1.0,
+            max_delay=10.0,
+            retryable_exceptions=(
+                TimeoutError,
+                ConnectionError,
+                RuntimeError,  # 403/other transient
+                OSError,
+            ),
         )
-        if proc.returncode != 0:
-            stderr = proc.stderr.strip()
-            if "required" in stderr.lower() and ("auth" in stderr.lower() or "login" in stderr.lower()):
-                errors.append(
-                    "gh CLI is not authenticated. Run `gh auth login` first."
-                )
-            elif "not found" in stderr.lower() or "no such" in stderr.lower():
-                errors.append("gh CLI is not installed. Install GitHub CLI and run `gh auth login`.")
-            else:
-                errors.append(f"gh search repos failed: {stderr[:200]}")
-        else:
-            items = json.loads(proc.stdout) if proc.stdout.strip() else []
+        if data is not None:
+            items = data.get("items", [])
             results = _parse_results(items, limit)
-    except FileNotFoundError:
-        errors.append("gh CLI not found on PATH. Install GitHub CLI and run `gh auth login`.")
-    except subprocess.TimeoutExpired:
-        errors.append("gh search repos timed out after 30s.")
-    except json.JSONDecodeError as e:
-        errors.append(f"Failed to parse gh output: {e}")
-    except OSError as e:
-        errors.append(f"Subprocess error: {e}")
+        else:
+            # All retries exhausted
+            if last_error:
+                errors.append(f"GitHub search failed after 3 attempts: {last_error}")
+            else:
+                errors.append("GitHub search failed after 3 attempts (unknown error)")
+    except (PermissionError, ValueError) as e:
+        # Non-retryable errors (bad token, bad query)
+        errors.append(str(e))
+    except Exception as e:
+        errors.append(f"GitHub search failed: {e}")
 
     output = {
         "schema": "polyglot-output-v1",
@@ -126,15 +155,15 @@ def search(query: str, limit: int = 5, qualifiers: str = "", sort: str = "") -> 
 
 
 def _parse_results(items: list, limit: int) -> list:
-    """Parse gh --json output into SearchOutput-compatible result dicts."""
+    """Parse GitHub Search API response into SearchOutput-compatible result dicts."""
     results = []
     for item in items[:limit]:
-        name = item.get("fullName", "")
-        stars = item.get("stargazersCount", 0) or 0
+        name = item.get("full_name", "")
+        stars = item.get("stargazers_count", 0) or 0
         lang = item.get("language") or ""
         desc = item.get("description") or ""
-        url = item.get("url", "")
-        updated = item.get("updatedAt", "")
+        url = item.get("html_url", "")
+        updated = item.get("updated_at", "")
         license_info = item.get("license")
 
         # Compute a score from stars + recency
@@ -157,43 +186,52 @@ def _parse_results(items: list, limit: int) -> list:
         if isinstance(license_info, str):
             license_name = license_info
         elif isinstance(license_info, dict):
-            license_name = license_info.get("spdxId") or license_info.get("name", "")
+            license_name = license_info.get("spdx_id") or license_info.get("name", "")
 
         results.append({
             "name": name,
-            "version": "",  # No version info from repo search
+            "version": "",
             "description": desc[:200] if desc else "",
             "registry_url": url,
             "stars": stars,
-            "downloads": 0,  # No download counts from repo search
+            "downloads": 0,
             "last_commit": updated,
             "license_name": license_name,
             "dependencies": [],
             "score": round(score, 2),
-            "language": lang,  # GitHub's detected language — used by discover routing
+            "language": lang,
         })
     return results
 
 
 def check_available() -> tuple[bool, str]:
-    """Check if gh CLI is available and authenticated.
+    """Check if GitHub API is accessible.
 
+    Makes a lightweight API call to verify connectivity and auth.
     Returns (available, message).
     """
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "polyglot-scout/1.0",
+    }
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+
     try:
-        proc = subprocess.run(
-            ["gh", "auth", "status"],
-            capture_output=True, encoding="utf-8", timeout=10,
+        resp, _ = proxy_get(
+            "https://api.github.com/rate_limit", timeout=10, headers=headers
         )
-        if proc.returncode == 0:
-            return True, "gh CLI authenticated"
-        return False, proc.stderr.strip()[:200]
-    except FileNotFoundError:
-        return False, "gh CLI not found on PATH"
-    except subprocess.TimeoutExpired:
-        return False, "gh auth status timed out"
-    except OSError as e:
-        return False, str(e)[:200]
+        if resp.status_code == 200:
+            data = resp.json()
+            remaining = data.get("resources", {}).get("search", {}).get("remaining", 0)
+            return True, f"GitHub API accessible ({remaining} search requests remaining)"
+        if resp.status_code == 401:
+            return False, "GitHub API token is invalid"
+        if resp.status_code == 403:
+            return False, "GitHub API rate limited"
+        return False, f"GitHub API returned {resp.status_code}"
+    except Exception as e:
+        return False, f"GitHub API unreachable: {e}"
 
 
 # ── Minimal smoke test ──
