@@ -24,6 +24,7 @@ _LANG_GRAMMARS = {
     "cpp": "tree_sitter_cpp",
 }
 
+# @lat: [[vtree#Key Concepts#Parser]]
 class PolyglotParser:
     def __init__(self):
         self._parsers = {}

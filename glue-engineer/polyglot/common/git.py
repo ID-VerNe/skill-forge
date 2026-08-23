@@ -5,6 +5,7 @@ import os
 import sys
 
 
+# @lat: [[common#Key Concepts#Git Operations]]
 def clone_repo(url: str, dest: str, depth: int = 1) -> tuple[bool, str]:
     """Shallow-clone repo. Returns (success, message)."""
     try:

@@ -4,16 +4,21 @@ glue-engineer 是一个模块化 CLI 工具，通过多阶段管道实现多语�
 
 ## Module Dependencies
 
-模块间的依赖关系图，展示从入口点到各子模块的数据流向。
+模块间的依赖关系图，展示从入口点到各子模块的数据流向。路由已拆分到 `polyglot/commands/`，`router.py` 仅保留语言注册表与后端加载器。
 
 ```
 polyglot/__main__.py  (入口点)
-  └── polyglot/router.py  (CLI 调度器)
+  └── polyglot/router.py  (CLI 调度器：语言注册表 + 后端加载)
+       ├── polyglot/commands/   (命令处理器)
+       │   ├── scout.py     — 搜索/审计/分析命令
+       │   ├── glue.py      — 胶水代码生成命令
+       │   ├── discover.py  — GitHub 检索命令
+       │   └── deep.py      — Deep Mode 命令
        ├── polyglot/deep/     (v4 Deep Mode)
        │   ├── outputs.py     — 工作空间管理
        │   ├── repo_resolver.py — URL 解析 + git clone
        │   ├── packager.py    — 子 agent 任务提示生成
-       │   ├── validator.py   — 工件验证
+       │   ├── validator.py   — jsonschema 严格校验工件
        │   ├── comparer.py    — 覆盖率矩阵 + 排名
        │   ├── summarizer.py  — 报告草稿生成
        │   ├── license.py     — 许可证兼容性引擎
@@ -27,14 +32,15 @@ polyglot/__main__.py  (入口点)
        │   ├── strategy_selector.py  — 策略选择
        │   ├── verifier.py    — 方案验证
        │   └── generators/    — 胶水代码生成器
-       ├── polyglot/backends/   (6 语言后端)
-       │   ├── {python, javascript, rust, java, kotlin, c_cpp}/
+       ├── polyglot/backends/   (8 语言后端)
+       │   ├── {python, javascript, rust, java, kotlin, c_cpp, php, go}/
        │   │   ├── scout.py    — 库搜索
        │   │   ├── auditor.py  — 库审计
        │   │   └── installer.py — 安装支持
        ├── polyglot/common/     (共享基础设施)
        │   ├── schema.py    — 共享 schema 验证
        │   ├── git.py       — git 操作
+       │   ├── github.py / gh_search.py — GitHub API 检索
        │   ├── platform.py  — 平台检测
        │   ├── cache.py     — 缓存
        │   └── reporters.py — 报告输出
@@ -71,7 +77,7 @@ Deep Mode 通过克隆仓库、派出 subagent 进行源码级分析，生成覆
 User Input → deep-init (创建 workspace + clone repos)
           → deep-pack (生成 subagent 任务提示)
           → 并行 subagent (glue-repo-architect 每 repo 一个)
-          → deep-validate (验证 subagent 输出)
+          → deep-validate (jsonschema 严格校验 subagent 输出)
           → deep-compare (生成覆盖率矩阵 + 排名)
           → deep-summarize (生成报告草稿)
           → deep-clean (清理克隆的 repos)
@@ -92,3 +98,9 @@ User Input → deep-init (创建 workspace + clone repos)
 
 ### 许可证兼容性引擎
 `license.py` 提供确定性许可证检查（无需 LLM），基于预定义的兼容性矩阵判断 reuse mode（copy/port/wrap/reference_only/avoid）。
+
+### Schema 严格校验
+`validator.py` 将 subagent 的架构报告接入 jsonschema 严格校验，一次性举报所有类型/结构/枚举违规。`comparer.py` 在数据不完整时抑制排名并输出 DATA INCOMPLETE 横幅。
+
+### 覆盖率主导排名
+`comparer.py` 排名公式 score = coverage×0.4 + confidence×0.3 + evidence×0.3，覆盖率优先；`known_gaps` 覆盖不足处如实下探，参考真实实现的 coverage_ratio 计算。

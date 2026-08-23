@@ -47,6 +47,7 @@ def _normalize_status(val) -> str:
     return "missing"
 
 
+# @lat: [[deep#Key Concepts#Comparison]]
 def build_coverage_matrix(workspace_dir: str, session: dict, archs: dict = None) -> dict:
     """Build a requirements-coverage matrix from all architecture reports.
 

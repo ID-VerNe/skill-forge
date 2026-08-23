@@ -81,6 +81,7 @@ class VerificationReport:
         return "\n".join(lines)
 
 
+# @lat: [[glue#Key Concepts#Verification]]
 class Verifier:
     """Progressive verification for generated glue code.
 

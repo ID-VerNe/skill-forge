@@ -27,6 +27,7 @@ class SearchResult:
     score: float = 0.0          # 0.0-1.0 composite quality score
 
 
+# @lat: [[common#Key Concepts#Schema Validation]]
 @dataclass
 class SearchOutput:
     """Unified output schema — every scout returns this."""

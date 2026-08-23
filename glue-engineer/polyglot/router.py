@@ -22,6 +22,7 @@ if _poly_dir not in sys.path and os.path.isdir(_poly_dir):
 
 BACKENDS_DIR = os.path.join(os.path.dirname(__file__), "backends")
 
+# @lat: [[polyglot#Key Concepts#Language Resolution]]
 LANGUAGES = {
     "python": "python",
     "py": "python",
@@ -54,6 +55,7 @@ def resolve_language(lang: str) -> str:
     return LANGUAGES.get(lang, lang)
 
 
+# @lat: [[backends#Key Concepts#Dynamic Loading]]
 def import_backend(language: str, tool: str):
     """Dynamically import a backend module."""
     path = os.path.join(BACKENDS_DIR, language, f"{tool}.py")
@@ -122,6 +124,7 @@ def _build_parser():
     return parser
 
 
+# @lat: [[polyglot#Key Concepts#CLI Dispatcher]]
 def main():
     parser = _build_parser()
     try:

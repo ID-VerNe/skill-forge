@@ -15,6 +15,7 @@ from polyglot.glue.registry_data import STARTER_REGISTRY
 from polyglot.glue.capability_matcher import match_capabilities
 
 
+# @lat: [[glue#Key Concepts#Capability Ontology]]
 class CapabilityRegistry:
     """Registry of library capabilities.
 

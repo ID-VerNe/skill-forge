@@ -46,6 +46,7 @@ from polyglot.glue.helpers import (
     build_pair_id,
 )
 
+# @lat: [[glue#Key Concepts#Schema]]
 __all__ = [
     "Parameter",
     "FunctionSignature",

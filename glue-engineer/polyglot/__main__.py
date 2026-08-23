@@ -22,5 +22,6 @@ _existing = os.environ.get("PYTHONPATH", "")
 if _skill_root not in _existing.split(os.pathsep):
     os.environ["PYTHONPATH"] = _skill_root + os.pathsep + _existing
 
+# @lat: [[polyglot#Key Concepts#Entry Point]]
 from polyglot.router import main
 main()

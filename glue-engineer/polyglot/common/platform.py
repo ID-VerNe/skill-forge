@@ -6,6 +6,7 @@ import subprocess
 import shutil
 
 
+# @lat: [[common#Key Concepts#Platform Detection]]
 def detect_os() -> str:
     """Returns 'windows', 'macos', or 'linux'."""
     if sys.platform == "win32":

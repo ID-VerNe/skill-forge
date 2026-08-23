@@ -58,6 +58,7 @@ STRATEGY_RULES = {
 }
 
 
+# @lat: [[glue#Key Concepts#Strategy Selection]]
 def select_strategy(
     src: LibraryEndpoint,
     dst: LibraryEndpoint,

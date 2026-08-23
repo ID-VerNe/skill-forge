@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 
 
+# @lat: [[deep#Key Concepts#Workspace]]
 def create_workspace(workspace_dir: str):
     """Create the .glue/deep/ directory structure."""
     dirs = [

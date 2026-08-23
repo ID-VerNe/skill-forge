@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from common.schema import SearchOutput, AuditOutput, ProbeOutput
 
 
+# @lat: [[common#Key Concepts#Reporters]]
 def search_to_md(output) -> str:
     lines = [
         f"## Search Results: {output.language}",

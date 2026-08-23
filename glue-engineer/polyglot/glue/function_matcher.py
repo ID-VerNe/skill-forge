@@ -26,6 +26,7 @@ from polyglot.glue.return_transform import guess_return_transform
 # ═══════════════════════════════════════════════════════════════════
 
 
+# @lat: [[glue#Key Concepts#Function Matching]]
 class FunctionMatcher:
     """Matches functions between source and destination libraries.
 

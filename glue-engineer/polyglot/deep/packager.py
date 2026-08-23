@@ -4,6 +4,7 @@ import os
 import json
 
 
+# @lat: [[deep#Key Concepts#Pipeline Stages]]
 def build_architect_task(session: dict, repo_entry: dict, workspace_dir: str) -> str:
     """Build a .architect.task.md prompt string for glue-repo-architect.
 
