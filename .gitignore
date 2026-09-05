@@ -43,3 +43,6 @@ glue-engineer/.glue/
 /OfficeCLI/
 /interfaces-skills/
 /scandinavian-design/
+
+# .plan — agent 规划草稿,不作为仓库内容
+/.plan/
