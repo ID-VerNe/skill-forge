@@ -20,6 +20,7 @@ from urllib3.util.retry import Retry
 
 from polyglot.common.cache import cache_get, cache_set
 from polyglot.common.gh_auth import TOKEN, is_authenticated
+from polyglot.common.net import ensure_system_trust  # noqa: F401 — injects OS trust store
 
 
 GITHUB_API_BASE = "https://api.github.com"

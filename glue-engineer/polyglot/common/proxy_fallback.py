@@ -16,6 +16,8 @@ Usage:
 
 import requests
 
+from polyglot.common.net import ensure_system_trust  # noqa: F401 — injects OS trust store
+
 _PROXY_RETRYABLE = (
     requests.exceptions.ProxyError,
     requests.exceptions.ConnectionError,

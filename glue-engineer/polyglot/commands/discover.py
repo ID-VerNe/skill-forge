@@ -10,6 +10,7 @@ import json
 
 from polyglot.router import import_backend
 from polyglot.common.gh_search import search as gh_search
+from polyglot.common.net import ensure_system_trust  # noqa: F401 — injects OS trust store
 
 
 def add_args(sub):

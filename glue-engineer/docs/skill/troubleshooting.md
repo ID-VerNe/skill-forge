@@ -7,6 +7,7 @@
 | 问题 | 原因 | 解决 |
 |------|------|------|
 | `discover` 返回 0 结果 | gh 搜索词太宽泛/太窄 | 换关键词或放宽 `--qualifiers`；如报 `gh CLI is not authenticated` → 提示用户 `gh auth login` |
+| `discover`/`scout`/`audit` 全部报 `SSLCertVerificationError: unable to get local issuer certificate` | Steam++/SteamTools 等 MITM 加速器用自签 root CA 截获 HTTPS，而 Python 默认信任 certifi（打包的 Mozilla 根库）不含该 CA | Steel++ 保持开启即可：polyglot 已在导入时自动注入 OS 系统证书库（`polyglot/common/net.py` + `polyglot/vendor/truststore`），与 `gh`/`git`/浏览器行为一致。仍失败时设 `POLYGLOT_SYSTEM_TRUST=0` 临时退回 certifi 排查，或确认加速器 CA 已装入 Windows 根证书库 |
 | `discover` Go repo 未补 version | `proxy.golang.org` 对非 Go 模块返回 404 | 属正常（该 repo 不是 Go 模块），保留 gh 原始数据 |
 | `audit go` 报 module not found | `proxy.golang.org/{module}/@latest` 返回 404 | 模块不存在或拼写错误；旧的 `api.gpkg.go.dev` 死域名路径已移除 |
 | `deep-init` 克隆失败 | GitHub 不可达 | 确保 GitHub 能访问，减少 repo 列表 |
