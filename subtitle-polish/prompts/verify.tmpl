@@ -38,5 +38,8 @@
 ### 发现 {n}
 结论: 确认 | 驳回 | 存疑
 corrected_srt_id: <仅当 id 标错但英文真实存在时给纠正值，否则留空>
+context_error: <若主 agent 喂来的"上下文块"srt_id 与切片文件实际不符，描述错误（如"上下文标 [170]=Um, which was...，实际 srt 170=What color is a banana?"）；否则留空>
 理由: <如果确认，说明为何无法反驳；如果驳回，说明反驳依据；如果存疑，说明无法核验的点>
 ```
+
+**context_error 的处理**：主 agent 读到任何非空的 `context_error`，必须重新从切片文件按 srt_id 直读构造上下文、重跑该批 verify，不能把纠正埋进理由文本后照旧写报告。

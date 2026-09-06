@@ -20,7 +20,8 @@ import pysubs2
 
 from lib.ass_srt_pair import style_to_track
 from lib.log import append_log, make_batch_id
-from apply_fixes import _resolve_work_dir, _find_paired_srt, parse_srt, _build_srt_index
+from lib.paths import resolve_work_dir
+from apply_fixes import _find_paired_srt, parse_srt, _build_srt_index
 
 
 def collect_files(files_glob: list) -> list:
@@ -120,7 +121,7 @@ def main():
     ap.add_argument("--work-dir", default=".subtitle-polish")
     args = ap.parse_args()
 
-    wd = _resolve_work_dir(args.work_dir)
+    wd = resolve_work_dir(args.work_dir)
     files = collect_files(args.files)
     if not files:
         print("[!] 无匹配文件", file=sys.stderr)

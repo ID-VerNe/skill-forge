@@ -76,7 +76,8 @@
 │   ├── audit-report.md       # 主审计报告（小节式，严重度排序）
 │   ├── <stem>-detail.md      # 每文件明细（多文件时）
 │   ├── dry-run.md            # 修复 dry-run 预览
-│   └── precheck-punct.md     # 标点预检报告
+│   ├── precheck-punct.md     # 标点预检报告
+│   └── verify-fixes.md       # 执行后验证报告
 ├── fixes.json       # 主修清单（1-6 类，是脚本的输入）
 ├── optional-fixes.json  # 第 7 类低严重度
 └── log.jsonl        # 操作日志（不进 git）

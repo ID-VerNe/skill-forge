@@ -35,12 +35,6 @@ from lib.paths import resolve_work_dir
 WORK_DIR = ".subtitle-polish"
 
 
-def _resolve_work_dir(work_dir: str) -> str:
-    """兼容旧调用名，转发到 lib.paths.resolve_work_dir。"""
-    return resolve_work_dir(work_dir)
-    return os.path.join(os.getcwd(), ".subtitle-polish")
-
-
 def load_fixes(path: str) -> list:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -325,7 +319,7 @@ def main():
     args = ap.parse_args()
 
     if args.rollback:
-        wd = _resolve_work_dir(args.work_dir)
+        wd = resolve_work_dir(args.work_dir)
         kwargs = {}
         spec = args.rollback
         if spec.startswith("batch="):
@@ -342,7 +336,7 @@ def main():
     if not args.fixes:
         ap.error("需要 fixes.json 或 --rollback")
 
-    wd = _resolve_work_dir(args.work_dir)
+    wd = resolve_work_dir(args.work_dir)
     fixes = load_fixes(args.fixes)
     if args.dry_run:
         run_dry_run(fixes, wd)

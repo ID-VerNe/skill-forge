@@ -56,10 +56,21 @@ python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slice
   `<srt_id> | <ass_time> | <英文> | <中文> | <注释>`
 - 头注列异常标记：ASS_HAS_SRT_NONE / SRT_HAS_ASS_NONE / ONE_TO_MANY / MULTI_SAME_LANG / ASS_TRACK_OVERWRITE
 
+### 2.5. 标点预检
+
+切片提取后、审计前，对成品 ASS 跑标点规范化预检（对照 translate_principle pipeline 的标点规则）：
+```bash
+python <skill>/scripts/precheck_punct.py <ass_file_or_dir> --out .subtitle-polish
+```
+- 默认 dry-run，输出 `.subtitle-polish/reports/precheck-punct.md`，列出中文行标点问题（`……`→`…` 残留、中文标点 `，。、`、非数字间英文 `.,`、连续空格、连续横杠、注释括号）。
+- **只查中文行**：英文行是源片台词，连续空格/`--` 是口语特征，不检查。
+- 这一步**不自动改文件**（默认 dry-run）。标点问题作为**第 7 类候选**喂给审计 agent（审计时若发现 precheck 报的行确实该改，归第 7 类进 optional-fixes）。
+- 人若想精校前先统一标点，可在门 1 后单独 `--accept` 跑一次 precheck（独立 batch，可回滚），与主修 fixes 分开。
+
 ### 3. 审计（自适应起 agent）
 
 - 每文件份数 = `max(1, round(块数/700))`。
-- **小文件短路**：单文件块数 < 200 时，主 agent 可直接审计该切片，不必另起子 agent（省成本）。
+- **小文件短路**：单文件块数 ≤ 200 时，主 agent 可直接审计该切片，不必另起子 agent（省成本）。> 200 必须起子 agent。边界明确，不要因"已读完整切片"自行放宽阈值。
 - 每份起一个子 agent，prompt 用 `prompts/audit.tmpl`，填入 `{slice_path}`、`{start_block}`、`{end_block}`、`{project_context}`。
 - project_context 来源（按优先级）：① 用户 prompt 里写的背景；② `.subtitle-polish/context.md`；③ **两者都没有时，主 agent 读 SRT 前 50 块 + ASS 样式自动合成一段项目背景**（领域、话题、疑似专名列表）。
 - 子 agent 后台跑期间，**主 agent 用 grep/正则独立预扫可疑点**（专名不一致、异常字符、ASR 错词模式），子 agent 返回后合并两边发现。
@@ -69,8 +80,9 @@ python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slice
 
 - 把同类问题打包给一个验证 agent，prompt 用 `prompts/verify.tmpl`（支持 `{findings}` 列表，多条独立给结论）。
 - 输入：每条问题 + 前后各 5 块上下文 + srt 原文。
+- **上下文构造约束**：主 agent 给 verify agent 喂"前后各 5 块"时，**必须按 srt_id 从切片文件逐行直读**，禁止手工编号、禁止凭记忆截取。上下文块的 srt_id 与切片文件一致，verify agent 据此核对发现里的 srt_id 是否对应 srt 原文。手工编号会引入偏移幻觉（上一轮实测主 agent 把上下文 srt_id 整体偏移 -2，verify agent 即便读了 srt 也被误导）。
 - **adversarial 默认驳回**：只有找不到反驳理由才确认。
-- 验证 agent 发现 srt_id 与 srt 原文不符时，输出 `corrected_srt_id`（纠正后定位键），主 agent 据此修正 fixes.json。
+- 验证 agent 发现 srt_id 与 srt 原文不符时，输出 `corrected_srt_id`（发现报的 id 错但英文真实存在时）；发现**喂来的上下文块 srt_id 与实际不符**时，输出 `context_error`（结构化字段，描述哪个上下文块 id 错了）。主 agent 见到 `context_error` 必须重读切片构造上下文重跑 verify，不能埋掉。
 - 补 agent 触发（绝对阈值，非相对均值）：某文件验证驳回率 > 40%，或确认问题密度 > 1/100 块 → 补 agent 重看**整个文件**。最多补 2 轮。单文件场景阈值同样适用。
 
 ### 5. 合并报告
@@ -87,18 +99,20 @@ python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slice
   - 建议: <建议译文>
   ```
 - id 空间：单文件 `1..N`；多文件 `<shortname>#<srt_id>`（如 `e02#152`）。
-- 第 7 类（低严重度）单独写 `.subtitle-polish/reports/optional-fixes.md`。
+- **第 7 类（低严重度）必须单独写** `.subtitle-polish/reports/optional-fixes.md`，不能塞进 audit-report.md 的附注里。audit-report.md 的"未报项说明"只放核验后排除的疑似项（经字节核验 Unicode 正确的疑似错字、经查证确认合法的 ASR 用法），不放第 7 类润色项。
 
 ### 6. 人确认门1
 
 - 把 audit-report.md 路径告诉用户，**停下**。
 - 用户回复形式："修 <id列表>，<id> 是误报，<id> 特意翻的"。
+- **回复自相矛盾时**（如"6 字幕正确"+"修 1-4 和 6"）**不要猜**，用 AskUserQuestion 对矛盾的 id 逐条澄清：accepted / misreport / intentional / skipped。自然语言报 id 列表容易自带矛盾，逐条结构化澄清能从源头消除。
 - 区分 `status` 字段（fixes.json 里记）：`accepted`（修）、`misreport`（误报，不该报）、`intentional`（特意翻的，译文本就对的）、`skipped`（暂不处理）。所有非 accepted 的都 `enabled=false` 不执行，但 status 记原因。
 - 用户也可能直接给意见让重审某条。
 
 ### 7. 生成 fixes.json
 
-- 按用户选的 id 生成 `.subtitle-polish/fixes.json`（1-6 类）。
+- 按用户在门 1 对每条发现的裁定生成 `.subtitle-polish/fixes.json`。
+- **门 1 涉及的每个 id 都要进 fixes.json**，包括用户标"误报/特意/跳过"的——这些条目 `enabled=false`、`status` 填 `misreport`/`intentional`/`skipped`，不执行但留追溯（否则 fixes.json 与 audit-report 对不上，回滚时也无这些条目的决策记录）。
 - 每条：`{id, audit_id, file, srt_id, track, action, suggested_new, final_new, category, reason, enabled, status, srt_path}`
   - `audit_id`：对应审计报告里的发现编号；`id` 是 fix 自身编号。一条审计发现可拆多条 fix，id 用 `<audit_id><suffix>`（如 `1a`/`1b`/`3a`），audit_id 为父。
   - `final_new` 缺省 = `suggested_new`；用户改过则覆盖。
@@ -119,6 +133,7 @@ python <skill>/scripts/apply_fixes.py .subtitle-polish/fixes.json --dry-run
 
 - 把 dry-run.md 路径告诉用户，**停下**。
 - 用户显式 accept 后才执行。**门1的"修 1-5"只授权生成 fixes.json 和跑 dry-run，不等于门2通过**。除非用户在门1明确说"全修并直接执行"（合并语义），否则必须等门2独立确认。
+- 用 AskUserQuestion 让用户选译文时，**选项 label 必须唯一**；省略号统一全角 `……` 或半角 `…`，不要混用（视觉差异极小易被当重复，上一轮实测因此触发校验报错要重试）。
 
 ### 10. 执行
 
@@ -129,9 +144,15 @@ python <skill>/scripts/apply_fixes.py .subtitle-polish/fixes.json --accept --bat
 - 每条写 `.subtitle-polish/log.jsonl`（ts/batch_id/action/file/srt_id/track/old_text/new_text/category/reason）。
 - 备份原文件为 `.bak`。
 
-### 11. 验证轮2（可选）
+### 11. 执行后验证
 
-- 用户对仍存疑条目可再起验证 agent（用 verify.tmpl）。
+```bash
+python <skill>/scripts/verify_fixes.py --batch-id <ts>
+```
+- 读 log.jsonl，按 srt_id + track 用 ass_srt_pair 重读 ASS，逐条核对每条操作记录的 new_text 是否真的落盘（delete 验该行已不存在）。
+- 输出 `.subtitle-polish/reports/verify-fixes.md`。全部通过即完成；有失败条目则列出期望/实际/原因，agent 或人据此排查。
+- 不依赖 agent 手写 pysubs2 脚本或硬编码时间戳——上一轮实测手写验证因时间戳算错 5/6 条 NOT FOUND，改为脚本兜底。
+- 用户对仍存疑条目可再起验证 agent（用 verify.tmpl）复查语义，但落盘核验走本脚本。
 
 ## 回滚
 

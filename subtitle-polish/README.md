@@ -51,17 +51,18 @@ ass 与 srt 可以是目录或单文件。多文件默认同名配对（去扩�
 | 脚本 | 功能 |
 |------|------|
 | `scripts/extract_slice.py` | ass+srt → 按 srt 块切片，输出 `<srt_id> | <ass_time> | <英文> | <中文> | <注释>`，标异常 |
-| `scripts/apply_fixes.py` | replace/delete/swap，dry-run/accept/rollback，自动还原特效标签 |
-| `scripts/global_replace.py` | 跨文件统一专名，可选 track |
 | `scripts/precheck_punct.py` | 标点规范化预检（中文行，保留 ASS 标签） |
-| `scripts/lib/` | time_fmt / ass_srt_pair / log / tags 工具 |
+| `scripts/apply_fixes.py` | replace/delete/swap，dry-run/accept/rollback，自动还原特效标签 |
+| `scripts/verify_fixes.py` | 执行后验证：读 log.jsonl 按 srt_id 重读 ASS，核对 new_text 落盘 |
+| `scripts/global_replace.py` | 跨文件统一专名，可选 track |
+| `scripts/lib/` | time_fmt / ass_srt_pair / log / tags / paths 工具 |
 
 ## 产出（项目侧，不进 skill）
 
 ```
 .subtitle-polish/
 ├── slices/              # 切片（审计中间产物）
-├── reports/             # audit-report.md / detail / dry-run.md / precheck-punct.md
+├── reports/             # audit-report.md / detail / dry-run.md / precheck-punct.md / verify-fixes.md
 ├── fixes.json            # 主修清单（1-6 类）
 ├── optional-fixes.json   # 第 7 类低严重度
 └── log.jsonl            # 操作日志（不进 git）

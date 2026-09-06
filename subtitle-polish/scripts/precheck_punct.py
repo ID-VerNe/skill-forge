@@ -37,7 +37,7 @@ import pysubs2
 
 from lib.tags import extract_leading_tags
 from lib.log import append_log, make_batch_id
-from apply_fixes import _resolve_work_dir
+from lib.paths import resolve_work_dir
 
 
 def normalize_punct(text: str) -> str:
@@ -169,7 +169,7 @@ def main():
     ap.add_argument("--out", default=".subtitle-polish", help="work dir")
     ap.add_argument("--accept", action="store_true", help="执行修复并写回（默认 dry-run）")
     args = ap.parse_args()
-    wd = _resolve_work_dir(args.out)
+    wd = resolve_work_dir(args.out)
     run(args.target, wd, args.accept)
 
 
