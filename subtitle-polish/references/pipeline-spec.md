@@ -43,6 +43,8 @@
 | `SRT_HAS_ASS_NONE` | srt 块在 ass 里找不到对应（漏译/丢行） |
 | `ONE_TO_MANY` | 一个 srt 块在 ass 里配到多个时间戳相近的行 |
 | `MULTI_SAME_LANG` | 同一 block 内有多个英文行或多个中文行（不允许；最多英-中-注） |
+| `ASS_TRACK_OVERWRITE` | 英文行的可见文本含中文字符（英文轨被中文覆盖，生产缺陷） |
+| `TIME_TEXT_DRIFT` | 时间戳匹配但英文文本仅部分相似（ass 可能人工调轴），需人工核查 |
 
 ## 配对算法（lib/ass_srt_pair.py）
 
@@ -50,10 +52,13 @@
 
 1. srt 块的时间戳转 ass 格式（毫秒截 2 位）。
 2. 在 ass Dialogue 里找时间戳相差 ±0.5s 内的候选行。
-3. 对候选行做文本相似度（fuzzy ratio），>85 才配对。
-4. 任一校验不过 → 标 unpaired（SRT_HAS_ASS_NONE 或 ASS_HAS_SRT_NONE）。
-5. 一个 srt 块配到多行 → ONE_TO_MANY。
-6. 同一 block 内同语言多行 → MULTI_SAME_LANG。
+3. 对候选行做文本相似度（fuzzy ratio，归一化去标点/去说话人标记后），>85 才配对；纯音效块（srt 全是 `[xxx]`）按时间戳配即可。
+4. 时间戳不过但文本相似度 >85 → 仍配对并标 anomaly 提示时间偏移（应对 ass 人工调轴场景）。
+5. 任一校验不过 → 标 unpaired（SRT_HAS_ASS_NONE 或 ASS_HAS_SRT_NONE）。
+6. 一个 srt 块配到多行 → ONE_TO_MANY。
+7. 同一 block 内同语言多行 → MULTI_SAME_LANG。
+8. 英文行可见文本含中文 → ASS_TRACK_OVERWRITE。
+9. 时间戳匹配但英文相似度 0.6~0.85 → TIME_TEXT_DRIFT（ass 可能调轴）。
 
 ## 时间格式（lib/time_fmt.py）
 
@@ -70,11 +75,14 @@
 ├── reports/
 │   ├── audit-report.md       # 主审计报告（小节式，严重度排序）
 │   ├── <stem>-detail.md      # 每文件明细（多文件时）
-│   └── dry-run.md            # 修复 dry-run 预览
-├── fixes.json       # 主修清单（1-6 类）
+│   ├── dry-run.md            # 修复 dry-run 预览
+│   └── precheck-punct.md     # 标点预检报告
+├── fixes.json       # 主修清单（1-6 类，是脚本的输入）
 ├── optional-fixes.json  # 第 7 类低严重度
 └── log.jsonl        # 操作日志（不进 git）
 ```
+
+**分界**：`fixes.json` / `optional-fixes.json` 是脚本输入（人/AI 编辑），`reports/` 是脚本输出（只读）。`log.jsonl` 不进 git，其余进。
 
 `.gitignore` 加 `.subtitle-polish/log.jsonl`（不进 git，其余进）。
 
@@ -83,8 +91,9 @@
 ```json
 [
   {
-    "id": "e02#152",            // 单文件：1..N；多文件：<shortname>#<srt_id>
-    "file": ".../e02....ass",   // 目标 ass 绝对路径
+    "id": "1a",                 // fix 自身编号；一条审计发现拆多条 fix 时用 <audit_id><suffix>
+    "audit_id": "1",            // 对应审计报告里的发现编号（父）
+    "file": ".../e02....ass",   // 目标 ass 路径（脚本会归一化比较）
     "srt_id": 152,              // srt 块序号（定位键）
     "track": "中文",            // 英文/中文/注释
     "action": "replace",        // replace | delete | swap
@@ -92,12 +101,16 @@
     "final_new": "我把托马斯甩开了",      // 人确认后；缺省=suggested_new
     "category": "语义反转",
     "reason": "胜负颠倒 losing=甩开",
-    "enabled": true             // 人 accept 时 true，skipped/误报 false
+    "enabled": true,            // 仅 status=accepted 为 true
+    "status": "accepted",       // accepted|misreport|intentional|skipped
+    "srt_path": ".../e02....srt"  // 显式写配对 srt，避免脚本找不到
   }
 ]
 ```
 
-**swap** 额外字段：`swap_with`: 另一个 srt_id。交换两行的文本部分，不动时间戳/样式/标签。
+- **一条审计发现可拆多条 fix**：例如 id=1 配对错位要改 srt 4+5 两行中文 → fix `1a`(srt 4) + `1b`(srt 5)，共享 `audit_id=1`。
+- **swap** 额外字段：`swap_with`: 另一个 srt_id。交换两行的文本部分，不动时间戳/样式/标签。
+- **status 语义**：`accepted`=修；`misreport`=误报（不该报）；`intentional`=特意翻的（译文本就对）；`skipped`=暂不处理。非 accepted 都 `enabled=false` 不执行，但 status 记原因供追溯。
 
 ## id 空间
 
@@ -107,9 +120,14 @@
 ## log.jsonl schema
 
 ```json
-{"ts":"2026-09-05T21:30:00","batch_id":"20260905_213000","action":"replace","file":".../e02....ass","srt_id":152,"track":"中文","old_text":"我输了","new_text":"我把托马斯甩开了","category":"语义反转","reason":"胜负颠倒"}
+{"ts":"2026-09-05T21:30:00","batch_id":"20260905_213000","action":"replace","file":"C:/abs/path/e02.ass","srt_id":152,"track":"中文","old_text":"{\\be3}我输了","new_text":"{\\be3}我把托马斯甩开了","category":"语义反转","reason":"胜负颠倒"}
 ```
 一行一条。不进 git。
+
+**字段说明**：
+- `file`：归一化为绝对路径存储，rollback 比较时容忍相对路径/斜杠方向差异（filter_log 用 `_norm_file` 归一化两端比较）。
+- `old_text` / `new_text`：都记**实际落盘的 ASS 文本**（含合并后的 `{\be3}` 等标签），forward 与 rollback 对称、可重放。replace 的 new_text = `_replace_text` 后的 `e.text`（不是 fixes 里的裸 final_new）。
+- rollback 定位：优先 srt_id→timestamp→Dialogue；srt 推不到时用 new_text 去 tag 后在 subs 里搜当前内容（fallback）。
 
 ## rollback
 

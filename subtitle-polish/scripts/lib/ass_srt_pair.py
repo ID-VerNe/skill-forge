@@ -269,7 +269,11 @@ def _match_by_time_and_text(srt_block: SrtBlock, ass_blocks: List[AssDialogue]) 
             elif any("一" <= c <= "鿿" for c in ab.text):
                 # 英文行写着中文（轨覆盖），配对但 anomaly 在 pair() 标
                 matched.append(ab)
-            # 文本对不上且非覆盖 -> 不配对，可能是错位
+            elif ratio >= 0.6:
+                # 时间戳对上但文本仅部分相似（ass 可能人工调轴 / 轻微差异），
+                # 仍配对但 pair() 会标 anomaly 提示时间/文本偏移
+                matched.append(ab)
+            # 文本对不上且非覆盖且相似度过低 -> 不配对，可能是错位
         else:
             # 中文/注释行，时间戳对上就算配对
             matched.append(ab)
@@ -310,6 +314,16 @@ def pair(ass_blocks: List[AssDialogue], srt_blocks: List[SrtBlock]) -> List[Pair
         # 英文行写中文（轨覆盖）检测
         if pb.english and any("一" <= c <= "鿿" for c in pb.english):
             anomalies.append("ASS_TRACK_OVERWRITE")
+        # 时间戳对上但文本部分相似（ass 可能人工调轴）—— 只在英文 track 标
+        en_lines = track_lines.get(TRACK_EN, [])
+        if en_lines and not sb.is_sound_effect_only():
+            srt_en = sb.english_text()
+            for ab in en_lines:
+                if not any("一" <= c <= "鿿" for c in ab.text):
+                    ratio = _text_ratio(srt_en, ab.text)
+                    if 0.6 <= ratio < TEXT_RATIO_THRESHOLD:
+                        anomalies.append("TIME_TEXT_DRIFT")
+                        break
         # 漏译：有英文无中文（音效块除外）
         if pb.english and not pb.chinese:
             anomalies.append("SRT_HAS_ASS_NONE")  # 中文行缺失

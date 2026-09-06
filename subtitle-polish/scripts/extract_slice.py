@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
 # 让脚本能 import 同级 lib（直接运行时）
@@ -96,14 +97,12 @@ def run(ass_path: str, srt_path: str, out_dir: str,
 
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(ass_path))[0]
-    # 简化 stem：去 the.grand.tour.2026.s01e0X 之类，取 eXX
+    # 简化 stem：剧集命名 s01e0X 取 eXX；否则用完整 stem（不截断，避免无意义切词）
     short = stem
-    import re
-    m = re.search(r"s01e(\d{2})", stem, re.I)
+    m = re.search(r"s0?(\d+)e0?(\d+)", stem, re.I)
     if m:
-        short = f"e{m.group(1)}"
-    else:
-        short = stem[:20]
+        short = f"s{m.group(1)}e{m.group(2)}"
+    # 单文件/非剧集场景直接用完整 stem，多文件同名时由调用方区分目录
 
     slices = slice_blocks(paired, total, blocks_per, overlap)
     out_paths = []

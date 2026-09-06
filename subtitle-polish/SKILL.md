@@ -59,17 +59,19 @@ python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slice
 ### 3. 审计（自适应起 agent）
 
 - 每文件份数 = `max(1, round(块数/700))`。
+- **小文件短路**：单文件块数 < 200 时，主 agent 可直接审计该切片，不必另起子 agent（省成本）。
 - 每份起一个子 agent，prompt 用 `prompts/audit.tmpl`，填入 `{slice_path}`、`{start_block}`、`{end_block}`、`{project_context}`。
-- project_context：prompt 参数优先，无则读 `.subtitle-polish/context.md`，都没有留空。
+- project_context 来源（按优先级）：① 用户 prompt 里写的背景；② `.subtitle-polish/context.md`；③ **两者都没有时，主 agent 读 SRT 前 50 块 + ASS 样式自动合成一段项目背景**（领域、话题、疑似专名列表）。
+- 子 agent 后台跑期间，**主 agent 用 grep/正则独立预扫可疑点**（专名不一致、异常字符、ASR 错词模式），子 agent 返回后合并两边发现。
 - 子 agent 报告：附 [start_block, end_block] 范围 + 问题列表（srt_id/类别/严重度/英文/现译/问题/建议）。
 
 ### 4. 验证轮1（按类别打包）
 
-- 把同类问题打包给一个验证 agent，prompt 用 `prompts/verify.tmpl`。
-- 输入：问题 + 前后各 5 块上下文 + srt 原文。
+- 把同类问题打包给一个验证 agent，prompt 用 `prompts/verify.tmpl`（支持 `{findings}` 列表，多条独立给结论）。
+- 输入：每条问题 + 前后各 5 块上下文 + srt 原文。
 - **adversarial 默认驳回**：只有找不到反驳理由才确认。
-- 驳回率高（>50%）或问题密度超标（>1.5× 均值）的文件 → 补 agent 重看**整个文件**。
-- 最多补 2 轮。
+- 验证 agent 发现 srt_id 与 srt 原文不符时，输出 `corrected_srt_id`（纠正后定位键），主 agent 据此修正 fixes.json。
+- 补 agent 触发（绝对阈值，非相对均值）：某文件验证驳回率 > 40%，或确认问题密度 > 1/100 块 → 补 agent 重看**整个文件**。最多补 2 轮。单文件场景阈值同样适用。
 
 ### 5. 合并报告
 
@@ -91,14 +93,17 @@ python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slice
 
 - 把 audit-report.md 路径告诉用户，**停下**。
 - 用户回复形式："修 <id列表>，<id> 是误报，<id> 特意翻的"。
+- 区分 `status` 字段（fixes.json 里记）：`accepted`（修）、`misreport`（误报，不该报）、`intentional`（特意翻的，译文本就对的）、`skipped`（暂不处理）。所有非 accepted 的都 `enabled=false` 不执行，但 status 记原因。
 - 用户也可能直接给意见让重审某条。
 
 ### 7. 生成 fixes.json
 
 - 按用户选的 id 生成 `.subtitle-polish/fixes.json`（1-6 类）。
-- 每条：`{id, file, srt_id, track, action, suggested_new, final_new, category, reason, enabled, srt_path}`
+- 每条：`{id, audit_id, file, srt_id, track, action, suggested_new, final_new, category, reason, enabled, status, srt_path}`
+  - `audit_id`：对应审计报告里的发现编号；`id` 是 fix 自身编号。一条审计发现可拆多条 fix，id 用 `<audit_id><suffix>`（如 `1a`/`1b`/`3a`），audit_id 为父。
   - `final_new` 缺省 = `suggested_new`；用户改过则覆盖。
-  - `enabled=true` 给选中的，误报/跳过的 `enabled=false`。
+  - `enabled=true` 仅给 status=accepted 的；其余 `enabled=false`。
+  - `status` ∈ accepted | misreport | intentional | skipped（见门1）。
   - `action` ∈ replace | delete | swap（swap 换文本不换时间戳，附 `swap_with`）。
   - `srt_path` 显式写，避免脚本找不到配对 srt。
 - 第 7 类进 `.subtitle-polish/optional-fixes.json`，默认不并入主修。
@@ -108,12 +113,12 @@ python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slice
 ```bash
 python <skill>/scripts/apply_fixes.py .subtitle-polish/fixes.json --dry-run
 ```
-- 输出 `.subtitle-polish/reports/dry-run.md`（每条 file/id/现译→新译/类别，现译从真实 ASS 读）。
+- 输出 `.subtitle-polish/reports/dry-run.md`（每条 file/id/现译→新译/类别，现译与新译都显示含标签的真实文本）。
 
 ### 9. 人确认门2
 
 - 把 dry-run.md 路径告诉用户，**停下**。
-- 用户 accept 或要求改 fixes.json。
+- 用户显式 accept 后才执行。**门1的"修 1-5"只授权生成 fixes.json 和跑 dry-run，不等于门2通过**。除非用户在门1明确说"全修并直接执行"（合并语义），否则必须等门2独立确认。
 
 ### 10. 执行
 

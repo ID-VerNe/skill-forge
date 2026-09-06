@@ -30,22 +30,14 @@ from lib.ass_srt_pair import (
 )
 from lib.time_fmt import seconds_to_ass
 from lib.log import append_log, read_log, filter_log, make_batch_id
+from lib.paths import resolve_work_dir
 
 WORK_DIR = ".subtitle-polish"
 
 
 def _resolve_work_dir(work_dir: str) -> str:
-    """work_dir 为空时回退到项目根（往上找含 .subtitle-polish 或 .git 的目录）。"""
-    if work_dir:
-        return work_dir
-    d = os.getcwd()
-    for _ in range(10):
-        if os.path.isdir(os.path.join(d, ".subtitle-polish")) or os.path.isdir(os.path.join(d, ".git")):
-            return os.path.join(d, ".subtitle-polish")
-        parent = os.path.dirname(d)
-        if parent == d:
-            break
-        d = parent
+    """兼容旧调用名，转发到 lib.paths.resolve_work_dir。"""
+    return resolve_work_dir(work_dir)
     return os.path.join(os.getcwd(), ".subtitle-polish")
 
 
@@ -73,15 +65,16 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str, fallback_t
                 return e
         # 退化：返回同时戳任意行（让调用者处理 track 不匹配）
         return candidates[0] if candidates else None
-    # 回滚场景：srt 推不到，按 fallback_text（new_text）在当前 subs 里搜
+    # 回滚场景：srt 推不到，按 fallback_text 在当前 subs 里搜
     if fallback_text:
-        import re
+        from lib.tags import extract_leading_tags
+        # 双端归一：fallback 可能带标签也可能不带，e.text 含标签，都去前导标签后比
+        _, fb_body = extract_leading_tags(fallback_text)
         for e in subs.events:
             if style_to_track(e.style or "") != track:
                 continue
-            # e.text 含标签，去标签后比
-            stripped = re.sub(r"^\{[^}]*\}+", "", e.text)
-            if stripped == fallback_text:
+            _, e_body = extract_leading_tags(e.text)
+            if e_body == fb_body:
                 return e
     return None
 
@@ -139,27 +132,45 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
         lines.append(f"## {os.path.basename(file)}")
         lines.append("")
         subs = pysubs2.load(file, encoding="utf-8-sig")
-        srt_path = _find_paired_srt(file)
-        srt_blocks = parse_srt(srt_path) if srt_path else []
+        # dry-run 也要优先用 fixes 里的 srt_path，推不到才 fallback
+        srt_path = ""
+        for fx in fxs:
+            if fx.get("srt_path"):
+                srt_path = fx["srt_path"]
+                break
+        if not srt_path:
+            srt_path = _find_paired_srt(file)
+        srt_blocks = parse_srt(srt_path) if srt_path and os.path.exists(srt_path) else []
         srt_index = _build_srt_index(srt_blocks)
         for fx in fxs:
             action = fx.get("action", "replace")
             track = fx.get("track", TRACK_ZH)
             e = _find_dialogue(subs, srt_index, fx["srt_id"], track)
-            cur = clean_ass_text(e.text) if e else "（定位失败）"
+            # dry-run 对称显示：现译/新译都显示实际落盘的 raw text（含标签），
+            # 让人看到真实写入内容，避免以为标签丢了。
+            cur_raw = e.text if e else "（定位失败）"
+            new_raw = fx.get("final_new") or fx.get("suggested_new", "")
+            # 给新译补上原行标签做对称预览（不实际写入）
+            if e and new_raw:
+                from lib.tags import extract_leading_tags, merge_tags
+                orig_tags, _ = extract_leading_tags(e.text)
+                new_tags, new_body = extract_leading_tags(new_raw)
+                new_preview = "".join(merge_tags(orig_tags, new_tags)) + new_body
+            else:
+                new_preview = new_raw
             lines.append(f"### {fx.get('id','')} — {fx.get('category','')} ({action})")
             lines.append(f"- srt_id: {fx['srt_id']} / track: {track}")
             if fx.get("reason"):
                 lines.append(f"- 理由: {fx['reason']}")
             if action == "replace":
-                lines.append("- 现译 → 新译:")
-                lines.append(f"  - 现: {cur}")
-                lines.append(f"  - 新: {fx.get('final_new') or fx.get('suggested_new','')}")
+                lines.append("- 现译 → 新译（均含实际标签）:")
+                lines.append(f"  - 现: `{cur_raw}`")
+                lines.append(f"  - 新: `{new_preview}`")
             elif action == "delete":
-                lines.append(f"- 删除整行: {cur}")
+                lines.append(f"- 删除整行: `{cur_raw}`")
             elif action == "swap":
                 lines.append(f"- 与 srt_id={fx.get('swap_with')} 交换文本（{track} 行）")
-                lines.append(f"  - 当前行: {cur}")
+                lines.append(f"  - 当前行: `{cur_raw}`")
             lines.append("")
         lines.append("")
     with open(out_path, "w", encoding="utf-8") as f:
@@ -207,8 +218,9 @@ def run_accept(fixes: list, work_dir: str, batch_id: str) -> None:
                     print(f"[!] 无新文本: {fx.get('id')}", file=sys.stderr)
                     continue
                 _replace_text(e, new_text)
+                # log 记实际落盘的 e.text（含合并标签），与 rollback 对称、可重放
                 append_log(work_dir, batch_id, "replace", file, srt_id, track,
-                           old_text, new_text, fx.get("category",""), fx.get("reason",""))
+                           old_text, e.text, fx.get("category",""), fx.get("reason",""))
             elif action == "delete":
                 # 删整行
                 subs.events.remove(e)

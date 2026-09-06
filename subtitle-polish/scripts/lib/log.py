@@ -28,12 +28,12 @@ def append_log(
     category: str = "",
     reason: str = "",
 ) -> None:
-    """追加一条操作记录。"""
+    """追加一条操作记录。file 归一化为绝对路径存储，便于跨 cwd 比较。"""
     entry = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "batch_id": batch_id,
         "action": action,
-        "file": file,
+        "file": _norm_file(file),
         "srt_id": srt_id,
         "track": track,
         "old_text": old_text,
@@ -65,6 +65,16 @@ def read_log(work_dir: str) -> List[dict]:
     return out
 
 
+def _norm_file(p: str) -> str:
+    """路径归一化：绝对路径 + normpath，用于 log 比较时容忍相对/绝对/大小写差异。"""
+    if not p:
+        return ""
+    try:
+        return os.path.normpath(os.path.abspath(p))
+    except Exception:
+        return p
+
+
 def filter_log(
     entries: List[dict],
     *,
@@ -73,14 +83,18 @@ def filter_log(
     file: Optional[str] = None,
     before_ts: Optional[str] = None,
 ) -> List[dict]:
-    """筛选符合条件的日志条目。"""
+    """筛选符合条件的日志条目。
+
+    file 比较用归一化绝对路径，容忍相对路径 / 斜杠方向差异。
+    """
+    target_file = _norm_file(file) if file else ""
     out = []
     for e in entries:
         if batch_id and e.get("batch_id") != batch_id:
             continue
-        if srt_id and e.get("srt_id") != srt_id:
+        if srt_id is not None and e.get("srt_id") != srt_id:
             continue
-        if file and e.get("file") != file:
+        if target_file and _norm_file(e.get("file", "")) != target_file:
             continue
         if before_ts and e.get("ts", "") > before_ts:
             continue

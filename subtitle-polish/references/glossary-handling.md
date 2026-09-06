@@ -18,8 +18,9 @@
 prompts 模板里有 `{project_context}` 占位符，来源优先级：
 1. 用户调用 prompt 里写的背景（如 `/subtitle-polish 精校：... srt：... 这是汽车节目，注意底盘术语`）
 2. 项目根 `.subtitle-polish/context.md`（若存在）
+3. **两者都没有时，主 agent 读 SRT 前 50 块 + ASS 样式自动合成一段项目背景**（领域、话题、疑似专名列表），填入 `{project_context}`
 
-两者都支持，prompt 参数优先。背景只是提示 agent 关注领域，不提供专名映射。
+prompt 参数 > context.md > 自动合成。背景只是提示 agent 关注领域，不提供专名映射。
 
 ## 全局替换脚本的用法
 
