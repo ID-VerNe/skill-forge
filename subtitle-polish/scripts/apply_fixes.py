@@ -152,8 +152,15 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
                 new_preview = "".join(merge_tags(orig_tags, new_tags)) + new_body
             else:
                 new_preview = new_raw
-            lines.append(f"### {fx.get('id','')} — {fx.get('category','')} ({action})")
+            # ass_time：从定位到的 Dialogue 取 start/end，转 ASS 串
+            ass_time = ""
+            if e:
+                from lib.time_fmt import seconds_to_ass
+                ass_time = f"{seconds_to_ass(e.start/1000.0)}-{seconds_to_ass(e.end/1000.0)}"
+            lines.append(f"### {fx.get('audit_id') or fx.get('id','')} — {fx.get('category','')} ({action})")
             lines.append(f"- srt_id: {fx['srt_id']} / track: {track}")
+            if ass_time:
+                lines.append(f"- ass_time: `{ass_time}`")
             if fx.get("reason"):
                 lines.append(f"- 理由: {fx['reason']}")
             if action == "replace":

@@ -97,12 +97,12 @@ def run(ass_path: str, srt_path: str, out_dir: str,
 
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(ass_path))[0]
-    # 简化 stem：剧集命名 s01e0X 取 eXX；否则用完整 stem（不截断，避免无意义切词）
+    # 简化 stem：剧集命名 s01e0X 取 e0X（与 id 空间 shortname 一致）；否则用完整 stem
     short = stem
-    m = re.search(r"s0?(\d+)e0?(\d+)", stem, re.I)
+    m = re.search(r"s0?(\d+)\s*e0?(\d+)", stem, re.I)
     if m:
-        short = f"s{m.group(1)}e{m.group(2)}"
-    # 单文件/非剧集场景直接用完整 stem，多文件同名时由调用方区分目录
+        short = f"e{m.group(2).zfill(2)}"
+    # 单文件/非剧集场景直接用完整 stem
 
     slices = slice_blocks(paired, total, blocks_per, overlap)
     out_paths = []

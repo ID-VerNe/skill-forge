@@ -22,10 +22,11 @@
 
 单文件输入：一份 `audit-report.md`。多文件：一份总报告 + 每文件一份 `<stem>-detail.md`。
 
-总报告/明细都用小节式，每条一个 `###` 小节：
+总报告/明细都用小节式，每条一个 `###` 小节（**id 用 audit_id 不用全局序号；每条带 ass_time 时间戳**，方便人对照视频定位）：
 
 ```
-### [id] — 类别（严重度）
+### <audit_id> — 类别（严重度）
+- ass_time: <时间戳，如 0:01:16.56-0:01:18.00>
 - 英文: <原文>
 - 现译: <当前中文>
 - 问题: <一句话>
@@ -34,8 +35,9 @@
 
 ## id 编号
 
-- 单文件输入：1..N，按 srt_id 顺序。一条发现可对应多条 fix（见 pipeline-spec fixes.json schema 的 id/audit_id）。
-- 多文件输入：`<shortname>#<srt_id>`，shortname 取文件名可识别部分（如 e01、e02）。
+- **统一用 `<shortname>#<srt_id>`**（如 `e02#17`），不用全局 1..N 序号。id 在 audit-report.md / dry-run.md / fixes.json 三处一致，人 review 时一眼对上。
+- 单文件也用此格式（shortname 从文件名取）。
+- 一条发现可对应多条 fix（见 pipeline-spec fixes.json schema 的 id/audit_id），拆条用 `<audit_id><suffix>`（如 `e02#152a`、`e02#152b`）。
 
 ## 低严重度（第 7 类）
 

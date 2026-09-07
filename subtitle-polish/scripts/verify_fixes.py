@@ -116,14 +116,36 @@ def run(entries, work_dir, label):
         lines.append("")
         lines.append("## 失败明细")
         lines.append("")
+        # 失败条目按 file 分组重新加载一次取 ass_time（不依赖上面的循环局部变量）
+        from lib.time_fmt import seconds_to_ass
+        fail_by_file = {}
         for e, actual, detail in fail_sections:
-            lines.append(f"### srt_id={e['srt_id']} track={e.get('track','')} "
-                         f"action={e.get('action','')} batch={e.get('batch_id','')}")
-            lines.append(f"- 文件: `{e['file']}`")
-            lines.append(f"- 期望 new_text: `{e.get('new_text','')}`")
-            lines.append(f"- 实际落盘: `{actual}`")
-            lines.append(f"- 原因: {detail}")
-            lines.append("")
+            fail_by_file.setdefault(e["file"], []).append((e, actual, detail))
+        for f, items in fail_by_file.items():
+            try:
+                fsubs = pysubs2.load(f, encoding="utf-8-sig")
+            except Exception:
+                fsubs = None
+            fsrt_path = _find_paired_srt(f)
+            fsrt_blocks = parse_srt(fsrt_path) if fsrt_path and os.path.exists(fsrt_path) else []
+            fsrt_index = _build_srt_index(fsrt_blocks)
+            for e, actual, detail in items:
+                ass_time = ""
+                if fsubs is not None:
+                    ev = _find_dialogue(fsubs, fsrt_index, e["srt_id"],
+                                        e.get("track", TRACK_ZH),
+                                        fallback_text=e.get("new_text", ""))
+                    if ev:
+                        ass_time = f"{seconds_to_ass(ev.start/1000.0)}-{seconds_to_ass(ev.end/1000.0)}"
+                lines.append(f"### srt_id={e['srt_id']} track={e.get('track','')} "
+                             f"action={e.get('action','')} batch={e.get('batch_id','')}")
+                if ass_time:
+                    lines.append(f"- ass_time: `{ass_time}`")
+                lines.append(f"- 文件: `{e['file']}`")
+                lines.append(f"- 期望 new_text: `{e.get('new_text','')}`")
+                lines.append(f"- 实际落盘: `{actual}`")
+                lines.append(f"- 原因: {detail}")
+                lines.append("")
     else:
         lines.append(f"## 验证结果: 全部通过 ({ok_count} 条)")
 

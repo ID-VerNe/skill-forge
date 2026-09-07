@@ -370,3 +370,28 @@ def pair_dirs(
 def pair_files(ass_path: str, srt_path: str) -> Tuple[List[AssDialogue], List[SrtBlock]]:
     """单文件配对：直接解析。"""
     return parse_ass(ass_path), parse_srt(srt_path)
+
+
+def find_srt_ids_by_text(
+    ass_path: str, srt_path: str, pattern: str, track: str = TRACK_ZH
+) -> List[Tuple[int, str, str]]:
+    """按文本 pattern 找含它的 srt_id 列表（用于术语统一前定位哪些行要改）。
+
+    返回 [(srt_id, ass_time, current_text)]，current_text 是该 track 的清洗后文本。
+    一个 srt_id 只记一次（即使该 track 有多行都含 pattern）。
+
+    用途：审计后想统一某专名（如"情怀铁路"→"遗产铁路"），用本函数找出哪些 srt_id
+    的中文行含该 pattern，再决定进 fixes.json 还是走 global_replace。避免手写
+    timestamp 匹配脚本（实测 map_nr.py 改 6 版才跑通）。
+    """
+    ass_blocks, srt_blocks = pair_files(ass_path, srt_path)
+    paired, _ = pair(ass_blocks, srt_blocks)
+    out = []
+    for pb in paired:
+        lines = pb.lines.get(track, [])
+        for ab in lines:
+            if pattern in ab.text:
+                out.append((pb.srt_id, pb.ass_time, ab.text))
+                break
+    return out
+
