@@ -1,188 +1,315 @@
-"""机票查询模块 — 基于 fast-flights 库，直连 Google Flights 获取实时航班数据"""
+"""机票查询模块 — 直连 Kiwi.com GraphQL API (api.skypicker.com)
 
-import sys
+数据来源：Kiwi.com 前端调用的公开 GraphQL 端点，无需鉴权、无需代理。
+单程走 onewayItineraries，往返走 returnItineraries（含 outbound + inbound），
+机场/城市搜索走 places。
+"""
 
-# ── 依赖检查 ──────────────────────────────────────────────────────
-try:
-    from fast_flights import FlightQuery, Passengers, create_query
-    from fast_flights import parser as fast_flights_parser
-    from fast_flights.parser import (
-        Flights, ResultList, SingleFlight, Airport,
-        JsMetadata, Alliance, Airline, CarbonEmission, SimpleDatetime,
-    )
-    AVAILABLE = True
-except ImportError:
-    AVAILABLE = False
+import json
+import urllib.error
+import urllib.request
 
 from .utils import (
-    resolve_airport, fmt_time, fmt_date, fmt_duration, fmt_price, get_airline_name,
+    CURRENCY_MAP,
+    fmt_duration,
+    fmt_iso_datetime,
+    get_airline_name,
+    resolve_airport,
 )
 
-# ── fast-flights v3.0.2 解析器补丁 ────────────────────────────────
-# 某些航班条目（无价格数据）的 k[1][0] 是空列表，导致 IndexError
-# 跳过这些条目，保留有价格的航班
+AVAILABLE = True  # 仅依赖标准库，永远可用
+
+# ── GraphQL 端点 ──────────────────────────────────────────────────
+_API_BASE = "https://api.skypicker.com/umbrella/v2/graphql"
+
+_HEADERS = {
+    "Content-Type": "application/json",
+    "Origin": "https://www.kiwi.com",
+    "Referer": "https://www.kiwi.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+}
+
+# ── 查询模板 ──────────────────────────────────────────────────────
+# 注意：query 文本里的变量名 ($search/$filter/$options) 必须与 variables
+# dict 的 key 完全一致，否则 Kiwi 静默返回 AppError('search' field is mandatory)。
+# Sector 内部字段（不含外层 sector/outbound/inbound 包装）。
+# 单程: itinerary.sector 是 Sector 字段 → 用 `sector { %s }`
+# 往返: outbound/inbound 本身就是 Sector → 直接用 `%s`
+_SECTOR_INNER = """\
+sectorSegments {
+  segment {
+    source { station { code name city { name } } localTime }
+    destination { station { code name city { name } } localTime }
+    duration
+    type
+    code
+    carrier { code name }
+    operatingCarrier { code name }
+  }
+  layover { duration isStationChange isBaggageRecheck }
+}"""
+
+_ONEWAY_QUERY = """\
+query($search: SearchOnewayInput, $filter: ItinerariesFilterInput, $options: ItinerariesOptionsInput) {
+  onewayItineraries(search: $search, filter: $filter, options: $options) {
+    __typename
+    ... on Itineraries {
+      itineraries {
+        ... on ItineraryOneWay {
+          id
+          price { amount roundedFormattedValue currency { code } }
+          duration
+          sector { %s }
+        }
+      }
+    }
+    ... on AppError { error: message }
+  }
+}
+""" % _SECTOR_INNER
+
+_RETURN_QUERY = """\
+query($search: SearchReturnInput, $filter: ItinerariesFilterInput, $options: ItinerariesOptionsInput) {
+  returnItineraries(search: $search, filter: $filter, options: $options) {
+    __typename
+    ... on Itineraries {
+      itineraries {
+        ... on ItineraryReturn {
+          id
+          price { amount roundedFormattedValue currency { code } }
+          duration
+          outbound { %s }
+          inbound { %s }
+        }
+      }
+    }
+    ... on AppError { error: message }
+  }
+}
+""" % (_SECTOR_INNER, _SECTOR_INNER)
+
+_PLACES_QUERY = """\
+query($search: PlacesSearchInput) {
+  places(search: $search) {
+    __typename
+    ... on PlaceConnection {
+      edges {
+        node {
+          __typename
+          id
+          name
+          slug
+          rank
+          ... on City { code airportsCount country { code name } }
+          ... on Station { code city { id name } country { code name } }
+          ... on Country { code }
+        }
+      }
+    }
+  }
+}
+"""
 
 
-def _install_patch():
-    """安装解析器补丁，处理空价格数组条目"""
-    if not AVAILABLE:
-        return
+# ── HTTP 层 ───────────────────────────────────────────────────────
 
-    def _patched_parse_js(js: str):
-        import json as _json
-        data = js.split("data:", 1)[1].rsplit(",", 1)[0]
-        if data.endswith("errorHasStatus: true"):
-            from fast_flights.exceptions import FlightsNotFound
-            raise FlightsNotFound("no flights found; received error")
-
-        payload = _json.loads(data)
-        alliances = []
-        airlines = []
-        if payload[7][1][0]:
-            for code, name in payload[7][1][0]:
-                alliances.append(Alliance(code=code, name=name))
-        if payload[7][1][1]:
-            for code, name in payload[7][1][1]:
-                airlines.append(Airline(code=code, name=name))
-        meta = JsMetadata(alliances=alliances, airlines=airlines)
-
-        flights = ResultList()
-        if payload[3][0] is None:
-            return flights
-
-        for k in payload[3][0]:
-            try:
-                flight = k[0]
-                if not k[1] or not k[1][0] or len(k[1][0]) < 2:
-                    continue
-                price = k[1][0][1]
-                typ = flight[0]
-                airline_names = flight[1]
-                sg_flights = []
-                for single_flight in flight[2]:
-                    sg_flights.append(SingleFlight(
-                        from_airport=Airport(code=single_flight[3], name=single_flight[4]),
-                        to_airport=Airport(code=single_flight[6], name=single_flight[5]),
-                        departure=SimpleDatetime(date=single_flight[20], time=single_flight[8]),
-                        arrival=SimpleDatetime(date=single_flight[21], time=single_flight[10]),
-                        duration=single_flight[11], plane_type=single_flight[17],
-                    ))
-                extras = flight[22]
-                flights.append(Flights(
-                    type=typ, price=price, airlines=airline_names, flights=sg_flights,
-                    carbon=CarbonEmission(typical_on_route=extras[8], emission=extras[7]),
-                ))
-            except (IndexError, TypeError, KeyError):
-                continue
-        flights.metadata = meta
-        return flights
-
-    fast_flights_parser.parse_js = _patched_parse_js
+def _post(query: str, variables: dict, feature: str) -> dict:
+    """POST GraphQL 请求，返回解析后的 dict。"""
+    body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+    url = f"{_API_BASE}?featureName={feature}"
+    req = urllib.request.Request(url, data=body, headers=_HEADERS, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        # 4xx：读 body 里的 GraphQL errors
+        try:
+            err_body = e.read().decode("utf-8", "replace")
+            parsed = json.loads(err_body)
+            msg = parsed.get("errors", [{}])[0].get("message", err_body)
+        except (ValueError, json.JSONDecodeError):
+            msg = f"HTTP {e.code}"
+        raise RuntimeError(f"Kiwi API 错误: {msg}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"网络错误: {e.reason}") from None
 
 
-_install_patch()
+# ── 变量构造 ──────────────────────────────────────────────────────
+
+def _passengers(adults: int) -> dict:
+    return {
+        "adults": adults, "children": 0, "infants": 0,
+        "adultsHoldBags": [0] * adults, "adultsHandBags": [0] * adults,
+        "childrenHoldBags": [], "childrenHandBags": [],
+    }
+
+
+def _cabin_class(seat: str) -> dict:
+    # 本 skill 用的 seat 名 (economy/premium-economy/business/first) → Kiwi enum
+    mapping = {
+        "economy": "ECONOMY", "premium-economy": "PREMIUM_ECONOMY",
+        "premium_economy": "PREMIUM_ECONOMY", "premium": "PREMIUM_ECONOMY",
+        "business": "BUSINESS", "first": "FIRST_CLASS",
+    }
+    return {"cabinClass": mapping.get(seat, "ECONOMY"), "applyMixedClasses": False}
+
+
+def _filter(stops: int, sort: str, limit: int = 15) -> dict:
+    return {
+        "maxStopsCount": stops,
+        "transportTypes": ["FLIGHT"],
+        "contentProviders": ["KIWI", "FRESH"],
+        "flightsApiLimit": 25,
+        "limit": limit,
+    }
+
+
+def _options(currency: str, sort: str) -> dict:
+    cur = currency.lower()
+    cm = CURRENCY_MAP.get(cur, CURRENCY_MAP["cny"])
+    return {
+        "sortBy": sort.upper(),
+        "mergePriceDiffRule": "INCREASED",
+        "contentProviders": ["KIWI", "FRESH"],
+        "currency": cur,
+        "locale": cm["locale"],
+        "market": cm["market"],
+        "partner": "skypicker",
+        "partnerMarket": cm["partner_market"],
+        "affilID": "skypicker",
+        "storeSearch": False,
+        "searchStrategy": "REDUCED",
+    }
+
+
+def _date_range(date: str) -> dict:
+    """'2026-11-20' → {start,end} 当天 00:00 - 23:59:59"""
+    return {"start": f"{date}T00:00:00", "end": f"{date}T23:59:59"}
 
 
 # ── 查询函数 ──────────────────────────────────────────────────────
 
-def search_flights(
-    from_airport: str,
-    to_airport: str,
-    date: str,
-    return_date: str = "",
-    seat: str = "economy",
-    adults: int = 1,
-    currency: str = "CNY",
-):
-    """查询航班，返回 ResultList"""
-    from fast_flights import get_flights as _get_flights
+def search_oneway(from_id: str, to_id: str, date: str = "",
+                  seat: str = "economy", adults: int = 1,
+                  stops: int = 2, sort: str = "QUALITY",
+                  currency: str = "cny") -> list:
+    """单程查询，返回 itinerary 列表。date 为空时查任意时间（最便宜的未来航班）。"""
+    itinerary = {
+        "source": {"ids": [from_id]},
+        "destination": {"ids": [to_id]},
+    }
+    if date and date.lower() != "anytime":
+        itinerary["outboundDepartureDate"] = _date_range(date)
 
-    flights_list = [FlightQuery(from_airport=from_airport, to_airport=to_airport, date=date)]
-    trip = "one-way"
-    if return_date:
-        flights_list.append(
-            FlightQuery(from_airport=to_airport, to_airport=from_airport, date=return_date),
-        )
-        trip = "round-trip"
+    variables = {
+        "search": {
+            "itinerary": itinerary,
+            "passengers": _passengers(adults),
+            "cabinClass": _cabin_class(seat),
+        },
+        "filter": _filter(stops, sort),
+        "options": _options(currency, sort),
+    }
+    result = _post(_ONEWAY_QUERY, variables, "SearchOneWayItinerariesQuery")
+    data = result["data"]["onewayItineraries"]
+    if data.get("__typename") == "AppError":
+        raise RuntimeError(f"Kiwi 查询失败: {data.get('error', '未知错误')}")
+    return data.get("itineraries", [])
 
-    query = create_query(
-        flights=flights_list, seat=seat, trip=trip,
-        passengers=Passengers(adults=adults), currency=currency,
-    )
-    return _get_flights(query)
+
+def search_roundtrip(from_id: str, to_id: str, depart_date: str, return_date: str,
+                     seat: str = "economy", adults: int = 1,
+                     stops: int = 2, sort: str = "QUALITY",
+                     currency: str = "cny") -> list:
+    """往返查询，返回 itinerary 列表（含 outbound + inbound 完整航班）。"""
+    variables = {
+        "search": {
+            "itinerary": {
+                "source": {"ids": [from_id]},
+                "destination": {"ids": [to_id]},
+                "outboundDepartureDate": _date_range(depart_date),
+                "inboundDepartureDate": _date_range(return_date),
+            },
+            "passengers": _passengers(adults),
+            "cabinClass": _cabin_class(seat),
+        },
+        "filter": _filter(stops, sort),
+        "options": _options(currency, sort),
+    }
+    result = _post(_RETURN_QUERY, variables, "SearchReturnItinerariesQuery")
+    data = result["data"]["returnItineraries"]
+    if data.get("__typename") == "AppError":
+        raise RuntimeError(f"Kiwi 查询失败: {data.get('error', '未知错误')}")
+    return data.get("itineraries", [])
+
+
+def search_places(term: str) -> list:
+    """机场/城市搜索，返回 Place 节点列表。"""
+    variables = {"search": {"term": term}}
+    result = _post(_PLACES_QUERY, variables, "PlacesQuery")
+    places = result["data"]["places"]
+    if places.get("__typename") != "PlaceConnection":
+        return []
+    return [e["node"] for e in places.get("edges", []) if e.get("node")]
 
 
 # ── 输出命令 ──────────────────────────────────────────────────────
 
 def _print_header(label: str, detail: str):
     print(f"\n{'='*70}")
-    print(f"  ✈️ {label}: {detail}")
+    print(f"  {label}: {detail}")
     print(f"{'='*70}")
 
 
-def _print_flight_list(results, show_price=True):
-    """打印航班列表（通用）"""
-    if not results:
-        print("  未找到航班")
-        return
+def _format_segment(seg: dict) -> str:
+    """单段航班: 'CAN 11-20 03:20 → MEL 11-20 00:10  AK113  4h20m'"""
+    src = seg["source"]
+    dst = seg["destination"]
+    src_code = src["station"]["code"]
+    dst_code = dst["station"]["code"]
+    dep = fmt_iso_datetime(src.get("localTime", ""))
+    arr = fmt_iso_datetime(dst.get("localTime", ""))
+    carrier = seg.get("carrier", {})
+    carrier_code = carrier.get("code", "")
+    carrier_name = get_airline_name(carrier_code) if carrier_code else ""
+    flight_no = seg.get("code", "")
+    airline_str = f"{carrier_code} ({carrier_name})" if carrier_name else carrier_code
+    flight_str = f"{airline_str} {flight_no}".strip()
+    dur = fmt_duration(seg.get("duration", 0))
+    return f"{src_code} {dep} → {dst_code} {arr}  {dur:>7s}  {flight_str}"
 
-    sorted_results = sorted(results, key=lambda x: x.price)
-    print(f"  共 {len(results)} 个航班，价格从 {fmt_price(sorted_results[0].price)} 起\n")
 
-    for i, flight in enumerate(sorted_results, 1):
-        airline_code = flight.type
-        known_name = get_airline_name(airline_code)
-        if known_name:
-            airline_str = f"{airline_code} ({known_name})"
-        else:
-            airline_str = f"{airline_code} ({flight.airlines[0] if flight.airlines else ''})"
-
-        for j, sg in enumerate(flight.flights):
-            dep_time = fmt_time(sg.departure.time)
-            arr_time = fmt_time(sg.arrival.time)
-            duration = fmt_duration(sg.duration)
-            plane = sg.plane_type or ""
-
-            if show_price:
-                print(f"  {i:2d}. {airline_str:24s}  {sg.from_airport.code} {dep_time} → "
-                      f"{sg.to_airport.code} {arr_time}  {duration:>6s}  "
-                      f"{fmt_price(flight.price):>8s}  {plane}")
-            else:
-                print(f"  {i:2d}. {airline_str:24s}  {sg.from_airport.code} {dep_time} → "
-                      f"{sg.to_airport.code} {arr_time}  {duration:>6s}  {plane}")
-
-        if hasattr(flight, 'carbon') and flight.carbon.emission:
-            print(f"     碳排放: {flight.carbon.emission/1000:.0f}kg CO₂ "
-                  f"(航线平均 {flight.carbon.typical_on_route/1000:.0f}kg)")
-        print()
+def _format_sector(sector: dict, prefix: str = ""):
+    """打印一个 sector 内所有航段 + 中转停留。"""
+    segs = sector.get("sectorSegments", [])
+    for i, ss in enumerate(segs):
+        seg = ss.get("segment", {})
+        line = _format_segment(seg)
+        print(f"  {prefix}{line}")
+        layover = ss.get("layover")
+        if layover and layover.get("duration"):
+            flags = []
+            if layover.get("isStationChange"):
+                flags.append("换站")
+            if layover.get("isBaggageRecheck"):
+                flags.append("重取行李")
+            tag = f"  [{'+'.join(flags)}]" if flags else ""
+            print(f"  {prefix}    中转停留 {fmt_duration(layover['duration'])}{tag}")
 
 
 def cmd_search(from_code: str, to_code: str, date: str,
-               seat: str = "economy", passengers: int = 1):
+              seat: str = "economy", passengers: int = 1,
+              stops: int = 2, sort: str = "QUALITY", currency: str = "cny"):
     """查询单程航班"""
     f = resolve_airport(from_code)
     t = resolve_airport(to_code)
-    _print_header("航班查询", f"{f} → {t}  {date}  {seat}")
+    date_label = date or "任意时间"
+    _print_header("航班查询", f"{from_code} → {to_code}  {date_label}  {seat}  ≤{stops}中转  {sort}  {currency}")
 
     try:
-        results = search_flights(f, t, date, seat=seat, adults=passengers)
-    except Exception as e:
-        print(f"查询失败: {e}")
-        return
-
-    _print_flight_list(results)
-
-
-def cmd_roundtrip(from_code: str, to_code: str, depart_date: str,
-                  return_date: str, seat: str = "economy"):
-    """查询往返航班"""
-    f = resolve_airport(from_code)
-    t = resolve_airport(to_code)
-    _print_header("往返查询", f"{f} → {t}  {depart_date} → {return_date}  {seat}")
-
-    try:
-        results = search_flights(f, t, depart_date, return_date=return_date, seat=seat)
-    except Exception as e:
+        results = search_oneway(f, t, date, seat, passengers, stops, sort, currency)
+    except RuntimeError as e:
         print(f"查询失败: {e}")
         return
 
@@ -190,25 +317,101 @@ def cmd_roundtrip(from_code: str, to_code: str, depart_date: str,
         print("  未找到航班")
         return
 
-    sorted_results = sorted(results, key=lambda x: x.price)
-    print(f"  共 {len(results)} 个往返方案，价格从 {fmt_price(sorted_results[0].price)} 起\n")
+    sorted_results = sorted(results, key=lambda x: int(x["price"].get("amount", 0)))
+    first_price = sorted_results[0]["price"].get("roundedFormattedValue", "")
+    print(f"  共 {len(results)} 个航班，价格从 {first_price} 起\n")
 
-    for i, flight in enumerate(sorted_results, 1):
-        airline_code = flight.type
-        known_name = get_airline_name(airline_code)
-        airline_str = f"{airline_code} ({known_name})" if known_name else airline_code
-        print(f"  {i:2d}. {airline_str:24s}  总价: {fmt_price(flight.price):>8s}")
-
-        for j, sg in enumerate(flight.flights):
-            flag = "去程" if j == 0 else "返程"
-            dep_time = fmt_time(sg.departure.time)
-            arr_time = fmt_time(sg.arrival.time)
-            dep_date = fmt_date(sg.departure.date) if sg.departure.date else ""
-            duration = fmt_duration(sg.duration)
-            plane = sg.plane_type or ""
-            print(f"     {flag}: {sg.from_airport.code} {dep_date} {dep_time} → "
-                  f"{sg.to_airport.code} {arr_time}  {duration:>6s}  {plane}")
+    for i, itin in enumerate(sorted_results, 1):
+        price = itin["price"].get("roundedFormattedValue", "")
+        dur = fmt_duration(itin.get("duration", 0))
+        print(f"  {i:2d}. 总价 {price:>10s}  总时长 {dur:>7s}")
+        _format_sector(itin.get("sector", {}))
         print()
+
+
+def cmd_roundtrip(from_code: str, to_code: str, depart_date: str,
+                  return_date: str, seat: str = "economy", passengers: int = 1,
+                  stops: int = 2, sort: str = "QUALITY", currency: str = "cny"):
+    """查询往返航班"""
+    f = resolve_airport(from_code)
+    t = resolve_airport(to_code)
+    _print_header("往返查询", f"{from_code} → {to_code}  {depart_date} → {return_date}  {seat}  ≤{stops}中转  {currency}")
+
+    try:
+        results = search_roundtrip(f, t, depart_date, return_date,
+                                   seat, passengers, stops, sort, currency)
+    except RuntimeError as e:
+        print(f"查询失败: {e}")
+        return
+
+    if not results:
+        print("  未找到航班")
+        return
+
+    sorted_results = sorted(results, key=lambda x: int(x["price"].get("amount", 0)))
+    first_price = sorted_results[0]["price"].get("roundedFormattedValue", "")
+    print(f"  共 {len(results)} 个往返方案，价格从 {first_price} 起\n")
+
+    for i, itin in enumerate(sorted_results, 1):
+        price = itin["price"].get("roundedFormattedValue", "")
+        dur = fmt_duration(itin.get("duration", 0))
+        print(f"  {i:2d}. 总价 {price:>10s}  总时长 {dur:>7s}")
+        outbound = itin.get("outbound", {})
+        inbound = itin.get("inbound", {})
+        print(f"      去程:")
+        _format_sector(outbound, prefix="    ")
+        print(f"      返程:")
+        _format_sector(inbound, prefix="    ")
+        print()
+
+
+def cmd_airport(keyword: str):
+    """搜索机场/城市"""
+    _print_header("机场/城市搜索", keyword)
+    try:
+        nodes = search_places(keyword)
+    except RuntimeError as e:
+        print(f"查询失败: {e}")
+        return
+
+    if not nodes:
+        print("  未找到匹配地点")
+        return
+
+    # 优先显示 City，再显示 Station；同类型按 rank 降序
+    cities = [n for n in nodes if n.get("__typename") == "City"]
+    stations = [n for n in nodes if n.get("__typename") == "Station"]
+    others = [n for n in nodes if n.get("__typename") not in ("City", "Station")]
+
+    def sort_key(n):
+        return -(n.get("rank") or 0)
+
+    cities.sort(key=sort_key)
+    stations.sort(key=sort_key)
+
+    if cities:
+        print(f"\n  城市 ({len(cities)}):")
+        for n in cities:
+            code = n.get("code", "")
+            airports = n.get("airportsCount", "")
+            country = n.get("country", {})
+            country_name = country.get("name", "") if country else ""
+            print(f"    {n['id']:40s}  {code:4s}  机场数:{airports}  {n['name']}  ({country_name})")
+
+    if stations:
+        print(f"\n  机场 ({len(stations)}):")
+        for n in stations:
+            code = n.get("code", "")
+            city = n.get("city", {}) or {}
+            city_name = city.get("name", "") if city else ""
+            country = n.get("country", {})
+            country_name = country.get("name", "") if country else ""
+            print(f"    {n['id']:40s}  {code:4s}  {n['name']}  ({city_name}, {country_name})")
+
+    if others:
+        print(f"\n  其他 ({len(others)}):")
+        for n in others:
+            print(f"    {n.get('__typename'):12s}  {n.get('id','')}  {n.get('name','')}")
 
 
 def cmd_airlines():

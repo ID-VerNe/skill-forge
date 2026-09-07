@@ -8,13 +8,14 @@
   travel.py train station <keyword>                      搜索车站
   travel.py train route <code> <from> <to> <date>        经停站
 
-  travel.py flight search <from> <to> <date> [options]         单程航班
+  travel.py flight search <from> <to> [date] [options]         单程航班
   travel.py flight roundtrip <from> <to> <depart> <return>     往返航班
+  travel.py flight airport <keyword>                           机场/城市搜索
   travel.py flight airlines                                     航空公司代码
 
 快捷方式:
   travel.py query <from> <to> <date>   = train query
-  travel.py search <from> <to> <date>  = flight search
+  travel.py search <from> <to> [date]  = flight search
   travel.py airlines                   = flight airlines
 """
 import asyncio
@@ -28,22 +29,39 @@ def print_usage():
     print(__doc__)
 
 
-def parse_seat_passengers() -> tuple:
-    """从 sys.argv 中解析 --seat 和 --passengers"""
-    seat = "economy"
-    passengers = 1
-    if "--seat" in sys.argv:
-        i = sys.argv.index("--seat")
-        if i + 1 < len(sys.argv):
-            seat = sys.argv[i + 1]
-    if "--passengers" in sys.argv:
-        i = sys.argv.index("--passengers")
-        if i + 1 < len(sys.argv):
+def parse_flight_options() -> dict:
+    """从 sys.argv 解析机票选项: --seat / --passengers / --stops / --sort / --currency"""
+    opts = {
+        "seat": "economy",
+        "passengers": 1,
+        "stops": 2,
+        "sort": "QUALITY",
+        "currency": "cny",
+    }
+    i = 0
+    args = sys.argv
+    while i < len(args):
+        a = args[i]
+        if a == "--seat" and i + 1 < len(args):
+            opts["seat"] = args[i + 1]; i += 2; continue
+        if a == "--passengers" and i + 1 < len(args):
             try:
-                passengers = int(sys.argv[i + 1])
+                opts["passengers"] = int(args[i + 1])
             except ValueError:
                 pass
-    return seat, passengers
+            i += 2; continue
+        if a == "--stops" and i + 1 < len(args):
+            try:
+                opts["stops"] = int(args[i + 1])
+            except ValueError:
+                pass
+            i += 2; continue
+        if a == "--sort" and i + 1 < len(args):
+            opts["sort"] = args[i + 1]; i += 2; continue
+        if a == "--currency" and i + 1 < len(args):
+            opts["currency"] = args[i + 1]; i += 2; continue
+        i += 1
+    return opts
 
 
 def parse_via() -> str:
@@ -54,6 +72,44 @@ def parse_via() -> str:
         if i + 1 < len(sys.argv):
             via = sys.argv[i + 1]
     return via
+
+
+def _flight_search(argv_offset: int):
+    """flight search 子命令。argv_offset 是 <from> 在 sys.argv 中的位置。"""
+    args = sys.argv[argv_offset:]
+    # args: [<from>, <to>, <date>?, ...options]
+    if len(args) < 2:
+        print("用法: travel.py flight search <from> <to> [date] [--seat ...] [--stops n] [--sort ...] [--currency ...]")
+        print("  date 可省略或写 anytime，查未来最便宜航班")
+        return
+    from_code = args[0]
+    to_code = args[1]
+    # date：第 3 个非选项位置参数
+    date = ""
+    for tok in args[2:]:
+        if tok.startswith("--"):
+            break
+        date = tok
+        break
+    opts = parse_flight_options()
+    flight.cmd_search(from_code, to_code, date,
+                      opts["seat"], opts["passengers"],
+                      opts["stops"], opts["sort"], opts["currency"])
+
+
+def _flight_roundtrip(argv_offset: int):
+    args = sys.argv[argv_offset:]
+    if len(args) < 4:
+        print("用法: travel.py flight roundtrip <from> <to> <depart> <return> [--seat ...] [--currency ...]")
+        return
+    from_code = args[0]
+    to_code = args[1]
+    depart = args[2]
+    return_ = args[3]
+    opts = parse_flight_options()
+    flight.cmd_roundtrip(from_code, to_code, depart, return_,
+                         opts["seat"], opts["passengers"],
+                         opts["stops"], opts["sort"], opts["currency"])
 
 
 async def main():
@@ -76,17 +132,13 @@ async def main():
 
     elif cmd in ("search", "s"):
         if not flight.AVAILABLE:
-            print("错误: 需要安装 fast-flights 库\n请运行: pip install fast-flights")
+            print("错误: 机票模块不可用")
             return
-        if len(sys.argv) < 5:
-            print("用法: travel.py search <from> <to> <date> [--seat ...]")
-            return
-        seat, passengers = parse_seat_passengers()
-        flight.cmd_search(sys.argv[2], sys.argv[3], sys.argv[4], seat, passengers)
+        _flight_search(2)
 
     elif cmd in ("airlines", "a"):
         if not flight.AVAILABLE:
-            print("错误: 需要安装 fast-flights 库")
+            print("错误: 机票模块不可用")
             return
         flight.cmd_airlines()
 
@@ -139,33 +191,31 @@ async def main():
     # ── flight 子命令 ──
     elif cmd == "flight":
         if not flight.AVAILABLE:
-            print("错误: 需要安装 fast-flights 库\n请运行: pip install fast-flights")
+            print("错误: 机票模块不可用")
             return
         if len(sys.argv) < 3:
-            print("用法: travel.py flight <search|roundtrip|airlines> ...")
+            print("用法: travel.py flight <search|roundtrip|airport|airlines> ...")
             return
         sub = sys.argv[2]
 
         if sub in ("search", "s"):
-            if len(sys.argv) < 6:
-                print("用法: travel.py flight search <from> <to> <date> [--seat ...]")
-                return
-            seat, passengers = parse_seat_passengers()
-            flight.cmd_search(sys.argv[3], sys.argv[4], sys.argv[5], seat, passengers)
+            _flight_search(3)
 
         elif sub in ("roundtrip", "rt", "r"):
-            if len(sys.argv) < 7:
-                print("用法: travel.py flight roundtrip <from> <to> <depart> <return> [--seat ...]")
+            _flight_roundtrip(3)
+
+        elif sub in ("airport", "ap"):
+            if len(sys.argv) < 4:
+                print("用法: travel.py flight airport <keyword>")
                 return
-            seat, _ = parse_seat_passengers()
-            flight.cmd_roundtrip(sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], seat)
+            flight.cmd_airport(sys.argv[3])
 
         elif sub in ("airlines", "a"):
             flight.cmd_airlines()
 
         else:
             print(f"未知 flight 子命令: {sub}")
-            print("可用: search, roundtrip, airlines")
+            print("可用: search, roundtrip, airport, airlines")
 
     else:
         print(f"未知命令: {cmd}")
