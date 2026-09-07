@@ -15,6 +15,7 @@
 | **igpsport-downloader** | `igpsport-downloader/` | v1.0.0 | iGPSPORT 路书下载器。输入路书编号或关键词,自动登录 iGPSPORT → 搜索路书 → 拉取航点 → 生成 GPX 文件,可直接导入 OsmAnd/Garmin/两步路/Strava 等地图软件。支持中国站 (prod.zh) 与国际站 (prod.en),两站账号和路书编号不互通。token 持久化缓存,避免重复登录 |
 | **cf-notifier** | `cf-notifier/` | — | Cloudflare Workers 推送通知服务。通过 Wrangler 部署到 Cloudflare 边缘节点，支持多渠道通知推送 |
 | **subtitle-polish** | `subtitle-polish/` | v1.0.0 | 字幕精校 Skill。输入 ASS 双语成品 + SRT 源，走 审计 → 人确认 → 修复 全流程。多 agent 并行审计（按 srt 块自适应切片 + overlap）、adversarial 验证轮去幻觉、脚本执行修复（replace/delete/swap + dry-run/accept/rollback）。按 srt_id+track 定位，自动还原 `{\be3}` 等特效标签；标点预检对照 translate_principle pipeline 规则规范化中文行 |
+| **web-search-routing** | `web-search-routing/` | v1.0.0 | Web 搜索路由器。串联 keenable（雷达，远程 LLM 增强搜索，抓新鲜源 + 厚 snippet + 发布日期）与 wigolo（工作台，本地缓存 + 引用 + 深挖）：keenable 发现值得用的 URL，wigolo `fetch` 落库，引用走 wigolo cache（`citation_id` + `source_span`）。触发词"搜一下/查一下/找一下最新 xxx"。含按任务类型分工的路由表与铁律 |
 
 ---
 
