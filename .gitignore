@@ -46,3 +46,6 @@ glue-engineer/.glue/
 
 # .plan — agent 规划草稿,不作为仓库内容
 /.plan/
+
+# .claude/workflows — 本机 workflow 脚本,不作为仓库内容
+/.claude/workflows/

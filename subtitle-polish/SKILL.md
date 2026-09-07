@@ -68,6 +68,17 @@ python <skill>/scripts/precheck_punct.py <ass_file_or_dir> --out .subtitle-polis
 - 人若想精校前先统一标点，可在门 1 后单独 `--accept` 跑一次 precheck（独立 batch，可回滚），与主修 fixes 分开。
 - **标点规则细节见 `references/punct-rules.md`；批次顺序（precheck --accept 必须在 apply_fixes 之前）见 `references/batch-ordering.md`**——顺序错了 precheck 会改掉主修写入的 `……`、删掉主修有意加的 `(EMU)` 译注。
 
+### 2.7. 三轨预审（可选开关）
+
+标点预检后、审计前，**可选**跑三轨预审（gemini-3.1 + glm-5.2 + 规则检查）给 Claude 子 agent（stage 3）提供总览线索。用户显式 `--pre-audit` 或说"先预审"才跑，默认不开。
+```bash
+python <skill>/scripts/pre_audit.py <slice.txt> --context .subtitle-polish/context.md --n 5 --out .subtitle-polish/reports
+```
+- 轨 1 gemini-3.1（5 passes intersection）：快稳，信达雅强。轨 2 glm-5.2（5 passes intersection）：慢但抓语义反转/语境错译。轨 3 check_fluency（规则）：书面语/机翻特征召回 100%。
+- 两 LLM 正交（重叠 <15%），并集才能覆盖全。模型可用性 ping 探测，缺 `GLM_API_KEY` 的轨跳过不崩。
+- **输出只是线索，不进 fixes.json / audit-report.md**。专名类标 `needs_web_verify`（GLM 专名建议 100% 编造），字符损坏类丢弃。Claude 子 agent 收到总览须独立判断，不得盲信 LLM 建议。
+- **用法/总览字段/安全闸/模型强弱图/带歪风险见 `references/pre-audit.md`**。
+
 ### 3. 审计（自适应起 agent）
 
 - 每文件份数 = `max(1, round(块数/700))`。
