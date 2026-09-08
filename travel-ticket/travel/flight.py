@@ -6,6 +6,7 @@
 """
 
 import json
+import re
 import urllib.error
 import urllib.request
 
@@ -17,7 +18,16 @@ from .utils import (
     resolve_airport,
 )
 
-AVAILABLE = True  # 仅依赖标准库，永远可用
+AVAILABLE = True  # 机票查询仅依赖标准库，永远可用
+
+# ── 机型查询：curl_cffi 可选依赖 ──────────────────────────────────
+# FlightRadar24 用 Cloudflare 反爬，标准库 urllib 会被 403 挡在挑战页。
+# curl_cffi 模拟 Chrome 的 TLS 指纹能过。未安装时机型标 N/A，不阻断主流程。
+try:
+    from curl_cffi import requests as _cf_requests
+    _CF_AVAILABLE = True
+except ImportError:
+    _CF_AVAILABLE = False
 
 # ── GraphQL 端点 ──────────────────────────────────────────────────
 _API_BASE = "https://api.skypicker.com/umbrella/v2/graphql"
@@ -254,6 +264,88 @@ def search_places(term: str) -> list:
     return [e["node"] for e in places.get("edges", []) if e.get("node")]
 
 
+# ── 机型查询（FlightRadar24，经 curl_cffi 过 Cloudflare） ──────────
+
+# ICAO 机型代码（执行过的航班 FR24 渲染为 "A333 (B-303N)"）。
+# 不匹配 "A330-300" 这类带连字符的变体名——只要干净的 ICAO 代码。
+_ICAO_CLASS = (
+    r"(?:A3(?:10|19|2[0-9]|3[0-3]|8[0-2])"
+    r"|B7(?:2[0-9]|3[0-7]|4[0-8]|5[0-7]|6[0-7]|[78][0-9])"
+    r"|A35[0-9]|A38[0-2]|E7[0-9]|E9\d|DH8\d?|AT7[25]?|CRJ\d?|SU9|AR8|SB[23])"
+)
+# "ICAO" 或 "ICAO (registration)" — 负向先行断言排除 A330-300 这类变体
+_ICAO_PAIR_RE = re.compile(
+    rf"\b({_ICAO_CLASS})(?!\d)(?!\-)"
+    r"(?:\s*\(\s*([^)\s]+)\s*\))?"
+)
+# 兜底注册号匹配（中国 B- 前缀为主，含国际常见前缀）
+_REG_RE = re.compile(
+    r"\b(B-\d{3,4}[A-Z]{0,3}|B-[A-Z]{2}\d{2,3}|N\d{2,5}[A-Z]{0,2}"
+    r"|A6-[A-Z]{3}|G-[A-Z0-9]{4,5}|9V-[A-Z]{2,3}|PH-[A-Z0-9]{3}|VH-[A-Z0-9]{3})\b"
+)
+
+# 机型缓存：(carrier_iata, flight_no) -> (icao, registration) 或 (None, None)
+# 一次查询里同一航班号多次出现只请求一次；进程级缓存跨多次调用。
+_aircraft_cache: dict = {}
+
+
+def _fetch_aircraft(carrier_iata: str, flight_no: str):
+    """查 FR24 航班页，返回 (icao_code, registration) 或 (None, None)。
+
+    优先取最近一班已执行（Landed）记录 —— 有注册号、机型确定。
+    全是 Scheduled（未来排班）时取首个 ICAO（无注册号）。
+    FR24 无此航班 / 网络失败 / curl_cffi 未装 → (None, None)。
+    """
+    key = (carrier_iata.upper(), flight_no.upper())
+    if key in _aircraft_cache:
+        return _aircraft_cache[key]
+
+    if not _CF_AVAILABLE:
+        _aircraft_cache[key] = (None, None)
+        return (None, None)
+
+    slug = f"{carrier_iata.lower()}{flight_no.lower()}"
+    url = f"https://www.flightradar24.com/data/flights/{slug}"
+    try:
+        r = _cf_requests.get(url, impersonate="chrome", timeout=20)
+        if r.status_code != 200:
+            _aircraft_cache[key] = (None, None)
+            return (None, None)
+        html = r.text
+    except Exception:
+        _aircraft_cache[key] = (None, None)
+        return (None, None)
+
+    # 去标签，压空白，便于在整行文本里搜 "ICAO (reg)" 对
+    flat = re.sub(r"<[^>]+>", " ", html)
+    flat = re.sub(r"\s+", " ", flat)
+
+    icao = None
+    reg = None
+    # 优先：含 "Landed" 的片段里找 ICAO+reg 对
+    for chunk in re.split(r"(?=Landed)", flat):
+        if "Landed" not in chunk:
+            continue
+        m = _ICAO_PAIR_RE.search(chunk)
+        if m:
+            icao = m.group(1)
+            reg = m.group(2)
+            if not reg:
+                rm = _REG_RE.search(chunk)
+                if rm:
+                    reg = rm.group(1)
+            break
+    # 回退：整页找任意 ICAO（未来排班只有 ICAO 无注册号）
+    if not icao:
+        m = _ICAO_PAIR_RE.search(flat)
+        if m:
+            icao = m.group(1)
+            reg = m.group(2)
+
+    _aircraft_cache[key] = (icao, reg)
+    return (icao, reg)
+
+
 # ── 输出命令 ──────────────────────────────────────────────────────
 
 def _print_header(label: str, detail: str):
@@ -263,7 +355,7 @@ def _print_header(label: str, detail: str):
 
 
 def _format_segment(seg: dict) -> str:
-    """单段航班: 'CAN 11-20 03:20 → MEL 11-20 00:10  AK113  4h20m'"""
+    """单段航班: 'CAN 11-20 03:20 → MEL 11-20 00:10  AK113 [A333 B-303N]  4h20m'"""
     src = seg["source"]
     dst = seg["destination"]
     src_code = src["station"]["code"]
@@ -276,6 +368,18 @@ def _format_segment(seg: dict) -> str:
     flight_no = seg.get("code", "")
     airline_str = f"{carrier_code} ({carrier_name})" if carrier_name else carrier_code
     flight_str = f"{airline_str} {flight_no}".strip()
+
+    # 机型（FR24 查询，可选）
+    ac_icao, ac_reg = _fetch_aircraft(carrier_code, flight_no)
+    if ac_icao:
+        ac_str = f"[{ac_icao}"
+        if ac_reg:
+            ac_str += f" {ac_reg}"
+        ac_str += "]"
+    else:
+        ac_str = "[机型N/A]"
+    flight_str = f"{flight_str}  {ac_str}"
+
     dur = fmt_duration(seg.get("duration", 0))
     return f"{src_code} {dep} → {dst_code} {arr}  {dur:>7s}  {flight_str}"
 
