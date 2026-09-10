@@ -1,7 +1,7 @@
 ---
 name: Ready-to-Use Prompt Patterns
 description: >-
-  8 个即用型 Prompt 模板：通用高质量生成、照片级人像、产品图、精确文字海报、UI Mockup、图像编辑、多图合成、角色一致性。
+  8 个即用型 Prompt 模板：通用高质量生成、照片级人像、产品图、精确文字海报、UI Mockup、图像编辑、多图合成、角色一致性。适用于 GPT Image 2.5。
 ---
 
 # Ready-to-Use Prompt Patterns

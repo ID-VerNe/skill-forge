@@ -14,7 +14,7 @@ description: >-
 
 **用户说：** "帮我做一张小红书封面，主题是 30 天早起计划，要有高级感，文字要清楚。"
 
-**Final GPT Image 2 Prompt：**
+**Final GPT Image 2.5 Prompt：**
 
 ```text
 Create a premium vertical social media cover image for a "30-day early wake-up plan".
@@ -47,6 +47,7 @@ Constraints:
 Render all Chinese text exactly once and perfectly legibly. No extra words, no duplicate text, no watermark, no unrelated logos, no clutter.
 
 Suggested settings:
+model: gpt-image-2.5-sunburst
 size: 1024x1536
 quality: high
 format: png
@@ -58,7 +59,7 @@ format: png
 
 **用户说：** "把这张产品图的背景换成大理石浴室台面，产品不要变。"
 
-**Final GPT Image 2 Prompt：**
+**Final GPT Image 2.5 Prompt：**
 
 ```text
 Change:
@@ -80,7 +81,7 @@ Do not restyle the product. Do not alter the label. Do not change product shape,
 
 **用户说：** "图 1 是人像，图 2 是衣服，帮我换装，但脸和背景不变。"
 
-**Final GPT Image 2 Prompt：**
+**Final GPT Image 2.5 Prompt：**
 
 ```text
 Image 1: base portrait to preserve.
@@ -105,7 +106,7 @@ Replace only the clothing. Do not add jewelry, bags, logos, text, accessories, e
 
 **用户说：** "帮我生成一张像国家地理杂志风格的老人做面包的照片。"
 
-**Final GPT Image 2 Prompt：**
+**Final GPT Image 2.5 Prompt：**
 
 ```text
 Create a photorealistic candid documentary photograph of an elderly baker preparing dough before sunrise in a small neighborhood bakery.

@@ -1,7 +1,7 @@
 ---
 name: Task-Type Templates
 description: >-
-  包含所有 12 类 GPT Image 2 任务的 Prompt 模板和规则。SKILL.md 的路由表指向这里。
+  包含所有 12 类 GPT Image 2.5 (Flare/Sunburst) 任务的 Prompt 模板和规则。SKILL.md 的路由表指向这里。
   由 SKILL.md 的 Task Classification Router 按需读取。
 ---
 
@@ -51,7 +51,7 @@ Constraints:
 
 ### 核心结构：Change / Preserve / Constraints
 
-编辑 Prompt 的重点是 **防止模型重绘整张图**。
+编辑 Prompt 的重点是 **防止模型重绘整张图**。每一次编辑建议只改一处。如果多轮迭代（Iterate deliberately），要把上一次输出作为输入，并重申保留项。
 
 ```text
 Change:
@@ -112,7 +112,7 @@ No extra accessories, no logos, no text, no watermark.
 
 ## § Text-in-Image
 
-GPT Image 2 的文字渲染能力较强，但 Agent 仍必须把文字当成「排版任务」来写。
+GPT Image 2.5 的文字渲染能力极强，但 Agent 仍必须把文字当成「排版任务」来写。
 
 ### Rules
 
@@ -122,7 +122,7 @@ GPT Image 2 的文字渲染能力较强，但 Agent 仍必须把文字当成「�
 4. 指定字体风格：bold sans-serif、condensed serif、handwritten script、宋体风格、现代无衬线等
 5. 指定文字出现次数：once only / exactly once
 6. 添加禁止项：no extra words, no duplicate text, no garbled text, no watermark
-7. 对密集文字、细小文字、信息图、UI 屏幕，建议使用 `quality: high`
+7. 对密集文字、细小文字、信息图、UI 屏幕，建议使用 `quality: high` 或 `xhigh`
 
 ### Template
 
@@ -224,7 +224,7 @@ No heavy retouching, no plastic skin, no glamorization, no watermark, no extra t
 Create a professional product photograph of [product].
 
 Scene:
-[背景、台面、道具、环境。]
+[背景、台面、道具、环境。如果需要抠图，明确声明 transparent background。]
 
 Product:
 [产品形状、颜色、材质、标签文字、logo 或图案要求。]
@@ -244,6 +244,18 @@ Use case:
 Constraints:
 Preserve product geometry, label legibility, and print sharpness. No extra logos, no watermark, no unrelated props.
 ```
+
+### Transparent Product Cutout Example (透明背景抠图)
+
+```text
+Extract the product from the input image and isolate it on a fully transparent background.
+
+Output: centered product, crisp silhouette, no halos/fringing.
+
+Constraints:
+Preserve product geometry and label legibility exactly. Add only light polishing. Do not add a solid backdrop, checkerboard, scenery, or shadow. Do not restyle the product; remove the background and preserve clean alpha transparency.
+```
+*(注意：调用时必须配合 `background="transparent"` 与 PNG/WebP 格式)*
 
 ### White-Background E-commerce Example
 
@@ -353,7 +365,7 @@ All labels must be legible. Avoid tiny text, extra decoration, incorrect arrows,
 
 ## § Logo
 
-Logo 生成要强调 **原创、简洁、可缩放、非侵权、单一标志**。
+Logo 生成要强调 **原创、简洁、可缩放、非侵权、单一标志**。支持原生透明背景输出。
 
 ```text
 Create an original, non-infringing logo for [brand name], a [business type].
@@ -365,17 +377,18 @@ Visual direction:
 [图形隐喻、几何形状、线条、负空间、图标与文字关系。]
 
 Style:
-Clean vector-like shapes, strong silhouette, balanced negative space, simple enough to read at small sizes.
+Clean vector-like shapes, strong silhouette, balanced negative space, simple enough to read at small sizes. Flat design, minimal strokes, no gradients unless essential.
 
 Color:
 [主色、辅助色、是否单色可用。]
 
 Output:
-A single centered logo on a plain background with generous padding.
+A single centered logo with generous padding. Fully transparent background (clean alpha edges) / Plain background.
 
 Constraints:
-Original design only, no trademarks, no real brand references, no watermark, no mockup scene, no complex illustration.
+Original design only, no trademarks, no real brand references, no watermark, no mockup scene, no complex illustration, no solid backdrop if transparency is requested.
 ```
+*(注意：若需透明底，调用时需配合 `background="transparent"` 与 PNG/WebP 格式)*
 
 ---
 
@@ -449,7 +462,7 @@ White background, no watermark, no extra text, no real brand logos.
 
 ## § Drawing → Photoreal
 
-草图是「合同」还是「灵感」？如果用户要保留结构，必须写 preserve exact layout。
+草图是「合同」还是「灵感」？如果用户要保留结构，必须写 preserve exact layout。并说明不添加任何新元素。
 
 ```text
 Turn this drawing into a photorealistic image.
@@ -458,7 +471,7 @@ Preserve:
 The exact layout, proportions, perspective, horizon line, object placement, camera angle, and spatial relationships from the drawing.
 
 Realism:
-Choose realistic materials, lighting, textures, shadows, and environmental details consistent with the sketch.
+Choose realistic materials, lighting, textures, shadows, and environmental details consistent with the sketch intent.
 
 Constraints:
 Do not add new major objects, do not change the composition, do not add text, no watermark.
