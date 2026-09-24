@@ -1,6 +1,6 @@
 ---
 name: subtitle-polish
-version: 1.1.0
+version: 1.2.0
 description: 字幕精校,支持自动/手动两种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。自动模式:输入 ASS 双语成品 + SRT 源,走 审计→人确认→修复 全流程,修复由脚本执行(dry-run/accept/rollback)。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。也支持 /subtitle-polish 命令。
 ---
 

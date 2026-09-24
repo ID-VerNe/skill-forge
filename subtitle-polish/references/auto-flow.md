@@ -101,7 +101,7 @@ python <skill>/scripts/pre_audit.py <slice.txt> --context .subtitle-polish/conte
   - 一条审计发现可拆多条 fix，id 用 `<audit_id><suffix>`（如 `e02#152a`/`e02#152b`），audit_id 为父。
   - `final_new` 缺省 = `suggested_new`；用户改过则覆盖。
   - `enabled=true` 仅给 status=accepted 的；其余 `enabled=false`。
-  - `action` ∈ replace | delete | swap（swap 换文本不换时间戳，附 `swap_with`）。
+  - `action` ∈ replace | delete | swap | insert（swap 换文本不换时间戳，附 `swap_with`；insert 新增一行如注释轨，样式按 track 自动解析）。
   - `srt_path` 显式写，避免脚本找不到配对 srt。
 - id 空间与 status 取值详见 `pipeline-spec.md`。
 - 第 7 类进 `.subtitle-polish/optional-fixes.json`，默认不并入主修。

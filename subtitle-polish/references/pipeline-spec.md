@@ -137,7 +137,7 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
     "file": ".../e02....ass",   // 目标 ass 路径（脚本会归一化比较）
     "srt_id": 152,              // srt 块序号（定位键）
     "track": "中文",            // 英文/中文/注释
-    "action": "replace",        // replace | delete | swap
+    "action": "replace",        // replace | delete | swap | insert
     "suggested_new": "我把托马斯甩开了",  // agent 建议
     "final_new": "我把托马斯甩开了",      // 人确认后；缺省=suggested_new
     "category": "语义反转",
@@ -152,6 +152,7 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 - **id = audit_id**（多文件用 `<shortname>#<srt_id>`，如 `e02#152`；单文件也用此格式而非全局序号）。fixes.json / dry-run.md / audit-report.md 三处 id 一致，人 review 时一眼对上。**不用全局 1..N 序号**（第三轮实测用了全局序号 `1..33` + audit_id 双轨，人看 fixes.json 得靠 audit_id 反查 id，多此一举）。
 - **一条审计发现可拆多条 fix**：例如 audit_id=`e02#152` 配对错位要改 srt 4+5 两行中文 → fix `e02#152a`(srt 4) + `e02#152b`(srt 5)，共享 `audit_id=e02#152`。id 加字母后缀区分。
 - **swap** 额外字段：`swap_with`: 另一个 srt_id。交换两行的文本部分，不动时间戳/样式/标签。
+- **insert** 新增一行（典型：注释轨）。`track` 指定新行轨道（如 `注释`），`final_new` 为新增文本（纯文本不带 ASS 标签，无现译行可继承标签）。样式由脚本按 track 从 ASS `[V4+ Styles]` 自动解析（ASS 须有对应样式，否则报错停下，不自动建样式）。日志 `old_text` 记为空，rollback 时删该行。
 - **status 语义**：
   - `accepted`=修（apply_fixes 执行）
   - `misreport`=误报（不该报）

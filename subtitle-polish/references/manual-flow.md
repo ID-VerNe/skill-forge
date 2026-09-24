@@ -20,6 +20,12 @@
 
 **多轮迭代时，每轮 M2 开始前重新跑 extract_slice.py**——切片是提取时的快照，上一批 accept 后 ASS 已变，旧切片的"现译"列是过期数据，直接 grep 会导致 dry-run 自检时现译与用户描述不符。第一轮无需重提（ASS 未动）。
 
+```bash
+python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slices/
+```
+
+参数是 `--out`（输出目录），不是 `--outdir`。
+
 指令的常见形态（主 agent 据此理解，不强求用户用固定格式）：
 
 - **定位**：用户可能给 srt 块号、ass 时间戳（`0:01:16`）、英文原文片段、或当前中文片段。主 agent 定位到具体 srt_id + track + Dialogue 行：
@@ -27,7 +33,9 @@
   - 给英文/中文片段 → 在切片文件里 `grep` 搜（切片每行 `<srt_id> | <ass_time> | <英文> | <中文> | <注释>`，grep 能直接看到 srt_id）；也可调 `lib/ass_srt_pair.find_srt_ids_by_text`。两者等价，grep 更直观。
   - 多行命中（片段太短，如"Thank you"对到多行）→ 用 AskUserQuestion 让用户消歧（附上每条命中的 ass_time + 现译），不要猜、不要默认取第一个。
   - **AskUserQuestion 消歧时不要重复已确认的取舍**——若用户已在上一轮 AskUserQuestion 里选了带权衡说明的选项（如"接受口型错位"），下一轮不要就同一问题再问。只问新出现的歧义。
-- **改什么**：用户说"把这句中文改成 XXX"、"删掉这行"、"这两行的中文换一下"——映射到 `action ∈ replace | delete | swap`。
+- **改什么**：用户说"把这句中文改成 XXX"、"删掉这行"、"这两行的中文换一下"——映射到 `action ∈ replace | delete | swap | insert`。
+  - `replace` 改某行文本；`delete` 删整行；`swap` 两行文本互换（不换时间戳）。
+  - `insert` 新增一行，典型场景是给某个 srt 时段加注释轨（`track=注释`）。`final_new` 写注释正文（纯文本不带 ASS 标签，同 replace 规则），挂在 `srt_id` 对应时段。样式由脚本按 track 从 ASS `[V4+ Styles]` 自动解析（找 `style_to_track(name)==track` 的样式名）；**ASS 无对应样式则脚本报错停下，不自动建样式**——用户需先在 ASS 里定义好 `注释` 等样式。`id`/`audit_id` 空间同 replace（`<shortname>#<srt_id>`）。
 - **批量**：用户一次给多条指令 → 全部进同一个 fixes.json。
 
 ## M3. 构造 fixes.json
@@ -44,6 +52,7 @@
   - **多行各自独立改**（三句不相关的话各改各的）→ id 各自 `jm#70`/`jm#71`/`jm#72`，audit_id 各自独立。
   - 判据：用户给的是"一个整句建议拆到多行"还是"多行各自独立改"。拿不准按前者（a/b/c），便于追溯。
   - swap（两行文本互换，不改时间戳）用 swap action + `swap_with`，单独一条 fix。
+  - insert（新增行，如注释轨）用 insert action，无现译行可继承标签，`final_new` 就是落盘文本。一条 fix 对应一行。
 
 **落盘**：写到 `.subtitle-polish/fixes.json`（覆盖式，手动模式每批一份新的）。
 
@@ -53,10 +62,10 @@
 python <skill>/scripts/apply_fixes.py .subtitle-polish/fixes.json --dry-run
 ```
 
-输出 `.subtitle-polish/reports/dry-run.md`。主 agent **读 dry-run.md 自检**，逐条核对三点：
+输出 `.subtitle-polish/reports/dry-run.md`。主 agent **读 dry-run.md 自检**，逐条核对：
 
-1. **定位**：无 `（定位失败）`，时间戳对得上用户说的那句。
-2. **现译**：现译与用户描述的"当前中文"吻合（多轮时尤其要核——上一批改过的行现译应是改后的）。
+1. **定位**：无 `（定位失败）`，时间戳对得上用户说的那句。**insert 特例**：insert 无现译行，ass_time 从 srt 块取，"定位"= srt_id 时段可解即可，不要求有现译行。
+2. **现译**：现译与用户描述的"当前中文"吻合（多轮时尤其要核——上一批改过的行现译应是改后的）。**insert 无此点**（新行无现译）。
 3. **新译 == 用户建议**：dry-run 里的"新译"必须与用户口述的建议译文**逐字一致**。**工程冲突（时段塞不下、行数与建议字数不配等）不自行拆字/移字/改写新译**——若发现某条新译无法原样落盘（如 1.3 秒时段塞不下 23 字），停下用 AskUserQuestion 把冲突抛回用户（附该行 ass_time + 现译 + 用户建议新译 + 冲突原因，让用户决定拆法/换词/改时长），不自作主张。手动模式的契约是 `final_new = 用户给的译文`，agent 只动手不二次创作。
 
 三点全过 → 进 M5。任一点不过 → 停下告知用户，问清后再走，不盲目 accept。

@@ -23,6 +23,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pysubs2
+from pysubs2 import SSAEvent
 
 from lib.ass_srt_pair import (
     parse_ass, parse_srt, pair, TRACK_EN, TRACK_ZH, TRACK_NOTE,
@@ -75,6 +76,16 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str, fallback_t
 
 def _build_srt_index(srt_blocks):
     return {b.index: b for b in srt_blocks}
+
+
+def _resolve_style_for_track(subs, track: str) -> str:
+    """从 subs.styles 找 style_to_track(name)==track 的样式名，返回首个。
+    无则返回 ""（调用方报错：ASS 缺该 track 样式）。insert 用。
+    """
+    for name in (subs.styles or {}):
+        if style_to_track(name) == track:
+            return name
+    return ""
 
 
 from lib.tags import extract_leading_tags, merge_tags as _merge_tags
@@ -139,23 +150,42 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
         for fx in fxs:
             action = fx.get("action", "replace")
             track = fx.get("track", TRACK_ZH)
-            e = _find_dialogue(subs, srt_index, fx["srt_id"], track)
+            srt_id = fx["srt_id"]
+            e = _find_dialogue(subs, srt_index, srt_id, track)
+            # insert：该 track 行尚不存在，e=None 正常；ass_time 从 srt 块取
+            sb = srt_index.get(srt_id)
+            is_insert = (action == "insert")
+            if is_insert:
+                if sb is None:
+                    lines.append(f"### {fx.get('audit_id') or fx.get('id','')} — {fx.get('category','')} (insert)")
+                    lines.append(f"- **（定位失败：srt_id {srt_id} 无对应时段）**")
+                    lines.append("")
+                    continue
+                ass_time = f"{seconds_to_ass(sb.start)}-{seconds_to_ass(sb.end)}"
+                new_raw = fx.get("final_new") or fx.get("suggested_new", "")
+                lines.append(f"### {fx.get('audit_id') or fx.get('id','')} — {fx.get('category','')} (insert)")
+                lines.append(f"- srt_id: {srt_id} / track: {track}")
+                lines.append(f"- ass_time: `{ass_time}`")
+                lines.append(f"- 新增 {track} 行")
+                if fx.get("reason"):
+                    lines.append(f"- 理由: {fx['reason']}")
+                lines.append(f"- 新译: `{new_raw}`")
+                lines.append("")
+                continue
             # dry-run 对称显示：现译/新译都显示实际落盘的 raw text（含标签），
             # 让人看到真实写入内容，避免以为标签丢了。
             cur_raw = e.text if e else "（定位失败）"
             new_raw = fx.get("final_new") or fx.get("suggested_new", "")
             # 给新译补上原行标签做对称预览（不实际写入）
             if e and new_raw:
-                from lib.tags import extract_leading_tags, merge_tags
                 orig_tags, _ = extract_leading_tags(e.text)
                 new_tags, new_body = extract_leading_tags(new_raw)
-                new_preview = "".join(merge_tags(orig_tags, new_tags)) + new_body
+                new_preview = "".join(_merge_tags(orig_tags, new_tags)) + new_body
             else:
                 new_preview = new_raw
             # ass_time：从定位到的 Dialogue 取 start/end，转 ASS 串
             ass_time = ""
             if e:
-                from lib.time_fmt import seconds_to_ass
                 ass_time = f"{seconds_to_ass(e.start/1000.0)}-{seconds_to_ass(e.end/1000.0)}"
             lines.append(f"### {fx.get('audit_id') or fx.get('id','')} — {fx.get('category','')} ({action})")
             lines.append(f"- srt_id: {fx['srt_id']} / track: {track}")
@@ -209,6 +239,28 @@ def run_accept(fixes: list, work_dir: str, batch_id: str) -> None:
             track = fx.get("track", TRACK_ZH)
             srt_id = fx["srt_id"]
             e = _find_dialogue(subs, srt_index, srt_id, track)
+            if action == "insert":
+                sb = srt_index.get(srt_id)
+                if sb is None:
+                    print(f"[!] insert 定位失败: {fx.get('id')} srt_id={srt_id} 无对应时段", file=sys.stderr)
+                    continue
+                style = _resolve_style_for_track(subs, track)
+                if not style:
+                    print(f"[!] insert 失败: {fx.get('id')} ASS 缺 {track} 样式（需先在 [V4+ Styles] 定义）", file=sys.stderr)
+                    continue
+                new_text = fx.get("final_new") or fx.get("suggested_new", "")
+                if not new_text:
+                    print(f"[!] insert 无新文本: {fx.get('id')}", file=sys.stderr)
+                    continue
+                ne = SSAEvent()
+                ne.start = int(sb.start * 1000)
+                ne.end = int(sb.end * 1000)
+                ne.style = style
+                ne.text = new_text
+                subs.events.append(ne)
+                append_log(work_dir, batch_id, "insert", file, srt_id, track,
+                           "", ne.text, fx.get("category", ""), fx.get("reason", ""))
+                continue
             if not e:
                 print(f"[!] 定位失败: {fx.get('id')} srt_id={srt_id} track={track}", file=sys.stderr)
                 continue
@@ -301,6 +353,17 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                 continue
             if ent["action"] == "delete":
                 print(f"[!] delete 回滚无法自动重建 srt_id={ent['srt_id']}", file=sys.stderr)
+                continue
+            if ent["action"] == "insert":
+                # insert 的逆 = 删该行（按 new_text fallback 定位插入的行）
+                if e is None:
+                    print(f"[!] insert 回滚定位失败: srt_id={ent['srt_id']} track={track}", file=sys.stderr)
+                    continue
+                subs.events.remove(e)
+                append_log(work_dir, make_batch_id(), "rollback", f,
+                           ent["srt_id"], ent["track"], e.text, "",
+                           ent.get("category", ""), f"rollback of {ent['batch_id']}")
+                count += 1
                 continue
             cur = e.text
             e.text = ent["old_text"]
