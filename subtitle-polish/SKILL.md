@@ -1,6 +1,6 @@
 ---
 name: subtitle-polish
-version: 1.2.0
+version: 1.3.0
 description: 字幕精校,支持自动/手动两种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。自动模式:输入 ASS 双语成品 + SRT 源,走 审计→人确认→修复 全流程,修复由脚本执行(dry-run/accept/rollback)。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。也支持 /subtitle-polish 命令。
 ---
 
@@ -59,6 +59,21 @@ python <skill>/scripts/apply_fixes.py --rollback before=<ts>
 ```
 所有操作都留 log.jsonl 记录,支持单条/整 batch/时间点三种粒度回滚。**global_replace 与 precheck_punct 当前不单独支持 `--rollback`**(argparse 未注册),其改动靠 `.bak` 文件手动还原,或用 `apply_fixes.py --rollback batch=<它们的 batch_id>`(若该 action 被认)。详见 `references/pipeline-spec.md` 回滚节与 `references/batch-ordering.md`。
 
+## 破例 Edit 兜底(两模式共用)
+
+脚本 `_find_dialogue` 在相邻 srt 块时间差 < 0.5s 时取最近也分不开(dry-run 会报"撞车预警")。撞车场景下允许破例 Edit ASS,但必须用脚本补记 log:
+
+```bash
+python <skill>/scripts/apply_fixes.py --manual-log \
+    --file <ass> --srt-id <id> --track 中文 \
+    --old "原文本" --new "新文本" \
+    --category "语境错译" --reason "撞车兜底" \
+    --batch-id <ts>_manual
+python <skill>/scripts/verify_fixes.py --batch-id <ts>_manual  # 验 manual_edit
+python <skill>/scripts/apply_fixes.py --rollback batch=<ts>_manual  # 回滚
+```
+首选仍是脚本,Edit 是 last resort。详见 `references/manual-flow.md` 兜底节。
+
 ## 文件结构
 
 ```
@@ -66,7 +81,7 @@ python <skill>/scripts/apply_fixes.py --rollback before=<ts>
 ├── SKILL.md                    # 本文件,路由
 ├── references/
 │   ├── auto-flow.md            # 自动流程阶段 0→11
-│   ├── manual-flow.md          # 手动流程 M0→M6
+│   ├── manual-flow.md          # 手动流程 M0→M6（含括注/ASR/兜底节）
 │   ├── pipeline-spec.md        # 数据流/fixes.json schema/log/回滚规范
 │   ├── batch-ordering.md       # 脚本批次顺序与 verify 失败处理
 │   ├── category-taxonomy.md    # 7 类分类法
@@ -92,7 +107,7 @@ python <skill>/scripts/apply_fixes.py --rollback before=<ts>
 
 - **不带术语表**:作为第三者审校,不预设专名映射。详见 `references/glossary-handling.md`。
 - **7 类分类法**:结构性生产缺陷/漏译/语义反转/语境错译/专名错误不一致/原文拼写错误/低严重度。详见 `references/category-taxonomy.md`。
-- **不 Edit ASS**:所有修改走脚本。
-- **srt 是权威英文源**(除拼写错误,srt 与 ass 同源,拼写靠子 agent 判断)。
-- **异常标记**:提取脚本自动标 ASS_HAS_SRT_NONE 等,这些本身是审计线索。
+- **不 Edit ASS**:所有修改走脚本。**例外**:相邻 srt 块时间差 < 0.5s 时脚本 `_find_dialogue` 取最近也分不开(dry-run 会报"撞车预警"),允许破例 Edit ASS 兜底,但必须用 `apply_fixes.py --manual-log` 子命令补记 log.jsonl,不能手写 JSON。详见 `references/manual-flow.md` 兜底节。
+- **srt 是权威英文源**(除拼写错误,srt 与 ass 同源,拼写靠子 agent 判断)。**ASR 听写错误**(如 `big closet`→`big chested`)算英文源本身错,默认只改中文轨,英文轨改不改是另一次决定,SRT 源始终不动。详见 `references/manual-flow.md` ASR 节。
+- **异常标记**:提取脚本自动标 ASS_HAS_SRT_NONE 等,这些本身是审计线索。`MULTI_SAME_LANG` 在配对算法去重后,只有真同时间戳重复行才标(不再因 ±0.5s 容差误配产生)。
 - **不要幻觉**:审计 agent 拿不准就别报,宁可漏报不要误报(有验证轮兜底)。

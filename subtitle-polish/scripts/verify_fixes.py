@@ -54,6 +54,19 @@ def verify_entry(entry, subs, srt_index):
             return True, "", "行已删除"
         return False, e.text, "delete 后该行仍存在"
 
+    if action == "manual_edit":
+        # 破例 Edit：按 log 的 new_text fallback 定位，核对可见文本一致即可。
+        # 不要求 srt_id 精确时间戳匹配（manual_edit 可能改了时间戳）。
+        e = _find_dialogue(subs, srt_index, entry["srt_id"], track,
+                           fallback_text=expected_new)
+        if e is None:
+            return False, "", "定位失败（manual_edit 后该行找不到，可能时间戳变了）"
+        _, exp_body = extract_leading_tags(expected_new)
+        _, act_body = extract_leading_tags(e.text)
+        if act_body == exp_body:
+            return True, e.text, "可见文本一致（manual_edit）"
+        return False, e.text, f"可见文本不符：期望 '{exp_body}' 实际 '{act_body}'"
+
     if action == "rollback" and expected_new == "":
         # rollback 到 delete 前态：行应已删除（log 的 new_text 空）
         e = _find_dialogue(subs, srt_index, entry["srt_id"], track)

@@ -247,7 +247,14 @@ def _text_ratio(a: str, b: str) -> float:
 
 
 def _match_by_time_and_text(srt_block: SrtBlock, ass_blocks: List[AssDialogue]) -> List[AssDialogue]:
-    """时间戳模糊匹配 + 文本双校验，返回匹配的 ass 行。"""
+    """时间戳模糊匹配 + 文本双校验，返回匹配的 ass 行。
+
+    同 track 多候选时只留时间戳最近的（实测相邻 srt 块间隔 < 0.5s 容差时，
+    ±0.5s 窗会把相邻 ass 行都包进来，导致 MULTI_SAME_LANG 误配 + 切片
+    `⏎` 重复行误导 agent 误判物理重复）。多个候选时间戳距离相同时（真正的
+    同时间戳重复行）全部保留，让 pair() 标 MULTI_SAME_LANG —— 那才是真
+    生产缺陷，不该被容差窗误配产生，也不该被这里误删。
+    """
     candidates = []
     for ab in ass_blocks:
         if abs(ab.start - srt_block.start) <= TIME_TOLERANCE:
@@ -277,7 +284,20 @@ def _match_by_time_and_text(srt_block: SrtBlock, ass_blocks: List[AssDialogue]) 
         else:
             # 中文/注释行，时间戳对上就算配对
             matched.append(ab)
-    return matched
+    # 同 track 多候选 → 只留时间戳距离最近的；距离相同的全留（真重复行）。
+    # 避免 ±0.5s 容差在相邻 srt 块（实测 361/362 隔 390ms）上把两条中文行
+    # 都配到两个 srt 块、切片出现"是的 ⏎ 它变硬了"假重复。
+    by_track = {}
+    for ab in matched:
+        by_track.setdefault(ab.track, []).append(ab)
+    deduped = []
+    for trk, abs_ in by_track.items():
+        abs_.sort(key=lambda x: abs(x.start - srt_block.start))
+        if not abs_:
+            continue
+        best_d = abs(abs_[0].start - srt_block.start)
+        deduped.extend(ab for ab in abs_ if abs(ab.start - srt_block.start) == best_d)
+    return deduped
 
 
 def pair(ass_blocks: List[AssDialogue], srt_blocks: List[SrtBlock]) -> List[PairedBlock]:

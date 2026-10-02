@@ -100,25 +100,33 @@ def _normalize_chinese_body(body: str) -> str:
     return body
 
 
+_ABBREV_CHAIN = re.compile(r"(?<![A-Za-z])[A-Za-z](?:\.[A-Za-z])+\.")
+
+
 def _delete_non_digit_eng_punct(body: str) -> str:
-    """删非数字间的英文 , .（保护 3.14、1,000 与缩写 J.R.）。
+    """删非数字间的英文 , .（保护 3.14、1,000 与缩写 J.R. / U.S.A.）。
 
     pipeline 规则 (?<!\\d)[.,](?!\\d) 会删 J.R. 的点。这里加缩写保护：
-    字母 . 字母 模式中的点保留。
+    整条缩写链 [A-Za-z](\\.[A-Za-z])+\\. 里的所有点（含末尾）都保留。
+
+    缩写保护只认拉丁字母 [A-Za-z]，不认 CJK —— Python 的 str.isalpha() 对
+    中文字符也返回 True，导致「的,不」这种中文间英文逗号被误判为缩写点保
+    留、漏删成空格（实测 15 行漏修）。本实现用正则匹配缩写链（天然只匹配
+    拉丁字母），中文间逗号不会进入链、被正常删成空格。
     """
+    # 1. 缩写链里的点临时换成 \x00 占位，避免被下面的删除逻辑误删
+    protected = _ABBREV_CHAIN.sub(
+        lambda m: m.group(0).replace(".", "\x00"), body
+    )
+    # 2. 删非数字间的 . ,
     out = []
     i = 0
-    n = len(body)
+    n = len(protected)
     while i < n:
-        ch = body[i]
+        ch = protected[i]
         if ch in ".,.":
-            # 缩写点保护：字母.字母（前后都是字母则保留）
-            prev = body[i - 1] if i > 0 else ""
-            nxt = body[i + 1] if i + 1 < n else ""
-            if prev.isalpha() and nxt.isalpha():
-                out.append(ch)
-                i += 1
-                continue
+            prev = protected[i - 1] if i > 0 else ""
+            nxt = protected[i + 1] if i + 1 < n else ""
             # 数字间保留（pipeline 原 (?<!\d)(?!\d)）
             if prev.isdigit() or nxt.isdigit():
                 out.append(ch)
@@ -130,7 +138,8 @@ def _delete_non_digit_eng_punct(body: str) -> str:
             continue
         out.append(ch)
         i += 1
-    return "".join(out)
+    # 3. 还原缩写链里的点
+    return "".join(out).replace("\x00", ".")
 
 
 def find_issues(text: str, is_chinese: bool = True) -> list:
@@ -150,10 +159,12 @@ def find_issues(text: str, is_chinese: bool = True) -> list:
     if re.search(r"[，。、]", body):
         issues.append("残留中文标点 ，。、（应为空格）")
     # 英文标点：只在归一化后的 body 上检测（省略号已转 …，不再算 ... 的点）。
-    # 缩写点 J.R. 保护：字母.字母 不算。
+    # 缩写点 J.R. 保护：拉丁字母.拉丁字母 不算。CJK 间的 . , 不算缩写，
+    # 必须报（实测 isalpha() 把中文也当字母导致漏报 15 行）。
     normalized_body = _normalize_ellipsis(body)
     bad_eng = re.findall(r"(?<!\d)[.,](?!\d)", normalized_body)
     abbrev = re.findall(r"[A-Za-z]\.[A-Za-z]", normalized_body)
+    # 缩写点只算拉丁字母对（与 _delete_non_digit_eng_punct 的 isascii()+isalpha() 一致）
     real_bad = len(bad_eng) - len(abbrev)
     if real_bad > 0:
         issues.append(f"英文标点在非数字间 {real_bad} 处（应为空格）")

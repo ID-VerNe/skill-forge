@@ -4,6 +4,7 @@
 
 - **ass 成品**：双语 ASS（英文行 + 中文行成对，同一时间戳）。track 取值固定 `英文/中文/注释`。
 - **srt 源**：权威英文源（纯英文）。srt 必须提供，否则 skill 拒绝运行。
+- **SRT 权威边界**：srt 是权威英文源，**只用于配对定位与英文原文展示，skill 不写 SRT**。例外是"原文拼写错误"类（第 6 类）——srt 与 ass 英文同源，srt 不能作权威，靠子 agent 判断。**ASR 听写错误**（如 `big closet`→`big chested`、`fifth toe`→`fat arse`）算英文源本身错，skill 默认只改中文轨，英文轨改不改是另一次决定（见 `manual-flow.md` ASR 节），SRT 源**始终不动**。
 - **调用**：
   ```
   /subtitle-polish 精校：<ass_dir_or_file> 其对应的srt是 <srt_dir_or_file>
@@ -48,15 +49,15 @@
 
 ## 配对算法（lib/ass_srt_pair.py）
 
-时间戳模糊匹配 + 原文文本双校验：
+时间戳模糊匹配 + 原文文本双校验，**同 track 多候选取时间戳最近的**（避免相邻 srt 块时间差 < 0.5s 时容差窗互相包进来产生 MULTI_SAME_LANG 误配）：
 
 1. srt 块的时间戳转 ass 格式（毫秒截 2 位）。
 2. 在 ass Dialogue 里找时间戳相差 ±0.5s 内的候选行。
 3. 对候选行做文本相似度（fuzzy ratio，归一化去标点/去说话人标记后），>85 才配对；纯音效块（srt 全是 `[xxx]`）按时间戳配即可。
 4. 时间戳不过但文本相似度 >85 → 仍配对并标 anomaly 提示时间偏移（应对 ass 人工调轴场景）。
 5. 任一校验不过 → 标 unpaired（SRT_HAS_ASS_NONE 或 ASS_HAS_SRT_NONE）。
-6. 一个 srt 块配到多行 → ONE_TO_MANY。
-7. 同一 block 内同语言多行 → MULTI_SAME_LANG。
+6. 一个 srt 块配到多行 → 同 track 取时间戳最近的（距离相同则全留，那是真重复行 → ONE_TO_MANY / MULTI_SAME_LANG）。
+7. 同一 block 内同语言多行（且时间戳距离不同）→ 已在 6 里去重，不会再误标 MULTI_SAME_LANG。真同时间戳重复行仍标 MULTI_SAME_LANG。
 8. 英文行可见文本含中文 → ASS_TRACK_OVERWRITE。
 9. 时间戳匹配但英文相似度 0.6~0.85 → TIME_TEXT_DRIFT（ass 可能调轴）。
 
@@ -160,6 +161,7 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
   - `skipped`=暂不处理
   - `deferred_to_global`=转给 global_replace 处理（如 Francis 统一替换，本条不执行，避免与 global_replace 重复改）
   - 非 accepted 都 `enabled=false` 不执行，但 status 记原因供追溯。
+- **action 取值**：`replace | delete | swap | insert | manual_edit`。前四种由 apply_fixes 写入，`manual_edit` 由 `--manual-log` 子命令补记（破例 Edit ASS 后用，见 `manual-flow.md` 兜底节）。verify_fixes 对 `manual_edit` 按 `new_text` fallback 定位核对可见文本。
 
 ## id 空间
 
@@ -173,6 +175,8 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 ```
 一行一条。不进 git。
 
+**action 取值**：`replace | delete | swap | insert | manual_edit | rollback | precheck_punct`。`manual_edit` 由 `apply_fixes.py --manual-log` 补记（破例 Edit ASS 兜底，见 `manual-flow.md` 兜底节）。
+
 **字段说明**：
 - `file`：归一化为绝对路径存储，rollback 比较时容忍相对路径/斜杠方向差异（filter_log 用 `_norm_file` 归一化两端比较）。
 - `old_text` / `new_text`：都记**实际落盘的 ASS 文本**（含合并后的 `{\be3}` 等标签），forward 与 rollback 对称、可重放。replace 的 new_text = `_replace_text` 后的 `e.text`（不是 fixes 里的裸 final_new）。
@@ -181,8 +185,10 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 ## rollback
 
 三种粒度，按 log.jsonl 反向应用 old_text：
-- `--rollback batch=<batch_id>`：回滚整个 batch
+- `--rollback batch=<batch_id>`：回滚整个 batch（含 `manual_edit` action 的条目）
 - `--rollback id=<srt_id>`：回滚单条（按 srt_id+file 定位）
 - `--rollback before=<ts>`：回滚某时间点之前所有操作
 
 所有操作都留记录，避免单条回滚破坏成对修改（可整 batch 回滚后再选择性重做）。
+
+**manual_edit 的 rollback**：破例 Edit 补记的 `manual_edit` 条目，rollback 时按 `old_text` + track + 时间戳定位回退（同 replace）。`manual_edit` 的 old_text 是 Edit 前的文本，rollback 把它写回去。

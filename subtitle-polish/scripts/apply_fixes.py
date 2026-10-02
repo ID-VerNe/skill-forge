@@ -54,6 +54,12 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str, fallback_t
         for e in subs.events:
             if abs(e.start / 1000.0 - target_start) <= 0.5:
                 candidates.append(e)
+        # 按时间戳距离排序后取最近的，不是第一个命中的。
+        # 相邻 srt 块时间差 < 0.5s 时（实测 361/362 隔 390ms），两块的容差窗
+        # 互相把对方 ass 行包进来；取第一个会让两条 fix 写到同一物理行（第二条
+        # 覆盖第一条），verify 报可见文本不符。取最近的能区分 361→981560 行、
+        # 362→981950 行。
+        candidates.sort(key=lambda e: abs(e.start / 1000.0 - target_start))
         # 按 track 筛
         for e in candidates:
             if style_to_track(e.style or "") == track:
@@ -121,6 +127,24 @@ def _swap_text(subs, srt_blocks_indexed, id_a: int, id_b: int, track: str):
     return ea, eb, old_a, old_b
 
 
+def run_manual_log(work_dir: str, batch_id: str, file: str, srt_id: int,
+                   track: str, old_text: str, new_text: str,
+                   category: str = "", reason: str = "") -> None:
+    """破例 Edit ASS 后用脚本补记 log.jsonl，避免手写 JSON 出错。
+
+    用法：apply_fixes.py --manual-log --batch-id <id> --file <ass> \\
+           --srt-id <id> --track 中文 --old "原文本" --new "新文本" \\
+           --category "语境错译" --reason "用户破例 Edit"
+    """
+    append_log(work_dir, batch_id, "manual_edit", file, srt_id, track,
+               old_text, new_text, category, reason)
+    print(f"[*] 补记 manual_edit: batch={batch_id} srt_id={srt_id} track={track}")
+    print(f"    file={file}")
+    print(f"    old={old_text!r}")
+    print(f"    new={new_text!r}")
+    print(f"    rollback: --rollback batch={batch_id}")
+
+
 def run_dry_run(fixes: list, work_dir: str) -> str:
     """生成 dry-run.md，返回路径。每条从真实 ASS 读现译。"""
     out_path = os.path.join(work_dir, "reports", "dry-run.md")
@@ -133,6 +157,8 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
 
     total = sum(len(v) for v in by_file.values())
     lines = ["# Dry-run 预览", "", f"共 {total} 条待执行（enabled=true）", ""]
+    # 撞车检测在每文件循环里做（subs 已加载，能拿到真实 event 身份）
+    collisions = []
     for file, fxs in by_file.items():
         lines.append(f"## {os.path.basename(file)}")
         lines.append("")
@@ -147,6 +173,29 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
             srt_path = _find_paired_srt(file)
         srt_blocks = parse_srt(srt_path) if srt_path and os.path.exists(srt_path) else []
         srt_index = _build_srt_index(srt_blocks)
+        # 撞车检测：本文件的 fix 里，有没有两条定位到同一个物理 event。
+        # _find_dialogue 已取最近时间戳，但 srt_id 距离 < 0.5s 时仍可能撞同
+        # 一行（实测培根链 361/362 隔 390ms）。提前报出来，accept 前拆开。
+        seen_events = {}  # event_identity -> [fx_id, ...]
+        for fx in fxs:
+            action = fx.get("action", "replace")
+            if action == "insert":
+                continue
+            track = fx.get("track", TRACK_ZH)
+            sid = fx["srt_id"]
+            e = _find_dialogue(subs, srt_index, sid, track)
+            if e is None:
+                continue
+            eid = id(e)
+            seen_events.setdefault(eid, []).append((fx.get("id") or fx.get("audit_id", ""), sid, track))
+        for eid, hits in seen_events.items():
+            if len(hits) > 1:
+                collisions.append({
+                    "file": file,
+                    "ids": [h[0] for h in hits],
+                    "srt_ids": [h[1] for h in hits],
+                    "track": hits[0][2],
+                })
         for fx in fxs:
             action = fx.get("action", "replace")
             track = fx.get("track", TRACK_ZH)
@@ -204,9 +253,27 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
                 lines.append(f"  - 当前行: `{cur_raw}`")
             lines.append("")
         lines.append("")
+    if collisions:
+        # 撞车预警放末尾，最显眼。报每对写到同一物理行的 fix。
+        lines.insert(3, "")
+        warn = ["## ⚠ 撞车预警（accept 前必须拆开）", ""]
+        warn.append("以下 fix 对定位到**同一物理 ASS 行**（srt_id 时间戳过近，"
+                    "_find_dialogue 取最近也分不开）。accept 会互相覆盖。"
+                    "拆法：要么合一条 fix（一条整句拆多行用 a/b/c 后缀），"
+                    "要么改用 insert 加注释轨，要么走 Edit 兜底（见 manual-flow.md 兜底节）。")
+        warn.append("")
+        for c in collisions:
+            ids = "/".join(c["ids"])
+            sids = "/".join(str(s) for s in c["srt_ids"])
+            warn.append(f"- 文件 `{os.path.basename(c['file'])}` track={c['track']}: "
+                        f"fix `{ids}` (srt_id {sids}) 写到同一行")
+        warn.append("")
+        lines = lines[:3] + warn + lines[3:]
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"[*] dry-run 写入 {out_path}")
+    if collisions:
+        print(f"[!] 撞车 {len(collisions)} 组：{[c['ids'] for c in collisions]}")
     return out_path
 
 
@@ -384,9 +451,27 @@ def main():
     ap.add_argument("--batch-id", default=None)
     ap.add_argument("--rollback", default=None,
                     help="batch=<id> | id=<srt_id> | before=<ts>")
-    ap.add_argument("--file", default=None, help="rollback id= 时限定文件")
+    ap.add_argument("--file", default=None, help="rollback id= 时限定文件；--manual-log 时必填")
     ap.add_argument("--work-dir", default=WORK_DIR)
+    # 破例 Edit 兜底：手动改了 ASS 后用脚本补记 log.jsonl
+    ap.add_argument("--manual-log", action="store_true",
+                    help="破例 Edit 后补记一条 manual_edit 日志（避免手写 JSON）")
+    ap.add_argument("--srt-id", type=int, default=None, help="--manual-log 用")
+    ap.add_argument("--track", default="中文", help="--manual-log 用")
+    ap.add_argument("--old", default="", help="--manual-log 用：原文本")
+    ap.add_argument("--new", default="", help="--manual-log 用：新文本")
+    ap.add_argument("--category", default="", help="--manual-log 用")
+    ap.add_argument("--reason", default="", help="--manual-log 用")
     args = ap.parse_args()
+
+    if args.manual_log:
+        if not args.file or args.srt_id is None:
+            ap.error("--manual-log 需要 --file, --srt-id, --old, --new（--batch-id 缺省自动生成）")
+        wd = resolve_work_dir(args.work_dir)
+        bid = args.batch_id or make_batch_id()
+        run_manual_log(wd, bid, args.file, args.srt_id, args.track,
+                       args.old, args.new, args.category, args.reason)
+        return
 
     if args.rollback:
         wd = resolve_work_dir(args.work_dir)

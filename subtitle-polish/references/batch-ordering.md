@@ -53,4 +53,6 @@ apply_fixes --rollback 读 log.jsonl 反向应用 old_text，支持 batch/id/bef
 - `.bak` 文件手动还原（apply_fixes 执行时备份原文件），或
 - 若 global_replace/precheck 的 log.jsonl 条目能被 apply_fixes --rollback 认（按 action 字段），则用 apply_fixes --rollback batch=<它们的 batch_id>；需先核 apply_fixes --rollback 是否过滤 action。
 
+apply_fixes --rollback 不过滤 action 字段——`replace`/`delete`/`swap`/`insert`/`manual_edit`/`precheck_punct` 都能回滚（`manual_edit` 按 old_text 写回，`delete` 回滚时打印"无法自动重建"提示人工补，`insert` 回滚删该行）。global_replace 若用了与 apply_fixes 一致的 action 字段记 log，也能用同一 rollback。
+
 未来若给 global_replace/precheck 加 --rollback，复用 lib/log.py 的 read_log + filter_log 反向应用 old_text 即可。
