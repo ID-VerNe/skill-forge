@@ -1,10 +1,17 @@
 #!/bin/bash
-# commit.sh — Commit with identity enforcement
+# commit.sh — Commit with identity enforcement.
 # Usage: bash commit.sh <message_file>
 # Reads commit message from file (avoids shell escaping issues),
-# sets identity, checks for Co-Authored-By, then commits.
+# loads identity from identity.env via set-identity.sh,
+# rejects Co-Authored-By trailers, then commits.
+#
+# Exits non-zero on ANY failure (missing file, forbidden trailer,
+# failed git commit, missing identity) — the caller can rely on
+# the exit code to decide what to do next.
 
-set -e
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ $# -lt 1 ]; then
   echo "Usage: bash commit.sh <message_file>" >&2
@@ -17,17 +24,15 @@ if [ ! -f "$MSG_FILE" ]; then
   exit 1
 fi
 
-# Set identity
-git config user.name "ID-VerNe"
-git config user.email "yuu_seeing@foxmail.com"
-export GIT_COMMITTER_NAME="ID-VerNe"
-export GIT_COMMITTER_EMAIL="yuu_seeing@foxmail.com"
-
-# Check for Co-Authored-By in the message file
+# Reject Co-Authored-By (before setting identity — fail fast)
 if grep -qi "Co-Authored-By" "$MSG_FILE"; then
   echo "[x] Commit message contains Co-Authored-By line! Remove it first." >&2
   exit 1
 fi
+
+# Load identity (sources identity.env, sets git config, exports env vars)
+# shellcheck disable=SC1090
+source "$SCRIPT_DIR/set-identity.sh"
 
 # Commit using -F to read from file (no shell escaping issues)
 git commit -F "$MSG_FILE"

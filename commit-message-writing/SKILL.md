@@ -32,23 +32,34 @@ git status
 - 查看哪些文件有修改未暂存
 
 ### 4. 身份信息强制覆盖
-每次 commit 前，必须执行身份设置：
+
+身份配置集中在 `scripts/identity.env`（KEY=VAL 单点定义，改身份只改这一处）。
+
+**正常流程**：无需手动设置身份。`commit.sh` / `commit.cmd` 会内部加载 `identity.env` 并注入 git。
+
+如需在提交前手动加载（例如想在交互式 `git commit` 里用）：
 
 ```bash
-# Bash
+# Bash — 必须 source，不能用 bash 执行（export 的变量只在 source 的当前 shell 生效）
 source scripts/set-identity.sh
 
-# Windows CMD
-scripts\set-identity.cmd
+# Windows CMD — 必须 call，不能直接执行
+call scripts\set-identity.cmd
 ```
 
-或手动执行：
+或手动执行（一般不建议，容易漏一处）：
 ```bash
 git config user.name "ID-VerNe"
 git config user.email "yuu_seeing@foxmail.com"
 export GIT_COMMITTER_NAME="ID-VerNe"
 export GIT_COMMITTER_EMAIL="yuu_seeing@foxmail.com"
 ```
+
+**⚠️ Windows CMD 会话变量陷阱：** `set GIT_COMMITTER_NAME=...` 在 CMD 里只对**当前 cmd.exe 进程**生效。如果你：
+- 开两个 cmd.exe 窗口，在 A 里 `call set-identity.cmd`，在 B 里 `git commit` → B 里看不到身份
+- 用 `start cmd.exe` 或双击打开的 cmd.exe → 每个新窗口都是全新进程，变量不共享
+
+**正确做法**：同一个 cmd.exe 会话内先 `call set-identity.cmd` 再 `call commit.cmd`；或者依赖 `git config` 持久化（`set-identity.cmd` 已经把身份写进 git config，跨会话也能用）。
 
 ### 5. 禁止 Co-Authored-By
 Commit message 中**禁止**出现任何 `Co-Authored-By:` 行。如果自动生成的 message 中包含此类内容，必须手动移除。
@@ -193,15 +204,20 @@ git push
 
 ## 辅助脚本
 
-`scripts/` 目录包含 3 组脚本（每组分 Windows CMD 和 Bash 两个版本），方便自动化操作：
+`scripts/` 目录包含 3 组脚本（每组分 Windows CMD 和 Bash 两个版本），方便自动化操作。身份集中定义在 `identity.env`：
 
-| 脚本 | 功能 | 使用方式 |
+| 文件 | 功能 | 使用方式 |
 |------|------|---------|
-| `set-identity.sh` / `.cmd` | 设置 git 身份 (ID-VerNe) + 环境变量 | `source scripts/set-identity.sh` / `scripts\set-identity.cmd` |
-| `stage.sh` / `.cmd` | 逐个 add 文件（禁止批量） | `bash scripts/stage.sh <file1> <file2>` / `scripts\stage.cmd <file1>` |
-| `commit.sh` / `.cmd` | 从文件读取 message，检查 Co-Authored-By，自动设身份后 commit | `bash scripts/commit.sh <msg_file>` / `scripts\commit.cmd <msg_file>` |
+| `identity.env` | 身份单一来源（KEY=VAL，改身份只改这里） | 无需手动调用，被其他脚本自动加载 |
+| `set-identity.sh` / `.cmd` | 加载 identity.env → 写 git config + 导出环境变量 | `source scripts/set-identity.sh` / `call scripts\set-identity.cmd` |
+| `stage.sh` / `.cmd` | 逐个 add 文件（**拒绝目录**，防误批量） | `bash scripts/stage.sh <file1> <file2>` / `scripts\stage.cmd <file1>` |
+| `commit.sh` / `.cmd` | 从文件读 message → 校验 Co-Authored-By → 加载身份 → commit（失败即退出） | `bash scripts/commit.sh <msg_file>` / `scripts\commit.cmd <msg_file>` |
 
-**注意：** `set-identity.sh` 需要用 `source` 执行（而非 `bash`），因为需要将环境变量导出到当前 shell 进程。
+**注意：**
+- `set-identity.sh` 必须用 `source` 执行（非 `bash`），否则 export 的变量在子进程退出后消失。
+- `set-identity.cmd` 必须用 `call` 执行（非直接 `scripts\set-identity.cmd`），否则不会回到调用者。
+- Windows CMD 里 `set GIT_*` 只对当前 cmd.exe 进程生效——不同窗口/不同进程不共享（详见"身份信息强制覆盖"章节的会话变量陷阱说明）。
+- `stage.sh` / `stage.cmd` 遇到目录会直接报错退出，防止 `git add <dir>` 递归静默批量暂存。
 
 ## 常见差错
 
