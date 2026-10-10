@@ -129,6 +129,87 @@ echo '研究' | node -e "process.stdin.on('data', d => console.log(d.toString().
 
 ---
 
+## OpenCode + Windows PowerShell 适配（2026-10 补充）
+
+### 与 Claude Code 方案的差异
+
+| 项 | Claude Code | OpenCode（Windows） |
+|---|---|---|
+| 环境变量注入 | `settings.json` 的 `env` 块，spawn 子进程时自动带上 | **无等价机制**。opencode.json 只有 `shell` / `model` / `agents` 等字段，没有 `env` |
+| shell 工具 | 通常是 Git Bash | Windows 默认 `pwsh`，非交互模式：`BASH_ENV`、`.bashrc`、`$PROFILE` **都不加载** |
+| 编码症状 | 中文关键词匹配失败 | 其实是三个不同的坑叠在一起（见下） |
+
+### 实测会踩的三个坑（互相独立，别混淆）
+
+**坑 1：`git status` 把中文路径显示成八进制转义**
+
+```
+ D "legacy_flask/\347\234\213\345\233\276.cmd"
+```
+
+`\347\234\213` 是 `截` 的 UTF-8 字节。这**不是乱码**，是 git 的 `core.quotepath` 默认 `true`，故意转义非 ASCII 字符。修复：
+
+```powershell
+git config --global core.quotepath false
+```
+
+**坑 2：pwsh 输出编码是 GBK（CP936）**
+
+pwsh 的 `[Console]::OutputEncoding` 跟随控制台代码页，中文 Windows 默认为 936，于是所有非 ASCII 输出（含 PowerShell 自己的本地化错误信息）都变成 GBK 字节， Terminal 按 UTF-8 解码后显示为 `????`。每条命令加前缀：
+
+```powershell
+chcp.com 65001 | Out-Null
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+```
+
+**坑 3：pwsh 不是 bash，bash 语法直接报错**
+
+`ls -la .plan .glue 2>$null | head -40` 在 pwsh 下会报"无法将 head 识别为 cmdlet"（且报错信息本身还是 GBK，乱码套乱码）。`ls`/`-la`/`2>$null` 的语义也和 bash 不同。PowerShell 等价写法：
+
+```powershell
+ls -la .plan .glue 2>$null | head -40
+# →
+Get-ChildItem -Force -Path .plan, .glue -ErrorAction SilentlyContinue |
+  Select-Object -First 40
+```
+
+### OpenCode 下的持久化修复（替代原方案的文件 1/2/3）
+
+Claude 三件套（settings.json env / .claude_init.sh / .bashrc）在 OpenCode 下用不了，改为：
+
+```powershell
+# 1) locale 环境变量（用户级，对所有新进程生效）
+setx LANG "en_US.UTF-8"
+setx LC_ALL "en_US.UTF-8"
+setx PYTHONIOENCODING "utf-8"
+
+# 2) 新控制台默认 UTF-8 代码页：修复 pwsh 输出 GBK 的根
+New-Item -Path 'HKCU:\Console' -Force | Out-Null
+Set-ItemProperty -Path 'HKCU:\Console' -Name 'CodePage' -Value 65001 -Type DWord
+
+# 3) git 中文路径直接显示
+git config --global core.quotepath false
+```
+
+**关键**：OpenCode 是客户端–后台 service 架构，shell 工具由**后台 service** 派生。`setx` 只影响之后启动的进程，所以必须重启 service 才生效：
+
+```
+opencode service restart
+```
+
+（或完全退出重开 OpenCode。对已经启动的会话，上述注册表项对它已持有的控制台无效，靠每条命令的前缀兜底。）
+
+### 验证（2026-10-10 于本机实测通过）
+
+```powershell
+"测试-中文-路径"        # 中文回写正常
+git log --oneline -5    # 中文提交信息正常，无乱码
+git status --short      # 中文文件名直接显示，无 \347 转义
+```
+
+---
+
 ## 原理：为什么这三个变量就够了
 
 Windows 上的编码问题链路：
