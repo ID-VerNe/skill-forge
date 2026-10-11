@@ -155,13 +155,15 @@ git config --global core.quotepath false
 
 **坑 2：pwsh 输出编码是 GBK（CP936）**
 
-pwsh 的 `[Console]::OutputEncoding` 跟随控制台代码页，中文 Windows 默认为 936，于是所有非 ASCII 输出（含 PowerShell 自己的本地化错误信息）都变成 GBK 字节， Terminal 按 UTF-8 解码后显示为 `????`。每条命令加前缀：
+pwsh 的 `[Console]::OutputEncoding` 跟随控制台代码页，中文 Windows 默认为 936，于是所有非 ASCII 输出（含 PowerShell 自己的本地化错误信息）都变成 GBK 字节， Terminal 按 UTF-8 解码后显示为 `????`。留在 pwsh 的话每条命令加前缀：
 
 ```powershell
 chcp.com 65001 | Out-Null
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 ```
+
+（注意：只有显式 setter 真正起效，`chcp` 在无控制台时是 no-op。若按下方最终方案换 Git Bash，此坑自动消失。）
 
 **坑 3：pwsh 不是 bash，bash 语法直接报错**
 
@@ -176,36 +178,47 @@ Get-ChildItem -Force -Path .plan, .glue -ErrorAction SilentlyContinue |
 
 ### OpenCode 下的持久化修复（替代原方案的文件 1/2/3）
 
-Claude 三件套（settings.json env / .claude_init.sh / .bashrc）在 OpenCode 下用不了，改为：
+**最终方案（2026-10-11 实测生效）：把 OpenCode 的 shell 换成 Git Bash，原指南的 bash 世界整套复用。**
 
-```powershell
-# 1) locale 环境变量（用户级，对所有新进程生效）
-setx LANG "en_US.UTF-8"
-setx LC_ALL "en_US.UTF-8"
-setx PYTHONIOENCODING "utf-8"
+`~/.config/opencode/opencode.json`（全局配置）：
 
-# 2) 新控制台默认 UTF-8 代码页：修复 pwsh 输出 GBK 的根
-New-Item -Path 'HKCU:\Console' -Force | Out-Null
-Set-ItemProperty -Path 'HKCU:\Console' -Name 'CodePage' -Value 65001 -Type DWord
-
-# 3) git 中文路径直接显示
-git config --global core.quotepath false
+```jsonc
+{
+  "shell": "C:\\Program Files\\Git\\bin\\bash.exe"
+}
 ```
 
-**关键**：OpenCode 是客户端–后台 service 架构，shell 工具由**后台 service** 派生。`setx` 只影响之后启动的进程，所以必须重启 service 才生效：
+本机 opencode 二进制内的 spawn 逻辑（实测字符串）：
 
+```js
+if (F2(e)==="cmd") return ["/c", r];
+if (rG(e)) return ["-NoLogo","-NoProfile","-NonInteractive","-Command",r];
+return ["-c", r];
 ```
-opencode service restart
-```
 
-（或完全退出重开 OpenCode。对已经启动的会话，上述注册表项对它已持有的控制台无效，靠每条命令的前缀兜底。）
+`bash.exe` 落入 `-c` 分支，命令以 argv 数组原样传入 Git Bash，**无引号损耗**；服务进程继承 `setx` 写入的环境变量，msys 工具链按 locale 输出 UTF-8。实测 `echo 测试`、`ls -la | head`、`git log/status` 中文全链路正常，无需任何命令前缀。改完需 `opencode service restart` 或退出重开（本次实测配置热加载即时生效，重启最稳）。
 
-### 验证（2026-10-10 于本机实测通过）
+配套仍然需要：
 
-```powershell
-"测试-中文-路径"        # 中文回写正常
-git log --oneline -5    # 中文提交信息正常，无乱码
-git status --short      # 中文文件名直接显示，无 \347 转义
+1. `setx LANG / LC_ALL / PYTHONIOENCODING`（用户级，见上）
+2. `git config --global core.quotepath false`（坑 1，与 shell 无关）
+
+#### 试过但没用的路（负面结论，别再踩）
+
+| 方案 | 结果 | 原因 |
+|---|---|---|
+| `HKCU\Console\CodePage=65001` | 无效 | harness 的 pwsh 没挂控制台（stdout 是管道），.NET 回退系统 ANSI 代码页 936；`chcp.com 65001` 也是 no-op（实测 `OutputEncoding` 不变） |
+| `$PROFILE` 启动注入编码 | 无效 | spawn 参数固定带 `-NoProfile`，profile 根本不加载（marker 文件实测未生成） |
+| cmd 包装器 `%*` 转发 | 失败 | batch 里 `SHIFT` 不影响 `%*`，`/c` 前缀剥不掉 |
+| pwsh 每命令编码前缀 | 有效但每次都要带 | `chcp 65001` + `[Console]::OutputEncoding=UTF8` + `$OutputEncoding=UTF8`；仅在必须留在 pwsh 时使用 |
+
+### 验证（2026-10-11 换 Git Bash 后实测通过，bash 裸跑无前缀）
+
+```bash
+echo "测试-中文"          # 直接输出正常，无需任何编码前缀
+ls -la .plan | head -3    # bash 语法原生可用（配坑 3 一并解决）
+git log --oneline -2      # 中文提交信息正常
+git status --short        # 中文文件名直接显示（配坑 1）
 ```
 
 ---
