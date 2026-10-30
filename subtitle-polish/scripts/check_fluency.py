@@ -6,12 +6,17 @@ TranslationQualityChecker（`core/quality_checker.py`），但适配 skill 的
 切片格式（一 block 一行 `<srt_id> | <ass_time> | <英文> | <中文> | <注释>`）。
 
 检查项：
-  - 书面语黑名单：进行/实施/开展/予以/给予/关于/针对/基于/鉴于/
-                   显著/充分/有效/积极/此外/因此/所以/然而
+  - 书面语残留：进行/实施/开展/予以/给予/关于/针对/基于/鉴于/
+               显著/充分/有效/积极/此外/因此/所以/然而
+                **判据不是「中文出现该词」，而是「中文出现该词，且英文没有
+                对应来源」**。比如 `So` → 「所以」是忠实直译（话语标记），
+                不算翻译腔；英文是 `Well` 却译成「然而」才报。详见 FORMAL_WORDS
+                注释与 issue #7。
   - 机翻特征正则：的的 / 了了 / 重复标点
-  - 长度异常比：译文 < 原文×0.4 或 > ×1.5
+  - 长度异常比：译文 < 原文×0.4 或 > ×1.5（默认关，需 --len-ratio）
 
-LLM（gemini-3.1 / glm-5.2）对书面语召回仅 6-11%，本脚本召回 100%。
+LLM（gemini-3.1 / glm-5.2）对书面语召回仅 6-11%，本脚本配合英文字段来源
+对照后召回与精度都可用（S06E04 实测 63 条 → 2 条真阳性）。
 软语境/俚语/委婉语抓不到，留给 LLM 两轨。
 
 可独立单跑，也被 pre_audit.py 调用。
@@ -30,12 +35,35 @@ from pathlib import Path
 from typing import List, Dict
 
 # 书面语黑名单（出现在口语对白里 = 翻译腔）
-FORMAL_WORDS = [
-    "进行", "实施", "开展", "予以", "给予",
-    "关于", "针对", "基于", "鉴于",
-    "显著", "充分", "有效", "积极",
-    "此外", "因此", "所以", "然而",
-]
+#
+# issue #7：纯子串匹配会把「忠实直译」误判成翻译腔。实测 S06E04 一集
+# 63 条「书面语残留」命中里 61 条是假阳性——53 条「所以」全部对应英文的
+# `So`，是话语标记的忠实翻译，不是翻译腔。精度 3%，规则失去可用性。
+#
+# 修法：每个词配一份「英文对应来源」正则。只有中文出现该词、而英文**没有**
+# 任何对应来源时，才算「英文没这个词，中文却冒出来」= 译者加戏的书面语。
+#
+# 值为 None 表示「无英文字面对应物」，纯中文语体问题（如「进行」是空动词，
+# 英文不会有对应词），这类直接报，但标 confidence=medium 提示需人看语境。
+FORMAL_WORDS = {
+    "进行": None,
+    "实施": None,
+    "开展": None,
+    "予以": None,
+    "给予": None,
+    "关于": r"\b(about|regarding|concerning|on|of|for)\b",
+    "针对": r"\b(for|against|at|to|targeting)\b",
+    "基于": r"\b(based on|on|from)\b",
+    "鉴于": r"\b(given|considering|seeing)\b",
+    "显著": r"\b(significant|significantly|notable|noticeably|markedly)\b",
+    "充分": r"\b(fully|enough|plenty|sufficient|adequate|well)\b",
+    "有效": r"\b(effective|effectively|works|work|efficient)\b",
+    "积极": r"\b(actively|active|positive|eager)\b",
+    "此外": r"\b(also|too|plus|besides|additionally|as well)\b",
+    "因此": r"\b(so|therefore|thus|hence|then)\b",
+    "所以": r"\b(so|therefore|thus|hence)\b",
+    "然而": r"\b(but|however|yet|although|though|while|whereas)\b",
+}
 
 # 机翻特征正则
 MACHINE_PATTERNS = [
@@ -69,14 +97,20 @@ def check_line(en: str, zh: str, len_ratio: bool = False) -> List[Dict]:
     每个 hit: {"axis": "达", "rule": ..., "detail": ..., "suggestion": ...}
     """
     hits = []
-    # 1. 书面语黑名单
-    found_formal = [w for w in FORMAL_WORDS if w in zh]
-    if found_formal:
+    # 1. 书面语黑名单（issue #7：先查英文有没有对应来源，避免把忠实直译误判成翻译腔）
+    for word, en_pat in FORMAL_WORDS.items():
+        if word not in zh:
+            continue
+        if en_pat and re.search(en_pat, en, re.I):
+            continue  # 英文确有对应词 → 忠实直译，不是翻译腔
+        reason = (f"英文无对应来源（查 {en_pat}）" if en_pat
+                  else "无英文字面对应物，纯中文语体问题")
         hits.append({
             "axis": "达",
             "rule": "书面语残留",
-            "detail": f"命中：{', '.join(found_formal)}",
+            "detail": f"命中：{word}；{reason}",
             "suggestion": "改为口语化表达",
+            "confidence": "medium" if en_pat is None else "high",
         })
     # 2. 机翻特征
     for pat, name in MACHINE_PATTERNS:

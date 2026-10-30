@@ -43,7 +43,7 @@ python <skill>/scripts/precheck_punct.py <ass_file_or_dir> --out .subtitle-polis
 ```bash
 python <skill>/scripts/pre_audit.py <slice.txt> --context .subtitle-polish/context.md --n 5 --out .subtitle-polish/reports
 ```
-- 轨 1 gemini-3.1（5 passes intersection）：快稳，信达雅强。轨 2 glm-5.2（5 passes intersection）：慢但抓语义反转/语境错译。轨 3 check_fluency（规则）：书面语/机翻特征召回 100%。
+- 轨 1 gemini-3.1（5 passes intersection）：快稳，信达雅强。轨 2 glm-5.2（5 passes intersection）：慢但抓语义反转/语境错译。轨 3 check_fluency（规则）：书面语残留对照英文字段来源 / 机翻特征（issue #7：`So`→「所以」这类忠实直译不报）。
 - 两 LLM 正交（重叠 <15%），并集才能覆盖全。模型可用性 ping 探测，缺 `GLM_API_KEY` 的轨跳过不崩。
 - **输出只是线索，不进 fixes.json / audit-report.md**。专名类标 `needs_web_verify`（GLM 专名建议 100% 编造），字符损坏类丢弃。Claude 子 agent 收到总览须独立判断，不得盲信 LLM 建议。
 - **用法/总览字段/安全闸/模型强弱图/带歪风险见 `pre-audit.md`**。
