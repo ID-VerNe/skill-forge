@@ -82,6 +82,13 @@ python <skill>/scripts/pre_audit.py <slice.txt> --context .subtitle-polish/conte
   ```
 - id 空间：统一 `<shortname>#<srt_id>`（如 `e02#152`），单文件也用此格式，不用全局 `1..N`。详见 `pipeline-spec.md`。
 - **第 7 类（低严重度）必须单独写** `.subtitle-polish/reports/optional-fixes.md`，**同时**生成 `.subtitle-polish/optional-fixes.json`（同 fixes.json schema，机器读）。不能只出 .md 不出 .json，也不能塞进 audit-report.md 的附注里。audit-report.md 的"未报项说明"只放核验后排除的疑似项（经字节核验 Unicode 正确的疑似错字、经查证确认合法的 ASR 用法），不放第 7 类润色项。详见 `pipeline-spec.md`。
+- **第 7 类每条必须在报告里标「改动类型」（issue #4）**，取值：
+  - `虚词删除` — 动的是正是/其实/果然/竟然这类虚词或标点/语序，删了语义不变，可顺手批
+  - `义项重选` — **动的是实词的意思，这时它不是第 7 类，应升级为第 4 类语境错译进主修**，并附英文原句与上下文
+  - `程度微调` — 程度副词方向没反但分量偏
+
+  判据：**这个词是虚词还是实词？删掉之后，原来那个实词的意思还对吗？** 实词删不掉 = 义项问题 = 译错了 = 第 4 类。不确定时默认按第 4 类处理。详见 `fluency-rubric.md`「第 7 类 vs 第 4 类的边界」。
+  反例（S06E04 第 6 轮）：「这正是菲尔的强项」→「这就是菲尔的地盘」，只看了虚词「正是」，没判 `bag` 的义项（英式 = 拿手领域），把对的改成错的。
 
 ## 6. 人确认门1
 
