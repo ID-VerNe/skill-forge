@@ -74,6 +74,26 @@ python <skill>/scripts/apply_fixes.py --rollback batch=<ts>_manual  # 回滚
 ```
 首选仍是脚本,Edit 是 last resort。详见 `references/manual-flow.md` 兜底节。
 
+## 结案条件(两模式共用)
+
+```bash
+python <skill>/scripts/verify_fixes.py --batch-id <ts>   # 盘面 == log
+python <skill>/scripts/cross_check.py   --batch-id <ts>  # 中英对照复核
+```
+
+**`verify_fixes` 0 失败不等于成品正确。** 它比的是「盘面 == log 里的 new_text」,
+是恒等式:只要字写进去就必然通过,与译文对不对无关。实测一轮 99 条修复 verify 报
+0 失败,其中 15 条把原本正确的译文换成了邻行/同场景另一句的译文(skill-forge issue #1)。
+
+所以结案条件是 **两者都满足**:
+
+- `verify_fixes` 0 失败 —— 证明「改了的东西确实写进去了」;
+- `cross_check` 中英对照逐块读过 —— 证明「写进去的是这一句该有的译文」。
+
+`cross_check` 会输出撞车预警(新译文 ≈ ±3 邻块现有中文)。误报率实测为 0,
+**每条预警都要人看**;但它召回只有 4/15(其余是「同场景换句」「缩译掩盖漏译」,
+字符串判据抓不到),所以预警表干净**不能**当作全文正确。详见 `references/auto-flow.md` 11b 节。
+
 ## 文件结构
 
 ```
@@ -90,8 +110,21 @@ python <skill>/scripts/apply_fixes.py --rollback batch=<ts>_manual  # 回滚
 │   ├── pre-audit.md            # 三轨预审用法
 │   └── prompt-injection.md     # prompt 构造约束
 ├── prompts/                    # audit/verify/synthesize 模板
-└── scripts/                    # extract_slice.py / apply_fixes.py / global_replace.py + lib/
+└── scripts/                    # extract_slice / apply_fixes / global_replace
+                                #   / verify_fixes / cross_check / precheck_punct / pre_audit + lib/
 ```
+
+脚本速查:
+
+| 脚本 | 用途 | 模式 |
+|---|---|---|
+| `extract_slice.py` | ASS+SRT 配对切片,标异常 | 自动 |
+| `precheck_punct.py` | 中文行标点归一(默认 dry-run) | 自动 |
+| `pre_audit.py` | 三轨预审(需显式开启) | 自动 |
+| `apply_fixes.py` | 执行 fixes.json / 回滚 / `--manual-log` | 两模式 |
+| `global_replace.py` | 跨文件纯文本替换 | 两模式 |
+| `verify_fixes.py` | 核验 log 已落盘 | 两模式 |
+| `cross_check.py` | 中英对照复核 + 撞车预警 | 两模式 |
 
 项目产物(不进 skill):
 ```

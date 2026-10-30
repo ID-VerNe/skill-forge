@@ -131,8 +131,12 @@ python <skill>/scripts/apply_fixes.py .subtitle-polish/fixes.json --accept --bat
 
 ## 11. 执行后验证
 
+结案条件是**两条都满足**:`verify_fixes` 0 失败 **AND** `cross_check` 中英对照复核通过。
+前者证明「改的东西写进去了」,后者证明「写进去的是这一句该有的译文」。只跑前者不算验完。
+
 ```bash
 python <skill>/scripts/verify_fixes.py --batch-id <ts>
+python <skill>/scripts/cross_check.py   --batch-id <ts>
 ```
 
 - 读 log.jsonl，按 srt_id + track 用 ass_srt_pair 重读 ASS，逐条核对每条操作记录的 new_text 是否真的落盘（delete 验该行已不存在）。输出带 ass_time 方便人对照视频。
