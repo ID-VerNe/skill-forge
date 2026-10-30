@@ -27,7 +27,8 @@ from lib.log import read_log, filter_log
 from lib.paths import resolve_work_dir, report_path
 from lib.tags import extract_leading_tags
 from lib.ass_srt_pair import clean_ass_text
-from apply_fixes import _find_dialogue, _build_srt_index, _find_paired_srt
+from apply_fixes import (_find_dialogue, _build_srt_index, _find_paired_srt,
+                         _format_timespec, _parse_timespec)
 
 # 邻块撞车默认参数（实测校准：坏条 4/15 命中，好条 0/84 误报）
 NEIGHBOR_WINDOW = 3
@@ -193,6 +194,21 @@ def verify_entry(entry, subs, srt_index):
         if act_body == exp_body:
             return True, e.text, "可见文本一致（manual_edit）"
         return False, e.text, f"可见文本不符：期望 '{exp_body}' 实际 '{act_body}'"
+
+    if action == "retime":
+        # retime 日志的 old_text/new_text 存的是时间串（见 issue #3），
+        # 不核对文本，只核对时间轴是否与 new_text 一致。
+        e = _find_dialogue(subs, srt_index, entry["srt_id"], track)
+        if e is None:
+            return False, "", "定位失败（retime 后该行找不到）"
+        try:
+            want_s, want_e = _parse_timespec(expected_new)
+        except ValueError as ex:
+            return False, _format_timespec(e.start / 1000.0, e.end / 1000.0), f"日志时间串非法：{ex}"
+        act = _format_timespec(e.start / 1000.0, e.end / 1000.0)
+        if _format_timespec(want_s, want_e) == act:
+            return True, act, "时间轴一致（retime）"
+        return False, act, f"时间轴不符：期望 {_format_timespec(want_s, want_e)} 实际 {act}"
 
     if action == "rollback" and expected_new == "":
         # rollback 到 delete 前态：行应已删除（log 的 new_text 空）

@@ -36,8 +36,9 @@ python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slice
   - 多行命中（片段太短，如"Thank you"对到多行）→ 用 AskUserQuestion 让用户消歧（附上每条命中的 ass_time + 现译），不要猜、不要默认取第一个。
   - **AskUserQuestion 消歧时不要重复已确认的取舍**——若用户已在上一轮 AskUserQuestion 里选了带权衡说明的选项（如"接受口型错位"），下一轮不要就同一问题再问。只问新出现的歧义。
   - **AskUserQuestion 选项要命中用户意图**——若用户拒绝了所有选项要求澄清（实测第 514 行用户拒绝 3 选项），不要重提同类选项，**直接用开放式问题问"你想要什么结果"**。提的选项都miss说明主 agent 对用户意图建模错了，再提同类还是 miss。
-- **改什么**：用户说"把这句中文改成 XXX"、"删掉这行"、"这两行的中文换一下"——映射到 `action ∈ replace | delete | swap | insert`。
+- **改什么**：用户说"把这句中文改成 XXX"、"删掉这行"、"这两行的中文换一下"、"把这两句拼起来"——映射到 `action ∈ replace | delete | swap | insert | retime`。
   - `replace` 改某行文本；`delete` 删整行；`swap` 两行文本互换（不换时间戳）。
+  - `retime` 改某行 `start`/`end`，`new_start`/`new_end` 用**秒**（与 srt 块一致）。**合并碎片行必须带上它**：`replace` 只改文本不动时间轴，合并后整句仍只占前半截的显示时间。
   - `insert` 新增一行，典型场景是给某个 srt 时段加注释轨（`track=注释`）。`final_new` 写注释正文（纯文本不带 ASS 标签，同 replace 规则），挂在 `srt_id` 对应时段。样式由脚本按 track 从 ASS `[V4+ Styles]` 自动解析（找 `style_to_track(name)==track` 的样式名）；**ASS 无对应样式则脚本报错停下，不自动建样式**——用户需先在 ASS 里定义好 `注释` 等样式。`id`/`audit_id` 空间同 replace（`<shortname>#<srt_id>`）。
 - **批量**：用户一次给多条指令 → 全部进同一个 fixes.json。
 

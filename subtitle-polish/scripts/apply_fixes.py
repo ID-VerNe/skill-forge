@@ -138,6 +138,41 @@ def _resolve_style_for_track(subs, track: str) -> str:
 from lib.tags import extract_leading_tags, merge_tags as _merge_tags
 
 
+def _format_timespec(start_s: float, end_s: float) -> str:
+    """时间串格式：'1422.12-1425.43'（秒，两位小数）。retime 日志用。"""
+    return f"{start_s:.2f}-{end_s:.2f}"
+
+
+def _parse_timespec(spec: str):
+    """解析 '1422.12-1425.43' → (1422.12, 1425.43)。失败抛 ValueError。"""
+    txt = (spec or "").strip()
+    if not txt or "-" not in txt:
+        raise ValueError(f"时间串格式应为 'start-end'，收到 {spec!r}")
+    a, b = txt.split("-", 1)
+    try:
+        return float(a), float(b)
+    except ValueError:
+        raise ValueError(f"时间串格式应为 'start-end'，收到 {spec!r}")
+
+
+def _retime_event(e, new_start: float, new_end: float):
+    """把 event 的 start/end 改成新时段（秒）。返回 (old_start, old_end) 秒。
+
+    new_start / new_end 为 None 时沿用原值。
+    pysubs2 内部用毫秒，秒→毫秒在写盘时转换（已知坑）。
+    """
+    old_start, old_end = e.start / 1000.0, e.end / 1000.0
+    if new_start is not None:
+        e.start = int(round(new_start * 1000))
+    if new_end is not None:
+        e.end = int(round(new_end * 1000))
+    if e.end <= e.start:
+        # 回退到原值再报错，避免把非法时段留在文件里
+        e.start, e.end = int(round(old_start * 1000)), int(round(old_end * 1000))
+        raise ValueError(f"新时段非法：end({new_end}) 必须大于 start({new_start})")
+    return old_start, old_end
+
+
 def _replace_text(e, new_text: str):
     """替换 Event 的文本字段，自动检测并还原原行的特效标签。
 
@@ -306,7 +341,8 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
         seen_events = {}  # event_identity -> [fx_id, ...]
         for fx in fxs:
             action = fx.get("action", "replace")
-            if action == "insert":
+            # retime 按设计就要跟 replace/delete 落同一行，不是歧义（issue #3）
+            if action in ("insert", "retime"):
                 continue
             track = fx.get("track", TRACK_ZH)
             sid = fx["srt_id"]
@@ -388,6 +424,32 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
                 lines.append("- 现译 → 新译（均含实际标签）:")
                 lines.append(f"  - 现: `{cur_raw}`")
                 lines.append(f"  - 新: `{new_preview}`")
+                # 合并碎片行时文本会显著变长，但 replace 不动时间轴 →
+                # 后半截没有显示时间。提醒补一条 retime（见 issue #3）。
+                old_plain = clean_ass_text(cur_raw)
+                new_plain = clean_ass_text(new_preview)
+                if (e and old_plain and new_plain
+                        and len(new_plain) / len(old_plain) > 1.5):
+                    lines.append(
+                        f"- ⚠ 文本长度 {len(old_plain)} → {len(new_plain)}"
+                        f"（>{1.5}×），但本条未带 retime")
+                    lines.append(
+                        f"  - 若是合并碎片行，需另加一条 `\"action\": \"retime\"` "
+                        f"把 end 延到后一句的结束时间")
+            elif action == "retime":
+                ns = fx.get("new_start")
+                ne = fx.get("new_end")
+                old_spec = (_format_timespec(e.start / 1000.0, e.end / 1000.0)
+                            if e else "")
+                ns_s = old_spec.split("-")[0] if old_spec else ""
+                ne_s = old_spec.split("-")[1] if old_spec else ""
+                if ns is not None:
+                    ns_s = f"{ns:.2f}"
+                if ne is not None:
+                    ne_s = f"{ne:.2f}"
+                lines.append(f"- 时间轴: `{old_spec}` → `{ns_s}-{ne_s}`（秒）")
+                if ns is not None and ne is not None and ne <= ns:
+                    lines.append(f"- **（非法：new_end {ne} 必须大于 new_start {ns}）**")
             elif action == "delete":
                 lines.append(f"- 删除整行: `{cur_raw}`")
             elif action == "swap":
@@ -477,10 +539,13 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
         # 预检模拟的是「没有 current 时」的退化行为：只要某条 fix 缺 current 且它
         # 会落到已被别的 fix 认领的行上，就是歧义。带了不同 current 的 fix 是明确
         # 指定的，不报（那是 merge 的正常写法：1 replace + N delete 合并碎片行）。
+        # 撞车预检忽略 retime：retime 按设计就是要跟 replace / delete 落在同一行
+        # （合并碎片行 = replace 合并文本 + retime 延时间轴 + delete 删后半条），
+        # 它是协同操作而非歧义（见 issue #3）。
         if not force_collision:
             claimed = {}   # id(e) -> [fx_id]
             for fx in fxs:
-                if fx.get("action", "replace") == "insert":
+                if fx.get("action", "replace") in ("insert", "retime"):
                     continue
                 fxiv = fx.get("id") or fx.get("audit_id", "")
                 track = fx.get("track", TRACK_ZH)
@@ -562,6 +627,23 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
                     continue
                 append_log(work_dir, batch_id, "delete", file, srt_id, track,
                            old_text, "", fx.get("category",""), fx.get("reason",""))
+            elif action == "retime":
+                new_start = fx.get("new_start")
+                new_end = fx.get("new_end")
+                if new_start is None and new_end is None:
+                    print(f"[!] retime 无 new_start/new_end: {fx.get('id')}", file=sys.stderr)
+                    continue
+                try:
+                    old_s, old_e = _retime_event(e, new_start, new_end)
+                except ValueError as ex:
+                    print(f"[!] retime 失败: {fx.get('id')} {ex}", file=sys.stderr)
+                    continue
+                # 时间串复用 old_text/new_text 字段（见 issue #3），
+                # rollback 靠它精确恢复时间轴
+                append_log(work_dir, batch_id, "retime", file, srt_id, track,
+                           _format_timespec(old_s, old_e),
+                           _format_timespec(e.start / 1000.0, e.end / 1000.0),
+                           fx.get("category",""), fx.get("reason",""))
             elif action == "swap":
                 ea, eb, old_a, old_b = _swap_text(subs, srt_index, srt_id,
                                                     fx["swap_with"], track)
@@ -627,9 +709,13 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
         srt_index = _build_srt_index(srt_blocks)
         for ent in ents:
             track = ent.get("track", TRACK_ZH)
-            # 回滚：按日志里的 new_text（当前内容）做 fallback 定位
-            e = _find_dialogue(subs, srt_index, ent["srt_id"], track,
-                               fallback_text=ent.get("new_text",""))
+            # 回滚：按日志里的 new_text（当前内容）做 fallback 定位。
+            # retime 条目的 new_text 是时间串，不能当文本用，改用 srt_id 定位。
+            if ent.get("action") == "retime":
+                e = _find_dialogue(subs, srt_index, ent["srt_id"], track)
+            else:
+                e = _find_dialogue(subs, srt_index, ent["srt_id"], track,
+                                   fallback_text=ent.get("new_text",""))
             if not e:
                 print(f"[!] 回滚定位失败: srt_id={ent['srt_id']} track={track} "
                       f"(srt_path={srt_path or '未找到'})", file=sys.stderr)
@@ -647,6 +733,22 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                     continue
                 append_log(work_dir, make_batch_id(), "rollback", f,
                            ent["srt_id"], ent["track"], e.text, "",
+                           ent.get("category", ""), f"rollback of {ent['batch_id']}")
+                count += 1
+                continue
+            if ent["action"] == "retime":
+                # retime 的逆 = 把时间轴写回 old_text 里的时间串
+                try:
+                    old_s, old_e = _parse_timespec(ent.get("old_text", ""))
+                except ValueError as ex:
+                    print(f"[!] retime 回滚失败: srt_id={ent['srt_id']} {ex}", file=sys.stderr)
+                    continue
+                cur_spec = _format_timespec(e.start / 1000.0, e.end / 1000.0)
+                e.start = int(round(old_s * 1000))
+                e.end = int(round(old_e * 1000))
+                append_log(work_dir, make_batch_id(), "rollback", f,
+                           ent["srt_id"], ent["track"], cur_spec,
+                           _format_timespec(old_s, old_e),
                            ent.get("category", ""), f"rollback of {ent['batch_id']}")
                 count += 1
                 continue

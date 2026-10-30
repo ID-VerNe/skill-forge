@@ -154,6 +154,7 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 - **一条审计发现可拆多条 fix**：例如 audit_id=`e02#152` 配对错位要改 srt 4+5 两行中文 → fix `e02#152a`(srt 4) + `e02#152b`(srt 5)，共享 `audit_id=e02#152`。id 加字母后缀区分。
 - **swap** 额外字段：`swap_with`: 另一个 srt_id。交换两行的文本部分，不动时间戳/样式/标签。
 - **insert** 新增一行（典型：注释轨）。`track` 指定新行轨道（如 `注释`），`final_new` 为新增文本（纯文本不带 ASS 标签，无现译行可继承标签）。样式由脚本按 track 从 ASS `[V4+ Styles]` 自动解析（ASS 须有对应样式，否则报错停下，不自动建样式）。日志 `old_text` 记为空，rollback 时删该行。
+- **retime** 调整时间轴（典型：合并碎片行后把 `end` 延到后一句结束）。字段：`new_start` / `new_end`，**单位是秒**（与 srt 块 `start`/`end` 一致；pysubs2 内部是毫秒，脚本写盘时乘 1000）。任一字段缺省则沿用原值；`new_end` 必须大于 `new_start`，否则拒写。只动 `start`/`end`，不动文本/样式/标签。日志 `old_text`/`new_text` 存时间串（`"1422.12-1425.43"` → `"1422.12-1428.91"`），不用文本字段存时间以外的语义。合并碎片行的标准写法是 **replace（合并文本）+ retime（延时间轴）+ delete（删后半条）三条 fix 落同一 srt_id**——撞车预检会放行 retime，因为它天生与 replace/delete 同行。
 - **status 语义**：
   - `accepted`=修（apply_fixes 执行）
   - `misreport`=误报（不该报）
@@ -161,7 +162,7 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
   - `skipped`=暂不处理
   - `deferred_to_global`=转给 global_replace 处理（如 Francis 统一替换，本条不执行，避免与 global_replace 重复改）
   - 非 accepted 都 `enabled=false` 不执行，但 status 记原因供追溯。
-- **action 取值**：`replace | delete | swap | insert | manual_edit`。前四种由 apply_fixes 写入，`manual_edit` 由 `--manual-log` 子命令补记（破例 Edit ASS 后用，见 `manual-flow.md` 兜底节）。verify_fixes 对 `manual_edit` 按 `new_text` fallback 定位核对可见文本。
+- **action 取值**：`replace | delete | swap | insert | retime | manual_edit`。前五种由 apply_fixes 写入，`manual_edit` 由 `--manual-log` 子命令补记（破例 Edit ASS 后用，见 `manual-flow.md` 兜底节）。verify_fixes 对 `manual_edit` 按 `new_text` fallback 定位核对可见文本；对 `retime` 核对起止时间与 `new_text` 时间串一致。
 
 ## id 空间
 
@@ -175,12 +176,13 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 ```
 一行一条。不进 git。
 
-**action 取值**：`replace | delete | swap | insert | manual_edit | rollback | precheck_punct`。`manual_edit` 由 `apply_fixes.py --manual-log` 补记（破例 Edit ASS 兜底，见 `manual-flow.md` 兜底节）。
+**action 取值**：`replace | delete | swap | insert | retime | manual_edit | rollback | precheck_punct`。`manual_edit` 由 `apply_fixes.py --manual-log` 补记（破例 Edit ASS 兜底，见 `manual-flow.md` 兜底节）。
 
 **字段说明**：
 - `file`：归一化为绝对路径存储，rollback 比较时容忍相对路径/斜杠方向差异（filter_log 用 `_norm_file` 归一化两端比较）。
 - `old_text` / `new_text`：都记**实际落盘的 ASS 文本**（含合并后的 `{\be3}` 等标签），forward 与 rollback 对称、可重放。replace 的 new_text = `_replace_text` 后的 `e.text`（不是 fixes 里的裸 final_new）。
-- rollback 定位：优先 srt_id→timestamp→Dialogue；srt 推不到时用 new_text 去 tag 后在 subs 里搜当前内容（fallback）。
+- **`retime` 是唯一的例外**：它的 `old_text` / `new_text` 存**时间串** `"<start>-<end>"`（秒，两位小数），如 `"1422.12-1425.43"` → `"1422.12-1428.91"`。复用这两个字段是为了不动 `append_log` 签名与已有日志格式。读日志时注意 `action == "retime"` 的行里它们不是文本。
+- rollback 定位：优先 srt_id→timestamp→Dialogue；srt 推不到时用 new_text 去 tag 后在 subs 里搜当前内容（fallback）。`retime` 条目的 new_text 是时间串，**不走 fallback**，只按 srt_id + track 定位。
 
 ## rollback
 
@@ -192,3 +194,5 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 所有操作都留记录，避免单条回滚破坏成对修改（可整 batch 回滚后再选择性重做）。
 
 **manual_edit 的 rollback**：破例 Edit 补记的 `manual_edit` 条目，rollback 时按 `old_text` + track + 时间戳定位回退（同 replace）。`manual_edit` 的 old_text 是 Edit 前的文本，rollback 把它写回去。
+
+**retime 的 rollback**：解析 `old_text` 的时间串，把 `start`/`end` 写回。文本不动，所以合并场景（replace + retime + delete）整 batch 回滚时，文本由 replace 那条还原、时间轴由 retime 那条还原。delete 条目回滚仍无法自动重建（脚本只打印提示，需人工补），这是既有限制。
