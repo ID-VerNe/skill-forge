@@ -134,11 +134,43 @@ python <skill>/scripts/apply_fixes.py .subtitle-polish/fixes.json --accept --bat
 ```bash
 python <skill>/scripts/verify_fixes.py --batch-id <ts>
 ```
+
 - 读 log.jsonl，按 srt_id + track 用 ass_srt_pair 重读 ASS，逐条核对每条操作记录的 new_text 是否真的落盘（delete 验该行已不存在）。输出带 ass_time 方便人对照视频。
-- 输出 `.subtitle-polish/reports/verify-fixes.md`。全部通过即完成；有失败条目则列出期望/实际/原因/ass_time，agent 或人据此排查。
+- 输出 `.subtitle-polish/reports/verify-fixes.md`。有失败条目则列出期望/实际/原因/ass_time，agent 或人据此排查。
 - **失败时不得用"预期差异"自行结案**，见 `batch-ordering.md`——每条必须读盘核对、分类（标点差异/译注被删/文本不符）、回滚或修复至 0 失败。真损失（如 `(EMU)` 被删）必须补回。
 - 不依赖 agent 手写 pysubs2 脚本或硬编码时间戳——上一轮实测手写验证因时间戳算错 5/6 条 NOT FOUND，改为脚本兜底。
 - 用户对仍存疑条目可再起验证 agent（用 verify.tmpl）复查语义，但落盘核验走本脚本。
+
+### 11b. 中英对照复核（必做，不可跳过）
+
+> **`verify_fixes` 0 失败 ≠ 成品正确。** 它比对的是「盘面 == log 里的 new_text」，
+> 是恒等式：只要字写进去就必然通过，**与译文对不对毫无关系**。
+> 实测：一轮 99 条 fix，verify 报 104 通过 / 0 失败，其中 15 条把原本正确的
+> 译文换成了邻行的/同场景另一句的译文。详见 skill-forge issue #1。
+
+因此 verify 通过后**必须再跑一次以英文为锚的对照**：
+
+```bash
+python <skill>/scripts/cross_check.py --batch-id <ts>
+```
+
+- 输出 `.subtitle-polish/reports/cross-check.md`：本批每个改动块的「英文 / 中文 / 本批改动」，外加**撞车预警表**。
+- 撞车预警 = 新译文与本块 ±3 邻块现有中文的相似度 ≥ 0.55（`difflib` 纯字符串，无模型）。
+  实测该判据：坏条命中 4/15，好条误报 **0/84**——误报率为 0，所以**每条预警都必须人工看**，不能当噪声忽略。
+- 预警只是提示，**不是结论**。剩下的错位（11/15）不是抄邻块，而是换成同场景另一句话，
+  任何字符串判据都抓不到。所以复核的正确姿势是：**读 cross-check.md 里每一块的英文与中文，问一句「如果我是译者，看了这句英文会写出这句中文吗」**。
+- 复查时必须按 srt_id 对齐，**不要用「这行像不像上一行的译文」判断**——连续对白里相邻块语义相关是正常的，这正是上一轮误判的根源。
+- 复核结果写进报告，明确说明「本次验证覆盖范围」（落了盘 + 中英对照抽检了哪些块），不要让「N 通过」被当成「全文正确」。
+
+### 11c. 误判自我强化的防治
+
+错位一旦写进盘面，下一轮审计 agent 会**基于坏盘面**把「恢复成错的那句」当成建议报上来，误判自我强化。
+
+- 重跑审计前，先确认上一轮 verify + 对照复核都过了；不过就回滚，不要把坏状态当基线。
+- 每轮开始前**保留一份快照**（如 `.subtitle-polish/<run>/S06E04.eng.ass.before.bak`），与执行后做 diff；
+  差异里出现「中文行内容等于其邻块内容」的，直接判为回归。
+- 报告里写明本轮相对快照改了多少行（中文/英文各几行），便于下一轮比对。
+
 
 ## 全局替换（跨文件统一专名）
 

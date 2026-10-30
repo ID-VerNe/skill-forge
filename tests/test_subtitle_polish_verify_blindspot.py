@@ -255,16 +255,61 @@ def test_dry_run_warns_on_cross_block_copy():
         shutil.rmtree(d)
 
 
+# ─────────────────────────────────────────────────────────────
+# G: cross_check 的撞车检测必须能抓到「抄邻块」这类错位
+#    (issue #1 的止血手段,已在 skill 中实现,这条防它被改坏)
+# ─────────────────────────────────────────────────────────────
+
+def test_cross_check_flags_neighbor_copy():
+    """343 写成 344 的内容时,collision_score 必须给出 >= 0.55 并指向 344。"""
+    from cross_check import load_pairs, collision_score
+
+    d = tempfile.mkdtemp()
+    try:
+        ass, srt = _fixture(d)
+        rows = load_pairs(ass, srt)
+        idx = [i for i, r in enumerate(rows) if r["srt_id"] == 343][0]
+        score, nbr = collision_score(rows, idx, window=3, floor=0.55)
+        assert nbr == 344, f"应指向 344,实际 {nbr}"
+        assert score >= 0.55, f"相似度应 >=0.55,实际 {score:.2f}"
+    finally:
+        shutil.rmtree(d)
+
+
+def test_cross_check_quiet_on_normal_pair():
+    """对照组:两个互不相干的译文,不应报撞车(防误报)。"""
+    from cross_check import load_pairs, collision_score
+
+    d = tempfile.mkdtemp()
+    try:
+        ass, srt = _fixture(d)
+        # 把 343 改成与 344 完全无关的正确译文
+        content = open(ass, encoding="utf-8").read().replace(
+            "{\\be3}好了 刘易斯 再把流程跟我讲一遍\nDialogue: 0,0:21:08.36",
+            "{\\be3}来宣传他的日本车友聚会\nDialogue: 0,0:21:08.36", 1)
+        open(ass, "w", encoding="utf-8").write(content)
+
+        rows = load_pairs(ass, srt)
+        idx = [i for i, r in enumerate(rows) if r["srt_id"] == 343][0]
+        _score, nbr = collision_score(rows, idx, window=3, floor=0.55)
+        assert nbr is None, f"正确译文不该报撞车,却指向 {nbr}"
+    finally:
+        shutil.rmtree(d)
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("verify_fixes 盲区回归测试 (issue #1)")
     print("  XFAIL = issue 尚未修复的现状;修好后应变为 PASS")
     print("=" * 70)
 
+
     test("D1 verify 应拒绝与英文对不上的译文(现状:通过)", test_verify_rejects_text_mismatching_english, expect_fail=True)
     test("D2 对照组:正确译文必须判通过", test_verify_still_accepts_correct_text)
     test("E  应提供邻块撞车检测", test_neighbor_duplicate_detected, expect_fail=True)
     test("F  dry-run 应对跨块复制预警", test_dry_run_warns_on_cross_block_copy, expect_fail=True)
+    test("G1 cross_check 应抓到抄邻块", test_cross_check_flags_neighbor_copy)
+    test("G2 cross_check 对照组:正常译文不报", test_cross_check_quiet_on_normal_pair)
 
     print()
     print(f"  通过 {PASS} / 失败 {FAIL} / 待修 {XFAIL}")
