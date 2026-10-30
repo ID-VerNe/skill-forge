@@ -314,7 +314,10 @@ def test_manual_log_appends():
              "--old", "是的", "--new", "没错",
              "--category", "语境错译", "--reason", "撞车兜底",
              "--batch-id", "20261002_111500_manual",
-             "--work-dir", work_dir],
+             "--work-dir", work_dir,
+             # 夹具里 new 未落盘、且同 srt_id 有多条同时间戳行,
+             # 新校验会给出警告。本条只验「补记字段完整」, 故 --force。
+             "--force"],
             capture_output=True, timeout=30,
         )
         # Windows 默认 gbk 解码 stderr 会炸（含中文），强制 utf-8

@@ -101,8 +101,10 @@ python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slice
        --category "语境错译" --reason "撞车兜底,用户确认破例 Edit" \
        --batch-id <ts>_manual
    ```
-3. **verify 兜底**：`verify_fixes.py --batch-id <ts>_manual` 验 manual_edit 条目（按 new_text fallback 定位核对）。
-4. **回滚**：`--rollback batch=<ts>_manual` 同样支持。
+3. **`--old` 必须真实存在**：`--manual-log` 写盘前会校验 `--old` 能在该 `srt_id` + `track` 的行里找到，找不到直接失败、不写日志。所以**先记日志、再做删除类 Edit**的顺序是反的——删完原文本就不在盘上了，校验会正确地拦下来。正确顺序是：改文件 → 记日志，且 `--old` 填**改之前**盘上真实的文本。这样留下的记录才能被 rollback 用上。实测有 4 条脏记录的形态就是 `--old` 填了早已不存在的碎片行、`--new` 为空，只能手工清 log.jsonl。
+   新文本尚未落盘、或同 `srt_id` 有多条同时间戳行（合并碎片行的典型场景）时会给警告并要求 `--force`。`--force` **不能**放过「`--old` 找不到」——那是硬错。
+4. **verify 兜底**：`verify_fixes.py --batch-id <ts>_manual` 验 manual_edit 条目（按 new_text fallback 定位核对）。
+5. **回滚**：`--rollback batch=<ts>_manual` 同样支持。
 
 规约"修复手段都只调脚本"在撞车场景下有这条例外条款。**首选仍是脚本**，Edit 是 last resort。
 

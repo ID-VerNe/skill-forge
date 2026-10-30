@@ -168,15 +168,96 @@ def _swap_text(subs, srt_blocks_indexed, id_a: int, id_b: int, track: str):
     return ea, eb, old_a, old_b
 
 
+def _manual_log_check(file: str, srt_id, track: str, old_text: str,
+                      new_text: str) -> list:
+    """--manual-log 的前置校验。返回警告列表；有致命问题抛 SystemExit。
+
+    为什么需要：append_log 不做任何校验，只 append。曾经出现过调用方先跑
+    --manual-log、随后删除却没匹配上，于是 log.jsonl 留下 4 条指向不存在内容
+    的脏记录，只能手工清理。这里的校验全部在写盘**之前**做。
+
+    校验项：
+      1. --old 非空，且能在该 srt_id + track 的行里找到（致命）
+      2. 新文本已落盘（否则日志与实际不符，警告）
+      3. --old 找不到但新文本已在盘上 → 大概率是重复补记（警告）
+      4. 同一 srt_id + track 存在多条同时间戳行（合并碎片行的典型场景，警告）
+    """
+    warns = []
+    if not os.path.exists(file):
+        raise SystemExit(f"[x] --manual-log 校验失败：ASS 文件不存在 {file}")
+    if not (old_text or "").strip():
+        raise SystemExit("[x] --manual-log 校验失败：--old 不能为空"
+                         "（没有 old 的 manual_edit 无法 rollback）")
+
+    subs = pysubs2.load(file, encoding="utf-8-sig")
+    want_old = clean_ass_text(old_text)
+    want_new = clean_ass_text(new_text)
+
+    # 同 srt_id + track 的全部行（时间戳容差与 _find_dialogue 一致，0.5s）
+    srt_path = _find_paired_srt(file)
+    blocks = parse_srt(srt_path) if srt_path and os.path.exists(srt_path) else []
+    index = _build_srt_index(blocks)
+    if srt_id in index:
+        start = index[srt_id].start
+        same = [e for e in subs.events
+                if style_to_track(e.style or "") == track
+                and abs(e.start / 1000.0 - start) <= 0.5]
+    else:
+        # srt 推不到就不做时间戳筛选，全文找 old，避免误判成「找不到」
+        same = [e for e in subs.events if style_to_track(e.style or "") == track]
+        warns.append(f"找不到配对 srt 或 srt_id={srt_id} 不在 srt 里，"
+                     f"--old 校验退化为在该 track 全文搜索")
+    texts = [clean_ass_text(e.text) for e in same]
+    old_found = want_old in texts
+    new_found = bool(want_new) and want_new in texts
+
+    if not old_found:
+        # 带标签的 old 最常见的是 heredoc 把反斜杠吃掉
+        hint = ""
+        if "{" in old_text and "}" in old_text:
+            hint = ("\n    --old 含 ASS 标签却匹配不到，检查 heredoc 是否吃了反斜杠"
+                    "（用带引号的 heredoc 或 chr(92)）")
+        if new_found:
+            warns.append(f"--old 在盘上找不到，但新文本已在盘上——"
+                         f"可能这条已经记过日志了（重复补记？）")
+        else:
+            shown = texts[:5]
+            more = "" if len(texts) <= 5 else f" …（共 {len(texts)} 条）"
+            raise SystemExit(
+                f"[x] --manual-log 校验失败：--old {old_text!r} 在 "
+                f"srt_id={srt_id} track={track} 的行里找不到。\n"
+                f"    该位置现有文本：{shown}{more}{hint}\n"
+                f"    （先确认改动真的发生了再记日志，否则会留下指向不存在内容的脏记录）")
+
+    if old_found and not new_found:
+        warns.append(f"新文本 {new_text!r} 尚未落盘——请确认已手工改好文件，"
+                     f"否则日志与实际不符")
+
+    if len(same) > 1:
+        warns.append(f"srt_id={srt_id} track={track} 有 {len(same)} 条同时间戳行，"
+                     f"请确认 --old 指定的是要记的那一条")
+    return warns
+
+
 def run_manual_log(work_dir: str, batch_id: str, file: str, srt_id: int,
                    track: str, old_text: str, new_text: str,
-                   category: str = "", reason: str = "") -> None:
+                   category: str = "", reason: str = "",
+                   force: bool = False) -> None:
     """破例 Edit ASS 后用脚本补记 log.jsonl，避免手写 JSON 出错。
 
     用法：apply_fixes.py --manual-log --batch-id <id> --file <ass> \\
            --srt-id <id> --track 中文 --old "原文本" --new "新文本" \\
            --category "语境错译" --reason "用户破例 Edit"
+
+    写盘前会校验 --old 是否真的在该位置存在（见 _manual_log_check）。
     """
+    warns = _manual_log_check(file, srt_id, track, old_text, new_text)
+    if warns:
+        for w in warns:
+            print(f"[!] {w}", file=sys.stderr)
+        if not force:
+            raise SystemExit("[x] 有警告未处理，已中止记录"
+                             "。确认无误后加 --force 强制写入。")
     append_log(work_dir, batch_id, "manual_edit", file, srt_id, track,
                old_text, new_text, category, reason)
     print(f"[*] 补记 manual_edit: batch={batch_id} srt_id={srt_id} track={track}")
@@ -601,6 +682,8 @@ def main():
     ap.add_argument("--new", default="", help="--manual-log 用：新文本")
     ap.add_argument("--category", default="", help="--manual-log 用")
     ap.add_argument("--reason", default="", help="--manual-log 用")
+    ap.add_argument("--force", action="store_true",
+                    help="--manual-log 校验有警告时仍强制写入（--old 找不到仍直接失败）")
     args = ap.parse_args()
 
     if args.manual_log:
@@ -608,8 +691,11 @@ def main():
             ap.error("--manual-log 需要 --file, --srt-id, --old, --new（--batch-id 缺省自动生成）")
         wd = resolve_work_dir(args.work_dir)
         bid = args.batch_id or make_batch_id()
+        # 校验失败时 run_manual_log 抛 SystemExit(str)，Python 默认会把
+        # 该字符串打到 stderr 并以 1 退出，这里不再包装，保留原始消息。
         run_manual_log(wd, bid, args.file, args.srt_id, args.track,
-                       args.old, args.new, args.category, args.reason)
+                       args.old, args.new, args.category, args.reason,
+                       force=args.force)
         return
 
     if args.rollback:
