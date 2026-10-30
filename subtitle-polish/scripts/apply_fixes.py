@@ -200,6 +200,7 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
     lines = ["# Dry-run 预览", "", f"共 {total} 条待执行（enabled=true）", ""]
     # 撞车检测在每文件循环里做（subs 已加载，能拿到真实 event 身份）
     collisions = []
+    cross_copies = []
     for file, fxs in by_file.items():
         lines.append(f"## {os.path.basename(file)}")
         lines.append("")
@@ -312,7 +313,32 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
                 lines.append(f"- 与 srt_id={fx.get('swap_with')} 交换文本（{track} 行）")
                 lines.append(f"  - 当前行: `{cur_raw}`")
             lines.append("")
+        # 跨块复制预警（issue #1 修复 F）：新译文与 ±3 邻块现有译文高相似，
+        # 典型是 agent 把一条译文换成了邻块的译文。只预警不拦，因为「同场景
+        # 两句本来就该像」是合法情形，需要人看一眼。
+        try:
+            from verify_fixes import find_cross_block_copies
+        except Exception:
+            find_cross_block_copies = None
+        if find_cross_block_copies is not None:
+            # 注意：apply_fixes 在模块级 import verify_fixes 会造成循环依赖
+            # （verify_fixes 反过来 import apply_fixes），故这里是函数内 import。
+            for h in find_cross_block_copies(fxs, subs, srt_index):
+                cross_copies.append({"file": file, **h})
         lines.append("")
+    if cross_copies:
+        lines.insert(3, "")
+        cw = ["## ⚠ 撞车预警（新译文与邻块译文高相似，accept 前逐条确认）", ""]
+        cw.append("以下 fix 的新译文与 ±3 邻块的现有译文高相似（阈值 0.55）。"
+                  "多数情况是**把邻块的译文抄了过来**（实测 e04 一轮 15 条错位就是这么来的）。"
+                  "少数情况是两句本来就该像，属正常。逐条读英文原文确认；"
+                  "确认是抄错了就改 fixes.json，确认正常可忽略。")
+        cw.append("")
+        for c in cross_copies:
+            cw.append(f"- `{c['id']}` srt_id={c['srt_id']} 与邻块 "
+                      f"`{c['neighbor']}` 相似度 {c['score']:.2f}：`{c['new']}`")
+        cw.append("")
+        lines = lines[:3] + cw + lines[3:]
     if collisions:
         # 撞车预警放末尾，最显眼。报每对写到同一物理行的 fix。
         lines.insert(3, "")
@@ -334,6 +360,9 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
     print(f"[*] dry-run 写入 {out_path}")
     if collisions:
         print(f"[!] 撞车 {len(collisions)} 组：{[c['ids'] for c in collisions]}")
+    if cross_copies:
+        print(f"[!] 跨块复制 {len(cross_copies)} 条："
+              f"{[(c['id'], c['srt_id'], c['neighbor']) for c in cross_copies]}")
     return out_path
 
 

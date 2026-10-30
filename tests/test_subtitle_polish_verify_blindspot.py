@@ -5,7 +5,7 @@
 事后对比快照发现其中 15 条把原本正确的译文换成了邻行的/同场景另一句的译文。
 verify 全部通过,因为 verify 比的是「盘面 == log 里的 new_text」,恒等式。
 
-本文件复刻最小场景,验证修复后应有的行为(当前应为 FAIL,即 issue 待修):
+本文件复刻最小场景,验证修复后应有的行为(已修,全部应为 PASS):
 
   bug D: verify_entry 对「new_text 与英文对不上」的条目仍报通过
   bug E: 没有「与邻块译文撞车」的检查
@@ -300,14 +300,14 @@ def test_cross_check_quiet_on_normal_pair():
 if __name__ == "__main__":
     print("=" * 70)
     print("verify_fixes 盲区回归测试 (issue #1)")
-    print("  XFAIL = issue 尚未修复的现状;修好后应变为 PASS")
+    print("  已修(2026-10-30):D1/E/F 由 XFAIL 转为 PASS")
     print("=" * 70)
 
 
-    test("D1 verify 应拒绝与英文对不上的译文(现状:通过)", test_verify_rejects_text_mismatching_english, expect_fail=True)
+    test("D1 verify 应拒绝与英文对不上的译文", test_verify_rejects_text_mismatching_english)
     test("D2 对照组:正确译文必须判通过", test_verify_still_accepts_correct_text)
-    test("E  应提供邻块撞车检测", test_neighbor_duplicate_detected, expect_fail=True)
-    test("F  dry-run 应对跨块复制预警", test_dry_run_warns_on_cross_block_copy, expect_fail=True)
+    test("E  应提供邻块撞车检测", test_neighbor_duplicate_detected)
+    test("F  dry-run 应对跨块复制预警", test_dry_run_warns_on_cross_block_copy)
     test("G1 cross_check 应抓到抄邻块", test_cross_check_flags_neighbor_copy)
     test("G2 cross_check 对照组:正常译文不报", test_cross_check_quiet_on_normal_pair)
 
