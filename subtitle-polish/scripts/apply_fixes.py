@@ -41,17 +41,31 @@ def load_fixes(path: str) -> list:
         return json.load(f)
 
 
-def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str, fallback_text: str = ""):
+def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
+                   fallback_text: str = "", *, used=None, prefer_text: str = ""):
     """按 srt_id + track 在 ass subs 里定位 Dialogue event。
 
     返回 pysubs2 Event 对象或 None。
     fallback_text: 若 srt_blocks_indexed 缺该 id，按文本在 subs 里搜当前内容（回滚用）。
+    used: 本次 batch 已处理过的 event id 集合。定位时跳过它们，避免同一 srt_id
+        下的多条同轨行被重复命中（如「合并碎片行」= 1 replace + N delete）。
+    prefer_text: 给了就优先匹配可见文本等于它的候选（fix 里的 current 字段）。
+        用于同一 srt_id 有多条同轨行时精确指定要删/要改的那一条。
+
+    为什么需要 used/prefer_text：_find_dialogue 原本的语义是「取时间戳最近的第
+    一条」，无状态。生产环节把一句中文字幕拆成多条独立 Dialogue 时，同 start/end、
+    同 track 会有 2~3 条。此时 1 条 replace + N 条 delete 的 fix 若不带 current，
+    每条都落在「时间戳最近的第一条」上，改哪条删哪条不可控。见 issue #2。
     """
+    if used is None:
+        used = set()
     if srt_id in srt_blocks_indexed:
         sb = srt_blocks_indexed[srt_id]
         target_start = sb.start  # 秒
         candidates = []
         for e in subs.events:
+            if id(e) in used:
+                continue
             if abs(e.start / 1000.0 - target_start) <= 0.5:
                 candidates.append(e)
         # 按时间戳距离排序后取最近的，不是第一个命中的。
@@ -61,23 +75,50 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str, fallback_t
         # 362→981950 行。
         candidates.sort(key=lambda e: abs(e.start / 1000.0 - target_start))
         # 按 track 筛
-        for e in candidates:
-            if style_to_track(e.style or "") == track:
-                return e
-        # 退化：返回同时戳任意行（让调用者处理 track 不匹配）
-        return candidates[0] if candidates else None
+        candidates = [e for e in candidates if style_to_track(e.style or "") == track]
+        if not candidates:
+            # 退化：返回同时戳任意未用行（让调用者处理 track 不匹配）
+            rest = [e for e in subs.events
+                    if id(e) not in used and abs(e.start / 1000.0 - target_start) <= 0.5]
+            return rest[0] if rest else None
+        # prefer_text：同一 srt_id 多条同轨行时，按 current 精确挑一条。
+        # 有命中就只在命中集里取最近的；都没命中则退回时间戳最近（保持旧行为，
+        # 调用方需要严格性时自己校验）。current 带不带标签都要能匹配。
+        if prefer_text:
+            want = clean_ass_text(prefer_text)
+            hits = [e for e in candidates if clean_ass_text(e.text) == want]
+            if hits:
+                candidates = hits
+        return candidates[0]
     # 回滚场景：srt 推不到，按 fallback_text 在当前 subs 里搜
     if fallback_text:
         from lib.tags import extract_leading_tags
         # 双端归一：fallback 可能带标签也可能不带，e.text 含标签，都去前导标签后比
         _, fb_body = extract_leading_tags(fallback_text)
         for e in subs.events:
+            if id(e) in used:
+                continue
             if style_to_track(e.style or "") != track:
                 continue
             _, e_body = extract_leading_tags(e.text)
             if e_body == fb_body:
                 return e
     return None
+
+
+def _remove_event(subs, e) -> bool:
+    """按对象身份删除 event，返回是否删到。
+
+    不能用 subs.events.remove(e)：pysubs2 的 SSAEvent.__eq__ 只比较 start/end
+    （源码注释 "XXX document this"），不看 text/style。list.remove 走 ==，
+    于是会删掉**第一条 start/end 相同的行**，而不是 e 本身。双语 ASS 里英中
+    两行时间戳完全一致，删中文碎片行时会把英文行删掉。见 issue #2。
+    """
+    for i, x in enumerate(subs.events):
+        if x is e:
+            del subs.events[i]
+            return True
+    return False
 
 
 def _build_srt_index(srt_blocks):
@@ -173,7 +214,11 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
             srt_path = _find_paired_srt(file)
         srt_blocks = parse_srt(srt_path) if srt_path and os.path.exists(srt_path) else []
         srt_index = _build_srt_index(srt_blocks)
-        # 撞车检测：本文件的 fix 里，有没有两条定位到同一个物理 event。
+        # 撞车检测：本文件的 fix 里，有没有两条在「没有 current」时定位到同一个
+        # 物理 event。_find_dialogue 已取最近时间戳，但同一 srt_id 有多条同轨行
+        # （一句被拆成多条 Dialogue）时必然撞同一行（见 issue #2）。
+        # 检测**不消耗 used、不按 current 精确挑**——补了不同 current 的
+        # 「1 replace + N delete」是合法的合并写法，不算撞车。
         # _find_dialogue 已取最近时间戳，但 srt_id 距离 < 0.5s 时仍可能撞同
         # 一行（实测培根链 361/362 隔 390ms）。提前报出来，accept 前拆开。
         seen_events = {}  # event_identity -> [fx_id, ...]
@@ -188,6 +233,18 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
                 continue
             eid = id(e)
             seen_events.setdefault(eid, []).append((fx.get("id") or fx.get("audit_id", ""), sid, track))
+        # 各条 current 互不相同且都能精确匹配 → 明确指定，不算撞车
+        for eid, hits in list(seen_events.items()):
+            if len(hits) <= 1:
+                continue
+            curs = []
+            for hid, sid, track in hits:
+                fx = next((f for f in fxs
+                           if (f.get("id") or f.get("audit_id", "")) == hid), {})
+                curs.append(fx.get("current", ""))
+            uniq = {clean_ass_text(c) for c in curs if c}
+            if len(uniq) == len(curs) and uniq:
+                del seen_events[eid]
         for eid, hits in seen_events.items():
             if len(hits) > 1:
                 collisions.append({
@@ -196,11 +253,14 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
                     "srt_ids": [h[1] for h in hits],
                     "track": hits[0][2],
                 })
+        used = set()  # 预览按实写顺序消耗候选，命中与 accept 一致
         for fx in fxs:
             action = fx.get("action", "replace")
             track = fx.get("track", TRACK_ZH)
             srt_id = fx["srt_id"]
-            e = _find_dialogue(subs, srt_index, srt_id, track)
+            # 与上面撞车检测同一套消耗顺序，保证预览与实写命中同一行
+            e = _find_dialogue(subs, srt_index, srt_id, track,
+                               prefer_text=fx.get("current", ""), used=used)
             # insert：该 track 行尚不存在，e=None 正常；ass_time 从 srt 块取
             sb = srt_index.get(srt_id)
             is_insert = (action == "insert")
@@ -277,7 +337,8 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
     return out_path
 
 
-def run_accept(fixes: list, work_dir: str, batch_id: str) -> None:
+def run_accept(fixes: list, work_dir: str, batch_id: str,
+               force_collision: bool = False) -> None:
     """执行替换，写 ASS + log.jsonl。"""
     by_file = {}
     for fx in fixes:
@@ -301,11 +362,54 @@ def run_accept(fixes: list, work_dir: str, batch_id: str) -> None:
             print(f"    在 fixes.json 里给每条加 \"srt_path\" 字段可显式指定", file=sys.stderr)
         srt_index = _build_srt_index(srt_blocks)
 
+        # accept 前的撞车预检（issue #2）：同一物理行被两条 fix 命中说明 fix
+        # 文件本身有歧义，写下去只会产生半合并残骸。默认拒写，需显式 --force-collision。
+        # 预检模拟的是「没有 current 时」的退化行为：只要某条 fix 缺 current 且它
+        # 会落到已被别的 fix 认领的行上，就是歧义。带了不同 current 的 fix 是明确
+        # 指定的，不报（那是 merge 的正常写法：1 replace + N delete 合并碎片行）。
+        if not force_collision:
+            claimed = {}   # id(e) -> [fx_id]
+            for fx in fxs:
+                if fx.get("action", "replace") == "insert":
+                    continue
+                fxiv = fx.get("id") or fx.get("audit_id", "")
+                track = fx.get("track", TRACK_ZH)
+                cur = fx.get("current", "")
+                # 该 fix 在「无 current」时（或带 current 时）会落到哪一行
+                e = _find_dialogue(subs, srt_index, fx["srt_id"], track,
+                                   prefer_text=cur)
+                if e is None:
+                    continue
+                # 带了 current 但没匹配上 → 说明这条 fix 自身不准，直接拒
+                if cur:
+                    want = clean_ass_text(cur)
+                    same = [x for x in subs.events
+                            if style_to_track(x.style or "") == track
+                            and abs(x.start / 1000.0
+                                    - srt_index[fx["srt_id"]].start) <= 0.5]
+                    if not any(clean_ass_text(x.text) == want for x in same):
+                        print(f"[!] {fxiv}: current 在 srt_id={fx['srt_id']} "
+                              f"track={track} 的行里找不到：{cur!r}", file=sys.stderr)
+                        print("    该行可能已被改过，或 current 写错。先核对再跑。",
+                              file=sys.stderr)
+                        raise SystemExit(1)
+                others = claimed.get(id(e), [])
+                if others:
+                    bad_note = others + [fxiv]
+                    print(f"[!] 撞车，拒绝写入 {file}：{bad_note}", file=sys.stderr)
+                    print(f"    这些 fix 会落在同一行。若确实要合并碎片行，"
+                          f"请给每条 fix 补 \"current\"（该行原文）以精确定位；"
+                          f"确认无误也可加 --force-collision。", file=sys.stderr)
+                    raise SystemExit(1)
+                claimed.setdefault(id(e), []).append(fxiv)
+
+        used = set()  # 逐条消耗候选行，后续 fix 不会再命中已处理过的行
         for fx in fxs:
             action = fx.get("action", "replace")
             track = fx.get("track", TRACK_ZH)
             srt_id = fx["srt_id"]
-            e = _find_dialogue(subs, srt_index, srt_id, track)
+            e = _find_dialogue(subs, srt_index, srt_id, track,
+                               prefer_text=fx.get("current", ""), used=used)
             if action == "insert":
                 sb = srt_index.get(srt_id)
                 if sb is None:
@@ -342,8 +446,10 @@ def run_accept(fixes: list, work_dir: str, batch_id: str) -> None:
                 append_log(work_dir, batch_id, "replace", file, srt_id, track,
                            old_text, e.text, fx.get("category",""), fx.get("reason",""))
             elif action == "delete":
-                # 删整行
-                subs.events.remove(e)
+                # 删整行（按身份，不能用 remove()，见 _remove_event）
+                if not _remove_event(subs, e):
+                    print(f"[!] delete 失败: {fx.get('id')} 未找到目标行", file=sys.stderr)
+                    continue
                 append_log(work_dir, batch_id, "delete", file, srt_id, track,
                            old_text, "", fx.get("category",""), fx.get("reason",""))
             elif action == "swap":
@@ -426,7 +532,9 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                 if e is None:
                     print(f"[!] insert 回滚定位失败: srt_id={ent['srt_id']} track={track}", file=sys.stderr)
                     continue
-                subs.events.remove(e)
+                if not _remove_event(subs, e):
+                    print(f"[!] insert 回滚失败: srt_id={ent['srt_id']} 未找到目标行", file=sys.stderr)
+                    continue
                 append_log(work_dir, make_batch_id(), "rollback", f,
                            ent["srt_id"], ent["track"], e.text, "",
                            ent.get("category", ""), f"rollback of {ent['batch_id']}")
@@ -453,6 +561,8 @@ def main():
                     help="batch=<id> | id=<srt_id> | before=<ts>")
     ap.add_argument("--file", default=None, help="rollback id= 时限定文件；--manual-log 时必填")
     ap.add_argument("--work-dir", default=WORK_DIR)
+    ap.add_argument("--force-collision", action="store_true",
+                    help="--accept 时忽略撞车预检（默认拒写，见 issue #2）")
     # 破例 Edit 兜底：手动改了 ASS 后用脚本补记 log.jsonl
     ap.add_argument("--manual-log", action="store_true",
                     help="破例 Edit 后补记一条 manual_edit 日志（避免手写 JSON）")
@@ -497,7 +607,7 @@ def main():
         run_dry_run(fixes, wd)
     elif args.accept:
         bid = args.batch_id or make_batch_id()
-        run_accept(fixes, wd, bid)
+        run_accept(fixes, wd, bid, force_collision=args.force_collision)
     else:
         ap.error("需要 --dry-run 或 --accept 或 --rollback")
 

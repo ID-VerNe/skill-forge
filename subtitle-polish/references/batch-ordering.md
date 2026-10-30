@@ -30,6 +30,27 @@
 
 global_replace 做纯文本替换（如 `法兰西斯`→`弗朗西斯`），不改标点、不删括号，可在主修前或后。但若主修的某条 fix 被 global_replace 覆盖（如 e02#13 Francis 由 global_replace 统一处理），那条 fix 在 fixes.json 里标 `status=deferred_to_global`/`enabled=false`，不重复执行。global_replace 建议在主修前跑，避免主修写入后又被 global_replace 改动文本。
 
+## 一句拆多条 Dialogue：合并碎片行必须带 `current`
+
+生产环节会把一句话拆成**多条独立 Dialogue**（同 start/end、同 track），这时要修就得「1 条 replace 合并 + N 条 delete 删碎片」，全都落在同一个 srt_id 上。
+
+**每条 fix 都必须写 `current`（该行原文）**，apply_fixes 据此精确定位：
+
+```json
+[
+  {"id": "e03#148a", "srt_id": 148, "track": "中文", "action": "replace",
+   "current": "MX-5 是的", "suggested_new": "MX-5 是的"},
+  {"id": "e03#148b", "srt_id": 148, "track": "中文", "action": "delete",
+   "current": "是的"}
+]
+```
+
+不带 `current` 时，`--accept` 会直接拒写（issue #2）。原来它只是往 dry-run.md 写一条预警，然后照写不误、退出码 0，最后得到「合并了一半」的残骸：英文行被删、碎片行留着。
+
+> 历史坑（已修，别改回去）：`subs.events.remove(e)` 走 `==`，而 pysubs2 的 `SSAEvent.__eq__` **只比较 start/end**。所以删中文碎片行时删掉的是同时间戳的英文行。现在统一用 `_remove_event()`（按 `is` 身份删）。`tests/test_subtitle_polish_delete_identity.py` 有护栏。
+
+（如 `法兰西斯`→`弗朗西斯`），不改标点、不删括号，可在主修前或后。但若主修的某条 fix 被 global_replace 覆盖（如 e02#13 Francis 由 global_replace 统一处理），那条 fix 在 fixes.json 里标 `status=deferred_to_global`/`enabled=false`，不重复执行。global_replace 建议在主修前跑，避免主修写入后又被 global_replace 改动文本。
+
 ## verify_fixes 失败的处理
 
 verify_fixes.py 报失败时，**不得用"预期差异"自行结案**。每条失败都必须：
