@@ -175,38 +175,73 @@ def plan_chunk(free_mib=None):
                          QWEN_PEAK_MIB[smallest] + QWEN_VRAM_HEADROOM_MIB))
 
 
-def tokens_qwen(wav, rows, model_dir, chunk=None, language="English"):
-    """Qwen3-ForcedAligner 分块全局强制对齐 -> 词级时间戳。
+def plan_chunks(free_mib=None):
+    """返回 (主分块, 副分块, 理由)。副分块是阶梯的下一档，已到最小档则为 None。
 
-    与 whisperX 的 align 关键差别：`align(audio, text)` **不接收时间窗**，
-    是在给定音频段内对整段文本做全局对齐。原字幕偏 2~3 秒也不影响结果，
-    只要块边界留足余量。
-
-    `chunk=None` 时按空闲显存自动规划（见 `plan_chunk`）。旧默认 240s 在
-    8GB 卡上必定溢出，实测整集跑 9~11 分钟；90s 只要 40 秒。
+    为什么要两档：`window_span` 对分块长度敏感，而分块长度本身是个任意的
+    自由参数。实测 E01 在 60/75/90/105/120/135 上给出
+    0.340/0.250/0.250/0.290/0.360/0.310——均值 0.300、标准差 0.046，而
+    qwen 的阈值正好是 0.300。同一个文件同一套字幕，判定随这个参数翻转。
+    两档一致才算数，不一致就是「测不准」，见 `combine_verdict`。
     """
+    c1, why = plan_chunk(free_mib)
+    ladder = list(QWEN_CHUNK_LADDER)
+    i = ladder.index(c1)
+    c2 = ladder[i + 1] if i + 1 < len(ladder) else None
+    return c1, c2, why
+
+
+def combine_verdict(spans, tol):
+    """多次独立分块给出的极差 -> (verdict, reason)。
+
+    这是把「点估计 vs 常数阈值」换掉的地方。极差落在阈值附近时，旧逻辑
+    会按小数点后第三位判 PASS 还是 FAIL，而那个差别小于测量本身的抖动。
+
+    单值输入时退化成原来的单阈值判定，所以 whisper / --asr-words 路径不变。
+    """
+    vals = [float(s) for s in spans if s is not None]
+    if not vals:
+        return "UNVERIFIED", "没有可用的极差测量"
+    hi, lo = max(vals), min(vals)
+    pretty = " / ".join("%.3f" % v for v in vals)
+    # 极差是浮点算出来的，0.1+0.2 就是 0.30000000000000004。判据刚说过
+    # 「别按小数点后第三位定生死」，那就更不能让一个 1e-16 的表示误差
+    # 把 0.300 顶到 FAIL。
+    eps = 1e-9
+    if hi <= tol + eps:
+        return "PASS", ""
+    if lo > tol + eps:
+        return "FAIL", "各分块都超过阈值（%s > %.2f）" % (pretty, tol)
+    return "AMBIGUOUS", ("各分块给出 %s，阈值 %.2f 落在两者之间——"
+                         "这个极差没有稳定到可判定的程度" % (pretty, tol))
+
+
+def _read_wav(wav):
+    import soundfile as sf
+    data, sr = sf.read(wav, dtype="float32")
+    return data, sr
+
+
+def _load_qwen(model_dir):
+    """加载 aligner 一次，供多种分块复用。装两次模型纯属浪费。"""
     try:
         import torch
-        import soundfile as sf
         from qwen_asr import Qwen3ForcedAligner
     except ImportError as e:
-        raise SystemExit("需要 qwen_asr / torch / soundfile：%s" % e)
-
-    if chunk is None:
-        chunk, why = plan_chunk()
-        print("  分块规划：%ds（%s）" % (chunk, why), flush=True)
-
-    data, sr = sf.read(wav, dtype="float32")
-    total = len(data) / float(sr)
-    bounds = _pick_boundaries(rows, chunk)
-    edges = [0.0] + bounds + [total]
-
+        raise SystemExit("需要 torch / qwen_asr：%s" % e)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model = Qwen3ForcedAligner.from_pretrained(
+    return Qwen3ForcedAligner.from_pretrained(
         model_dir, dtype=torch.bfloat16, device_map=dev)
 
 
-    print("  强制对齐：%d 段，共 %.0fs 音频" % (len(edges) - 1, total), flush=True)
+def _align_once(model, data, sr, rows, chunk, language="English", quiet=False):
+    """按给定分块做一遍全局强制对齐 -> 词级时间戳。"""
+    total = len(data) / float(sr)
+    bounds = _pick_boundaries(rows, chunk)
+    edges = [0.0] + bounds + [total]
+    if not quiet:
+        print("  强制对齐[%ds]：%d 段，共 %.0fs 音频"
+              % (chunk, len(edges) - 1, total), flush=True)
     tokens = []
     for ci in range(len(edges) - 1):
         lo, hi = edges[ci], edges[ci + 1]
@@ -228,9 +263,45 @@ def tokens_qwen(wav, rows, model_dir, chunk=None, language="English"):
             if txt:
                 tokens.append((float(w.start_time) + a0,
                                float(w.end_time) + a0, txt))
-        print("    块 %2d  %5.0f-%5.0f s  %3d 条  token %d"
-              % (ci, lo, hi, len(sel), len(items)), flush=True)
+        if not quiet:
+            print("    块 %2d  %5.0f-%5.0f s  %3d 条  token %d"
+                  % (ci, lo, hi, len(sel), len(items)), flush=True)
     return tokens
+
+
+def tokens_qwen(wav, rows, model_dir, chunk=None, language="English"):
+    """Qwen3-ForcedAligner 分块全局强制对齐 -> 词级时间戳（单次）。
+
+    与 whisperX 的 align 关键差别：`align(audio, text)` **不接收时间窗**，
+    是在给定音频段内对整段文本做全局对齐。原字幕偏 2~3 秒也不影响结果，
+    只要块边界留足余量。
+
+    `chunk=None` 时按空闲显存自动规划（见 `plan_chunk`）。旧默认 240s 在
+    8GB 卡上必定溢出，实测整集跑 9~11 分钟，且结果是错的。
+
+    需要跨分块一致性时用 `tokens_qwen_dual`（脚本主流程走那条）。
+    """
+    if chunk is None:
+        chunk, why = plan_chunk()
+        print("  分块规划：%ds（%s）" % (chunk, why), flush=True)
+    data, sr = _read_wav(wav)
+    model = _load_qwen(model_dir)
+    return _align_once(model, data, sr, rows, chunk, language)
+
+
+def tokens_qwen_dual(wav, rows, model_dir, chunks, language="English"):
+    """对同一段音频按多个分块各对齐一遍，返回 [(chunk, tokens), ...]。
+
+    模型只加载一次。多出来的一遍是为了回答「换个分块还成立吗」——那个问题
+    原本没人问，于是 E01/E05 的判定实际上取决于随手填的分块值。
+    """
+    data, sr = _read_wav(wav)
+    model = _load_qwen(model_dir)
+    out = []
+    for c in chunks:
+        out.append((c, _align_once(model, data, sr, rows, c, language)))
+    return out
+
 
 
 # ---------------------------------------------------------------- 报告
@@ -252,6 +323,10 @@ def print_summary(name, stats, n_rows, engine):
           % (stats["window"], stats["window_span"],
              stats["verdict"] if stats["verdict"] != "FAIL"
              else "FAIL（阈值 %.2fs）" % stats["tol"]))
+    if stats.get("window_spans") and len(stats["window_spans"]) > 1:
+        print("  跨分块复核：%s （分块 %s）"
+              % (" / ".join("%.3f" % s for s in stats["window_spans"]),
+                 " / ".join("%ds" % c for c in stats.get("chunks") or [])))
     if stats.get("verdict_reason"):
         print("    %s" % stats["verdict_reason"])
     if stats["windows"]:
@@ -283,6 +358,12 @@ def build_report(args, stats, n_rows, engine, compare, axis_res=None):
     L.append("| 判定 | **%s** |" % stats["verdict"])
     L.append("| 分时段中位极差 | %.3f s（阈值 %.2f s） |"
              % (stats["window_span"], stats["tol"]))
+    if stats.get("window_spans") and len(stats["window_spans"]) > 1:
+        L.append("| 跨分块复核 | %s（分块 %s） |"
+                 % (" / ".join("%.3f" % s for s in stats["window_spans"]),
+                    " / ".join("%ds" % c for c in stats.get("chunks") or [])))
+    if stats.get("verdict_reason"):
+        L.append("| 判定依据 | %s |" % stats["verdict_reason"])
     L.append("| delta 中位 / MAD | %s / %.3f |"
              % (_fmt(stats["median"]), stats["mad"]))
     L.append("| 全长漂移 | %s s（斜率 %+.6f，跨度 %.0f s） |"
@@ -397,7 +478,10 @@ def main():
                     help="附带比对的候选基准（可多次），用于轴归属判定")
     ap.add_argument("--window", type=float, default=180.0, help="分时段窗长（秒）")
     ap.add_argument("--chunk", type=float, default=None,
-                    help="qwen 引擎的分块时长（秒）；默认按空闲显存自动规划")
+                    help="qwen 引擎的主分块时长（秒）；默认按空闲显存自动规划")
+    ap.add_argument("--single-chunk", action="store_true",
+                    help="qwen 只跑一遍分块，不做跨分块复核（快一倍，但判定会"
+                         "随分块值翻转；仅调试用）")
     ap.add_argument("--tol", type=float, default=None,
                     help="分时段中位极差阈值（秒）。默认按引擎取：qwen 0.3 / whisper 0.5")
     ap.add_argument("--min-n", type=int, default=5, help="时段最少样本数")
@@ -432,6 +516,7 @@ def main():
         raise SystemExit("没读到字幕行：检查 --track（当前 %r）与文件" % args.track)
 
     # 1) 词级时间戳
+    alt_runs = []          # [(chunk, tokens), ...]：qwen 的跨分块复核
     if args.asr_words:
         with open(args.asr_words, encoding="utf-8") as f:
             tokens = [tuple(x) for x in json.load(f)]
@@ -442,9 +527,20 @@ def main():
         if args.engine == "qwen":
             if not args.model:
                 ap.error("--engine qwen 必须给 --model")
-            tokens = tokens_qwen(args.media_path, rows, args.model,
-                                 chunk=args.chunk)
+            if args.single_chunk:
+                c1 = args.chunk or plan_chunk()[0]
+                chunks = [c1]
+                print("  分块：%ds（--single-chunk，不做跨分块复核）" % c1)
+            else:
+                c1, c2, why = plan_chunks(args.chunk)
+                chunks = [c1] + ([c2] if c2 else [])
+                print("  分块规划：%ds + %s（%s）"
+                      % (c1, ("%ds" % c2) if c2 else "无副档（已在最小档）", why))
+            runs = tokens_qwen_dual(args.media_path, rows, args.model, chunks)
+            tokens = runs[0][1]
+            alt_runs = runs[1:]
             engine = "qwen3-forced-aligner"
+            args.chunks_used = [c for c, _ in runs]
         else:
             model = args.model or "large-v3"
             cache = os.path.join(
@@ -467,6 +563,36 @@ def main():
     if len(pairs) < 10:
         raise SystemExit("锚点不足（%d 条）：文本与音频可能不是同一语种/版本" % len(pairs))
     stats = ac.summarize(pairs, args.window, tol, args.min_n)
+
+    # 2b) 跨分块一致性：换一种分块，这个极差还成立吗
+    #
+    # 为什么必须有这一步：window_span 对分块长度敏感，而分块长度是个自由
+    # 参数。E01 在 60/75/90/105/120/135 上给出 0.340/0.250/0.250/0.290/
+    # 0.360/0.310——均值 0.300、标准差 0.046，阈值正好压在中心。旧逻辑按
+    # 小数点后第三位判 PASS/FAIL，而那个差别小于测量自身的抖动。两档一致
+    # 才算数，不一致就是测不准（AMBIGUOUS），不是「勉强通过」。
+    if alt_runs:
+        spans = [stats["window_span"]]
+        for c, tk in alt_runs:
+            p2 = ac.align_anchors(rows, tk)
+            if len(p2) < 10:
+                print("  [warn] 分块 %ds 锚点不足（%d），不参与合并"
+                      % (c, len(p2)), file=sys.stderr)
+                continue
+            s2 = ac.summarize(p2, args.window, tol, args.min_n)
+            spans.append(s2["window_span"])
+            print("  分块 %ds 复核：极差 %.3f s" % (c, s2["window_span"]))
+        v, reason = combine_verdict(spans, tol)
+        # window_span 保留主分块那次的原始值：它是最坏的情况吗？不一定。
+        # 报最大值会让 AMBIGUOUS 看起来像 FAIL（max 必然 > 阈值），报最小值
+        # 又会把 FAIL 伪装成 PASS。判定的合成结果在 verdict 里，别让它被
+        # 一个挑过的数字盖住。
+        stats["window_spans"] = spans
+        stats["chunks"] = args.chunks_used
+        stats["verdict"] = v
+        stats["verdict_reason"] = reason
+        stats["ok"] = v == "PASS"
+
     print_summary(os.path.basename(args.sub), stats, len(rows), engine)
 
     # 3) 轴归属 —— 判的是「哪条可信」，不是「哪条最小」

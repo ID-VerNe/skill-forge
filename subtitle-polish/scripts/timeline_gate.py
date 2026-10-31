@@ -103,7 +103,10 @@ def main():
     elif agg == V.FAIL:
         print("[gate] FAIL —— 轴有问题，先修再开工（见 references/align-audit.md）")
     elif agg == V.AMBIGUOUS:
-        print("[gate] AMBIGUOUS —— 多条候选轴无法区分，需人工确认用的是哪条流")
+        print("[gate] AMBIGUOUS —— 验了但判不出来。两种常见成因：")
+        print("       ① 多条候选轴无法区分，需人工确认用的是哪条流；")
+        print("       ② 换一种 qwen 分块，窗间极差就跨到阈值另一边——")
+        print("          说明这个极差没稳定到可判定的程度，别当成 PASS 用。")
     else:
         print("[gate] UNVERIFIED —— 没验或凭据失效。先跑：")
         print("       python align_audit.py --sub <ass> --media <片源> --write-credential")
