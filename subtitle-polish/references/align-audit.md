@@ -250,6 +250,18 @@ python scripts/timeline_gate.py a.ass --media m.mkv
 
 模型目录：whisper 用 `large-v3`（首次会自动下载或指定本地目录）；qwen 需本地 `Qwen3-ForcedAligner-0.6B`。
 
+> **两件常把人挡在门外的环境问题**（实测踩过）：
+>
+> 1. **换个解释器**。`align_audit` 需要装 `faster-whisper` 的那个 python，不一定是 PATH 上的那个。
+>    先用目标解释器 `python -c "import faster_whisper, torch; print(torch.cuda.is_available())"` 确认，
+>    再把它套在脚本前。系统 python 缺包时不要立刻下「这台机器跑不了 ASR」的结论——先找有没有现成的嵌入环境。
+> 2. **`--model` 传绝对目录**。给名字 `large-v3` 会走 HuggingFace 下载，离线或网络受限环境直接失败；
+>    有本地模型时传目录。同理，模型已在本地却仍去连网，会卡在超时上，看起来像「跑得慢」。
+>
+> 速度参考（RTX 4060 Laptop 8G，large-v3 float16，43 分钟音频）：约 5 分钟。
+> 明显超过这个量级时先看是不是同机在跑别的重活——`beam_size=5` + `word_timestamps`
+> 的瓶颈在 mel 提取，CPU 被抢就会掉到 1/8 速。GPU 功率掉到 20W 上下、pstate 停在 P4 就是这个信号。
+
 > **HF 缓存目录陷阱**：`~/.cache/huggingface/hub/models--*/snapshots/*` 里全是符号链接，`transformers` 的 `cached_files` 会把路径当 repo_id 校验，报 `Repo id must use alphanumeric chars...`。把 snapshot 内容复制成实体目录再用（1.7 GB，`shutil.copyfile` 约 1.4 s）。
 
 ---
