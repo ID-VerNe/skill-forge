@@ -268,6 +268,7 @@ def run(entries, work_dir, label):
 
     ok_count = 0
     fail_count = 0
+    pending_sections = []
     fail_sections = []
 
     for f, ents in by_file.items():
@@ -283,6 +284,12 @@ def run(entries, work_dir, label):
         # 该文件内每 (srt_id, track) 取最后一条
         latest = _latest_per_target(ents)
         for e in latest:
+            if e.get("action") in ("retime_curve", "revert_curve"):
+                # 文件级时间轴动作：不是「某行写没写进去」，而是「整条轴被改过」。
+                # 算成通过会让「0 失败」替一次未复测的改动背书；算成失败又会
+                # 逼人去删日志。单列一栏，明确「待复测」。
+                pending_sections.append(e)
+                continue
             ok, actual, detail = verify_entry(e, subs, srt_index)
             if ok:
                 ok_count += 1
@@ -327,6 +334,28 @@ def run(entries, work_dir, label):
                 lines.append("")
     else:
         lines.append(f"## 验证结果: 全部通过 ({ok_count} 条)")
+
+    if pending_sections:
+        lines.append("## 待复测：时间轴改动（不是失败）")
+        lines.append("")
+        lines.append("下列动作改了时间字段，**不能靠 verify 证明是对的**——"
+                     "必须重跑 `align_audit` 复测，直到 PASS。")
+        lines.append("")
+        for e in pending_sections:
+            lines.append(f"- `{os.path.basename(e.get('file',''))}` "
+                         f"action={e.get('action')} batch={e.get('batch_id','')} "
+                         f"max_shift={e.get('max_shift', 0):+.2f}s "
+                         f"events={e.get('n_events', 0)}")
+            if e.get("fit"):
+                f = e["fit"]
+                lines.append(f"  - 拟合 {f.get('segs','?')} 段，残差 P90 {f.get('p90','?')}，"
+                             f"R² {f.get('r2','?')}")
+        lines.append("")
+        lines.append("```bash")
+        lines.append("python <skill>/scripts/align_audit.py --sub <ass> --media <片源> \\")
+        lines.append("    --write-credential   # 复测并刷新凭据")
+        lines.append("```")
+        lines.append("")
 
     with open(out_path, "w", encoding="utf-8") as fp:
         fp.write("\n".join(lines))

@@ -425,7 +425,9 @@ def main():
     if args.json:
         os.makedirs(os.path.dirname(args.json) or ".", exist_ok=True)
         keep, _ = ac.robust_reject(pairs)
-        spec, base = ac.spec_from_pairs([(p[0], p[1]) for p in keep])
+        spec, base, fdiag = ac.spec_from_pairs([(p[0], p[1]) for p in keep])
+        if fdiag["verdict"] != "FIT_OK":
+            print("[!] 拟合被拒：%s" % fdiag.get("reason", ""), file=sys.stderr)
         # 判 PASS 的集不给曲线：残余多是噪声，拟合出的曲线没有物理意义，
         # 反被误用会平白制造偏移。
         payload = {
@@ -437,7 +439,8 @@ def main():
             # 两种都不该让下游拿到一条可以施加上去的曲线。
             "curve": spec if stats["verdict"] == "FAIL" else None,
             "curve_base": round(base, 4) if stats["verdict"] == "FAIL" else 0.0,
-            "curve_applicable": stats["verdict"] == "FAIL",
+            "curve_applicable": stats["verdict"] == "FAIL" and spec is not None,
+            "fit": fdiag,
             "verdict": stats["verdict"],
             "axis": axis_res,
         }

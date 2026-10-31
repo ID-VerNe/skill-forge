@@ -29,6 +29,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import align_core as ac
+from lib import credential as cred
+from lib import log as plog
 from lib.ass_srt_pair import style_to_track
 
 
@@ -93,11 +95,21 @@ def patch_sub(path, offset_fn, write=False, tag="align", track=ac.TRACK_EN):
                                for t in (0, 600, 1200, 1800, 2400)))
 
     if not write:
+        # 改动最大的 20 条先摊开看。曲线整体看着对、却把某一段推过头，
+        # 是这类「整片乘一个函数」的操作最容易犯的错。
+        order = sorted(range(len(units)), key=lambda i: -abs(shifts[i]))[:20]
+        print("  改动最大的 20 条：")
+        for i in order:
+            if abs(shifts[i]) < 1e-6:
+                break
+            print("    #%-5d %8.2f -> %8.2f  (%+.2f)"
+                  % (i + 1, units[i]["start"], new_times[i][0], shifts[i]))
         print("  [dry-run] 加 --write 生效")
         return {"file": path, "n": len(units), "shifts": shifts, "steps": steps,
-                "clamped": clamped, "written": False}
+                "clamped": clamped, "written": False,
+                "max_shift": max(shifts, key=abs) if shifts else 0.0}
 
-    _backup(path, tag)
+    bak = _backup(path, tag)
     for u, (st, en) in zip(units, new_times):
         if ext == ".srt":
             lines[u["line_no"]] = "%s --> %s" % (ac.sec_to_srt(st), ac.sec_to_srt(en))
@@ -107,9 +119,10 @@ def patch_sub(path, offset_fn, write=False, tag="align", track=ac.TRACK_EN):
             parts[2] = ac.sec_to_ass(en)
             lines[u["line_no"]] = "Dialogue:" + ",".join(parts)
     ac.write_lines(path, lines, _detect_newline(path, "\r\n" if ext != ".srt" else "\n"))
-    print("  [write] %s  (备份 %s)" % (path, "%s.%s.bak" % (path, tag)))
+    print("  [write] %s  (备份 %s)" % (path, os.path.basename(bak)))
     return {"file": path, "n": len(units), "shifts": shifts, "steps": steps,
-            "clamped": clamped, "written": True}
+            "clamped": clamped, "written": True, "backup": bak,
+            "max_shift": max(shifts, key=abs) if shifts else 0.0}
 
 
 # ---------------------------------------------------------------- 重定时
@@ -239,9 +252,10 @@ def apply_retime(path, rows, events, new_times, write=False, tag="retime",
 
     if not write:
         print("  [dry-run] 加 --write 生效")
-        return
+        return {"file": path, "n": len(rows), "written": False,
+                "max_shift": max(shifts, key=abs) if shifts else 0.0}
 
-    _backup(path, tag)
+    bak = _backup(path, tag)
     for line_no, (st, en) in by_line.items():
         e = next(x for x in events if x["line_no"] == line_no)
         parts = e["parts"][:]
@@ -249,10 +263,68 @@ def apply_retime(path, rows, events, new_times, write=False, tag="retime",
         parts[2] = ac.sec_to_ass(en)
         lines[line_no] = "Dialogue:" + ",".join(parts)
     ac.write_lines(path, lines, _detect_newline(path, "\r\n"))
-    print("  [write] %s  (备份 %s)" % (path, "%s.%s.bak" % (path, tag)))
+    print("  [write] %s  (备份 %s)" % (path, os.path.basename(bak)))
+    return {"file": path, "n": len(rows), "written": True, "backup": bak,
+            "max_shift": max(shifts, key=abs) if shifts else 0.0}
 
 
 # ---------------------------------------------------------------- 主流程
+
+def _after_write(path, st, spec, work_dir, batch_id, fit=None, action="retime_curve"):
+    """写盘后的三件事，缺一不可。
+
+    1. 记 log.jsonl —— 否则 `--rollback batch=` 回滚完文本、时间还错着，
+       回滚本身变成一次新的错误
+    2. 让时间轴凭据失效 —— patched_at > computed_at，闸门立刻转 UNVERIFIED
+    3. 记备份索引 —— .bak 不进 git，误删就没了，至少要能枚举出来
+    """
+    bak = st.get("backup")
+    try:
+        plog.append_curve_log(work_dir, batch_id, path, spec or {},
+                              st.get("max_shift", 0.0), st.get("n", 0),
+                              bak or "", fit)
+        cred.touch_patch(path, st.get("max_shift", 0.0), st.get("n", 0))
+        plog.record_backup(work_dir, path, bak or "", batch_id, action)
+    except OSError as e:
+        # 记不上账就不能留着改动——「改了但没记账」比不改更麻烦
+        if bak and os.path.exists(bak):
+            shutil.copy2(bak, path)
+            print("[x] 记账失败（%s），已从备份还原 %s" % (e, path), file=sys.stderr)
+        raise SystemExit("记账失败，改动已回滚")
+    print("  [log]    %s  batch=%s  max %+.2f"
+          % (os.path.basename(path), batch_id, st.get("max_shift", 0.0)))
+
+
+def run_revert(args):
+    """撤销最近一次 retime_curve：从备份还原，并记一条 revert_curve。"""
+    work_dir = os.path.abspath(args.work_dir)
+    batch_id = plog.make_batch_id()
+    targets = args.sub or []
+    done = 0
+    for path in targets:
+        e = plog.last_curve_entry(work_dir, path)
+        if not e:
+            print("[skip] %s：log 里没有 retime_curve 记录" % os.path.basename(path))
+            continue
+        bak = e.get("backup") or ""
+        if not os.path.exists(bak):
+            print("[x] 备份不存在：%s" % bak, file=sys.stderr)
+            continue
+        shutil.copy2(bak, path)
+        plog.append_raw(work_dir, {
+            "batch_id": batch_id, "action": "revert_curve", "file": path,
+            "srt_id": 0, "track": "*", "old_text": "", "new_text": "",
+            "reverted_batch": e.get("batch_id"), "backup": bak,
+            "category": "时间轴", "reason": "align_patch --revert",
+        })
+        cred.touch_patch(path, 0.0, 0)
+        print("[revert] %s  <- %s（撤销 batch %s）"
+              % (os.path.basename(path), os.path.basename(bak), e.get("batch_id")))
+        done += 1
+    if not done:
+        print("没有可撤销的记录。")
+        sys.exit(1)
+
 
 def main():
     ap = argparse.ArgumentParser(description="按偏移量改字幕时间轴")
@@ -267,13 +339,25 @@ def main():
     ap.add_argument("--tag", default=None,
                     help="备份后缀：<file>.<tag>.bak（默认 retime / align）")
     ap.add_argument("--write", action="store_true", help="真正写盘（默认 dry-run）")
+    ap.add_argument("--revert", action="store_true",
+                    help="撤销最近一次时间轴改动（从 log 里找 retime_curve 的备份）")
+    ap.add_argument("--work-dir", default=".subtitle-polish",
+                    help="log.jsonl / backups.jsonl 所在目录")
+    ap.add_argument("--batch-id", default=None, help="指定 batch_id（默认按时间生成）")
     args = ap.parse_args()
+
+    if args.revert:
+        run_revert(args)
+        return
 
     given = sum(x is not None for x in (args.slope, args.spec, args.ref))
     if given != 1:
         ap.error("--slope / --spec / --ref 三者选一")
     if args.tag is None:
         args.tag = "retime" if args.ref else "align"
+
+    work_dir = os.path.abspath(args.work_dir)
+    batch_id = args.batch_id or plog.make_batch_id()
 
     if args.ref:
         sub_ass = next((p for p in args.sub
@@ -284,30 +368,47 @@ def main():
         print("参考 %s：匹配 %d/%d (%.1f%%)，非单调 %d"
               % (os.path.basename(args.ref), info["matched"], info["total"],
                  100.0 * info["matched"] / info["total"], info["non_monotonic"]))
-        apply_retime(sub_ass, rows, events, new_times, args.write, args.tag, args.track)
+        st = apply_retime(sub_ass, rows, events, new_times, args.write, args.tag, args.track)
 
         # 同一 off(t) 供配套 SRT/其他文件复用（按行偏移拟合成阶梯曲线）
         pairs = [(rows[i]["start"], new_times[i][0] - rows[i]["start"])
                  for i in range(len(rows))]
-        spec, base = ac.spec_from_pairs(pairs)
-        print("  派生曲线：%d 段（base %+.3f）" % (len(spec.get("segments", [])), base))
-        if args.emit_spec:
+        spec, base, fdiag = ac.spec_from_pairs(pairs)
+        print("  派生曲线：%d 段（base %+.3f，残差 P90 %s）"
+              % (fdiag.get("segs", 0), base,
+                 ("%.3f" % fdiag["p90"]) if fdiag.get("p90") is not None else "—"))
+        if fdiag["verdict"] != "FIT_OK":
+            print("  [!] 拟合被拒：%s" % fdiag.get("reason", ""), file=sys.stderr)
+            print("      逐条重定时已经写入了，但**不要**拿这条曲线去施加别的文件。")
+        if args.emit_spec and spec is not None:
             with open(args.emit_spec, "w", encoding="utf-8") as f:
                 json.dump(spec, f, ensure_ascii=False, indent=1)
             print("  [spec] %s" % args.emit_spec)
+        if st and st.get("written"):
+            _after_write(sub_ass, st, spec, work_dir, batch_id, fdiag, "retime_ref")
         others = [p for p in args.sub if p != sub_ass]
         if others:
-            print("\n提示：其余文件请用同一条曲线各自施加，避免条数不等时被跳过：")
-            print("  python align_patch.py --spec %s %s --write"
-                  % (args.emit_spec or "<spec.json>",
-                     " ".join("--sub %s" % p for p in others)))
+            if spec is None:
+                print("\n其余文件：拟合被拒，不能自动派生曲线，需单独处理。")
+            else:
+                print("\n提示：其余文件请用同一条曲线各自施加，避免条数不等时被跳过：")
+                print("  python align_patch.py --spec %s %s --write"
+                      % (args.emit_spec or "<spec.json>",
+                         " ".join("--sub %s" % p for p in others)))
         return
 
+    fit = None
     if args.spec:
         with open(args.spec, encoding="utf-8") as f:
             data = json.load(f)
         spec = data.get("curve")
+        fit = data.get("fit")
         if spec is None:
+            fv = (fit or {}).get("verdict")
+            if fv == "FIT_REJECTED":
+                raise SystemExit(
+                    "拟合被拒：%s\n改用 --slope 做线性补偿，或分区段手工处理。"
+                    % (fit or {}).get("reason", ""))
             if "curve_applicable" in data:
                 v = data.get("verdict") or "PASS"
                 if v == "UNVERIFIED":
@@ -337,7 +438,9 @@ def main():
 
     offset_fn = lambda t: ac.offset_at(spec, t)  # noqa: E731
     for path in args.sub:
-        patch_sub(path, offset_fn, args.write, args.tag, args.track)
+        st = patch_sub(path, offset_fn, args.write, args.tag, args.track)
+        if st.get("written"):
+            _after_write(path, st, spec, work_dir, batch_id, fit)
 
 
 if __name__ == "__main__":

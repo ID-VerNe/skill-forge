@@ -400,8 +400,52 @@ def spec_from_linear(slope: float, origin: float):
     return {"kind": "linear", "slope": float(slope), "origin": float(origin)}
 
 
-def spec_from_pairs(pairs, nseg=0, min_pts=12, local_window=6, local_tol=1.0):
-    """把逐条偏移拟合成分段常数曲线（方向感知单调 + 首段归零）。
+def theil_sen_slope(pts, max_pairs=40000):
+    """所有点对斜率的中位数。崩溃点 29%，用来看**偏移的整体方向**。
+
+    为什么不用首末两点：末段常是合并不全的窄段，噪声大；用它决定方向，
+    一旦翻向，整条曲线会被夹平、末尾反转（v1.4.0 那次 bug 就是这么来的）。
+    """
+    n = len(pts)
+    if n < 3:
+        return 0.0
+    step = max(1, n // 200)
+    xs = [p[0] for p in pts[::step]]
+    ys = [p[1] for p in pts[::step]]
+    m = len(xs)
+    slopes = []
+    for i in range(m):
+        for j in range(i + 1, m):
+            dx = xs[j] - xs[i]
+            if dx > 1e-9:
+                slopes.append((ys[j] - ys[i]) / dx)
+                if len(slopes) >= max_pairs:
+                    return median(slopes)
+    return median(slopes) if slopes else 0.0
+
+
+def _pct(vals, q):
+    if not vals:
+        return 0.0
+    v = sorted(vals)
+    k = min(len(v) - 1, max(0, int(round(q * (len(v) - 1)))))
+    return v[k]
+
+
+def _seg_value(segs, t):
+    """分段常数曲线在 t 处的取值（落在首个段之前取首段）。"""
+    v = segs[0][1] if segs else 0.0
+    for t0, c in segs:
+        if t >= t0:
+            v = c
+        else:
+            break
+    return v
+
+
+def spec_from_pairs(pairs, nseg=0, min_pts=12, local_window=6, local_tol=1.0,
+                    max_resid=0.4, break_tol=0.15):
+    """把逐条偏移拟合成分段常数曲线（方向感知单调 + 首段归零 + 残差自检）。
 
     三道处理，顺序不能换：
 
@@ -413,20 +457,45 @@ def spec_from_pairs(pairs, nseg=0, min_pts=12, local_window=6, local_tol=1.0):
     3. **方向感知单调**：偏移只会沿一个方向累加，不会回退；但**方向可能是负的**
        （字幕被推晚 → delta 递减）。早期版本写死 `run = max(run, c)`，遇到递减
        样本会把整条曲线夹平、末尾一个离群段反转成正向，照着施加会把字幕推得更偏。
+       方向现在由 Theil-Sen 斜率给出，不再看首末两段。
 
     首段归零：对齐器与字幕起点存在系统性偏置（实测 base −0.279s），不减去
     就会把整集平推一段，反而制造新偏移。
 
-    返回 (spec, base)。
+    **残差自检**：拟合完算 |观测 − 曲线| 的 P90。超过 `max_resid` 说明这批
+    数据不是「分段常数」形态（非线性拉伸、局部重剪接、双语轨各自错位），
+    此时返回 `spec=None` 而不是硬给一条看起来合理的曲线——照它施加比不改更糟。
+
+    返回 `(spec, base, diag)`；`spec` 为 None 时看 `diag["verdict"]`。
     """
     pts = _local_filter(sorted(pairs), local_window, local_tol)
     segs = _segfit(pts, nseg, min_pts=min_pts)
     if not segs:
-        return {"kind": "curve", "segments": []}, 0.0
+        return (None, 0.0,
+                {"verdict": "FIT_REJECTED", "reason": "点数不足以分段（<8）",
+                 "p90": None, "r2": None, "segs": 0, "direction": 0,
+                 "breaks": [], "hit_max_seg": False, "hit_min_pts": False})
 
-    direction = 1 if segs[-1][2] >= segs[0][2] else -1
+    # 方向：Theil-Sen 斜率符号；斜率几乎为 0 时退回「末段 vs 首段」。
+    slope = theil_sen_slope(pts)
+    if abs(slope) < 1e-9:
+        direction = 1 if segs[-1][2] >= segs[0][2] else -1
+    else:
+        direction = 1 if slope > 0 else -1
+
+    raw = [(t0, c) for t0, _t1, c, _n in segs]
+    # 非单调冲突：先记下来（不夹平也不反转，这两件事只有人能判）
+    breaks = []
+    for i in range(1, len(raw)):
+        d = (raw[i][1] - raw[i - 1][1]) * direction
+        if d > break_tol:
+            breaks.append({"at": round(raw[i][0], 1),
+                           "from": round(raw[i - 1][1], 3),
+                           "to": round(raw[i][1], 3),
+                           "back": round(d, 3)})
+
     run, fixed = None, []
-    for t0, _t1, c, _n in segs:
+    for t0, c in raw:
         if run is None:
             run = c
         elif direction > 0:
@@ -435,9 +504,37 @@ def spec_from_pairs(pairs, nseg=0, min_pts=12, local_window=6, local_tol=1.0):
             run = min(run, c)
         fixed.append((t0, run))
     base = fixed[0][1]
+
+    resid = [abs((y - base) - _seg_value(fixed, t)) for t, y in pts]
+    ys = [y - base for _t, y in pts]
+    mean_y = sum(ys) / len(ys) if ys else 0.0
+    ss_tot = sum((y - mean_y) ** 2 for y in ys)
+    ss_res = sum(r * r for r in resid)
+    r2 = (1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
+    p90 = _pct(resid, 0.9)
+
+    diag = {
+        "verdict": "FIT_OK",
+        "p90": round(p90, 4),
+        "r2": round(r2, 4),
+        "segs": len(fixed),
+        "direction": direction,
+        "slope": round(slope, 8),
+        "breaks": breaks,
+        "hit_max_seg": len(fixed) >= 9,
+        "hit_min_pts": any(n <= min_pts for *_x, n in segs),
+        "n_pts": len(pts),
+    }
+
+    if p90 > max_resid:
+        diag["verdict"] = "FIT_REJECTED"
+        diag["reason"] = ("残差 P90 %.2fs > %.2fs：这批数据不是「分段常数」形态，"
+                          "硬拟一条曲线照它施加会把对的改坏" % (p90, max_resid))
+        return None, base, diag
+
     return ({"kind": "curve",
              "segments": [[round(t0, 2), round(c - base, 4)] for t0, c in fixed]},
-            base)
+            base, diag)
 
 
 def _local_filter(pts, window=6, tol=1.0):
