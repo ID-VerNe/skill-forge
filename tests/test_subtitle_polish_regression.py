@@ -210,20 +210,79 @@ def test_reversals_silent_on_monotone_drift():
     assert rg.reversals(trail) == [], "渐进改动不是反向"
 
 
-def test_converged_true_when_two_rounds_agree():
-    trail = [{"batch": "R6", "new": "甲"},
-             {"batch": "R7", "new": "乙"},
-             {"batch": "R8", "new": "乙"}]
-    assert rg.converged(trail), "连续两轮给出相同 new_text 应判已收敛"
+def test_converged_is_impossible_on_consistent_log():
+    """「连续两轮给出相同 new_text」在一致的日志里永远为假。
+
+    这是设计缺陷，不是一个待修的 bug：trail 里相邻两条满足
+    `old[i] == new[i-1]`，若再有 `new[i] == new[i-1]`，则 `old[i] == new[i]`
+    —— 那是一条空改动，会被 _is_text_change 滤掉。
+
+    所以 converged() 已删掉，换成可观测的 settled() / churn()。
+    这条测试盯住「不要再把它加回来」。
+    """
+    assert not hasattr(rg, "converged"), \
+        "converged() 在一致的日志里永远为假，不该存在；用 settled()/churn()"
 
 
-def test_converged_false_cases():
-    assert not rg.converged([{"batch": "R8", "new": "甲"}]), "只有一轮不算收敛"
-    assert not rg.converged([{"batch": "R7", "new": "甲"},
-                             {"batch": "R8", "new": "乙"}]), "文本不同不算收敛"
-    # 同一个 batch 里的两条不算「两轮」
-    assert not rg.converged([{"batch": "R8", "new": "甲"},
-                             {"batch": "R8", "new": "甲"}]), "同一轮不算收敛"
+def test_settled_excludes_recent_rounds():
+    entries = flipflop_trail() + [
+        _entry("R9", 500, "甲", "乙", ts="2026-10-01T13:00:00"),
+    ]
+    h = rg.history(entries)
+    # 最近 1 轮 = R9 → #1 的最后改动是 R8，算「沉住」；#500 刚改，不算
+    s = rg.settled(h, {"R9"})
+    keys = [x["key"][1] for x in s]
+    assert keys == [1], s
+    assert s[0]["n_rounds"] == 3 and s[0]["last"]["batch"] == "R8", s[0]
+    # 最近 5 轮覆盖全部 → 没有沉住的
+    assert rg.settled(h, {"R1", "R6", "R7", "R8", "R9"}) == []
+
+
+def test_churn_counts_overturned_rows():
+    """批次沉住度：这一批改的行，后来又被改过的比例。"""
+    entries = flipflop_trail()  # R6 改 #1、R7 再改 #1、R8 再改 #1
+    rows = rg.churn(rg.history(entries))
+    by = {r["batch"]: r for r in rows}
+    assert [r["batch"] for r in rows] == ["R6", "R7", "R8"], rows
+    assert by["R6"]["n"] == 1 and by["R6"]["again"] == 1, by["R6"]   # 后来被 R7 推翻
+    assert by["R7"]["n"] == 1 and by["R7"]["again"] == 1, by["R7"]   # 后来被 R8 推翻
+    assert by["R8"]["n"] == 1 and by["R8"]["again"] == 0, by["R8"]   # 最后一次，没人动它
+    assert by["R8"]["rate"] == 0.0, by["R8"]
+
+
+def test_history_excludes_noop_text_change():
+    """old_text == new_text 的记录不算文本改动。
+
+    真实来源：`retime` 在 `--manual-log` 里没有时间戳字段可用（issue #3），
+    只能以 `replace` 补记，old 与 new 完全相同。S06E04 的真实 log 里因此
+    把 #390 算成「3 轮改过」、英文轨算成「2 轮已收敛」——实际分别是 2 轮和
+    1 轮，而 1 轮根本不该出现在「连续改动」里。
+    """
+    noop = _entry("R6_retime", 390,
+                  "但是嗯那就好了如果你们能少做点影响生产力的事",
+                  "但是嗯那就好了如果你们能少做点影响生产力的事",
+                  ts="2026-10-01T10:30:00", category="时间轴", reason="纯 retime")
+    real = _entry("R6_merge", 390, "但是嗯那就太好了",
+                  "但是嗯那就好了如果你们能少做点影响生产力的事",
+                  ts="2026-10-01T10:00:00")
+    later = _entry("R10", 390, "但是嗯那就好了如果你们能少做点影响生产力的事",
+                   "不过嗯你们要是能少干点影响生产力的活儿那就太好了",
+                   ts="2026-10-01T11:00:00")
+    h = rg.history([real, noop, later])
+    trail = h[("F.ass", 390, "中文")]
+    assert len(trail) == 2, f"空改动不该算一轮，实际 {[x['batch'] for x in trail]}"
+    assert [x["batch"] for x in trail] == ["R6_merge", "R10"], trail
+
+    # 只有一条真实改动的行，不该出现在「连续改动」里
+    h2 = rg.history([real, noop])
+    assert rg.conflicts(h2) == [], "1 轮改动不是连续改动"
+
+
+def test_find_regressions_skips_noop_current():
+    """本轮记录本身 old == new，谈不上「改掉了历史修好的译文」。"""
+    cur = [_entry("R8", 1, "这正是菲尔的强项", "这正是菲尔的强项")]
+    past = [_entry("R7", 1, "这就是菲尔的地盘", "这正是菲尔的强项")]
+    assert rg.find_regressions(cur, past) == [], "文本没变就不该报疑似回归"
 
 
 def test_find_regressions_exact():
@@ -292,26 +351,45 @@ def test_regression_check_conflicts():
                   encoding="utf-8").read()
         assert "#1" in md, md[:600]
         assert "被 3 轮改过" in md, md
-        assert "还没收敛" in md, "R6→R7→R8 最后一轮与上一轮不同，不该判收敛"
         assert "疑似反向" in md, md
+        assert "没有「已收敛」标记" in md, "报告里要写清为什么没有「已收敛」"
     finally:
         wd.close()
 
 
-def test_regression_check_converged_filter():
+def test_regression_check_settled():
+    """--settled：改过、但最近 N 轮没再被动。
+
+    #1 最后改于 R8，#500 最后改于 R9；最近 1 轮是 R9 → 只有 #1 沉住了。
+    """
     rows = flipflop_trail() + [
         _entry("R9", 500, "甲", "乙", ts="2026-10-01T13:00:00"),
-        _entry("R10", 500, "乙", "乙", ts="2026-10-01T14:00:00"),
     ]
     wd = WorkDir(rows)
     try:
-        p = _run("regression_check.py", ["--work-dir", wd.dir, "--converged"])
+        p = _run("regression_check.py", ["--work-dir", wd.dir,
+                                         "--settled", "--window", "1"])
         assert p.returncode == 0, p.stderr
-        assert "连续改动 1 行（已收敛 1" in p.stdout, p.stdout
         md = open(os.path.join(wd.dir, "reports", "regression.md"),
                   encoding="utf-8").read()
-        assert "#500" in md and "已收敛" in md, md
-        assert "#1" not in md, "--converged 应过滤掉没收敛的 #1"
+        assert "## 沉住的" in md and "| 1 | 中文 | 3 | R8 |" in md, md
+        assert "| 500 |" not in md, "--settled 不该列最近一轮刚改的 #500"
+        # --settled 是选段开关：不该顺带输出台账
+        assert "## 台账" not in md, md
+    finally:
+        wd.close()
+
+
+def test_regression_check_window_zero_lists_everything_settled():
+    wd = WorkDir(flipflop_trail())
+    try:
+        p = _run("regression_check.py", ["--work-dir", wd.dir,
+                                         "--settled", "--window", "0"])
+        assert p.returncode == 0, p.stderr
+        md = open(os.path.join(wd.dir, "reports", "regression.md"),
+                  encoding="utf-8").read()
+        assert "## 沉住的（最近 全部 轮没再被动）" in md, md
+        assert "没有。", "window=0 时所有改动过的行都算沉住"
     finally:
         wd.close()
 
@@ -339,7 +417,10 @@ def test_regression_check_json_shape():
         assert data["window"] == 3, data
         assert len(data["conflicts"]) == 1, data["conflicts"]
         c = data["conflicts"][0]
-        assert c["srt_id"] == 1 and c["converged"] is False, c
+        assert c["srt_id"] == 1, c
+        assert "converged" not in c, "converged 已废，json 里不该再有这个键"
+        assert isinstance(data["churn"], list) and data["churn"], data["churn"]
+        assert data["churn"][-1]["again"] == 0, "最后一批没人再动"
         assert len(c["reversals"]) == 1, c["reversals"]
         assert len(c["trail"]) == 3, c["trail"]
     finally:
@@ -550,40 +631,44 @@ if __name__ == "__main__":
     test("G4 conflicts 数轮次不数条目", test_conflicts_counts_rounds_not_entries)
     test("G5 reversals 抓到改回去", test_reversals_detects_flipback)
     test("G6 reversals 不误报渐进改动", test_reversals_silent_on_monotone_drift)
-    test("G7 converged 两轮一致为真", test_converged_true_when_two_rounds_agree)
-    test("G8 converged 三种为假", test_converged_false_cases)
-    test("G9 疑似回归 exact", test_find_regressions_exact)
-    test("G10 疑似回归 near", test_find_regressions_near)
-    test("G11 无关改动不报", test_find_regressions_ignores_unrelated)
-    test("G12 同批不自比", test_find_regressions_ignores_same_batch)
-    test("G13 retime 与空 old 跳过", test_find_regressions_skips_retime_and_blank_old)
-    test("G14 轨道不同不比", test_find_regressions_respects_track)
-    test("G15 ledger 窗口", test_ledger_window)
+    test("G7 converged 是不可观测的（已删）", test_converged_is_impossible_on_consistent_log)
+    test("G8 settled 排除最近轮次", test_settled_excludes_recent_rounds)
+    test("G8b churn 统计被推翻的行", test_churn_counts_overturned_rows)
+    test("G9 空改动不算一轮", test_history_excludes_noop_text_change)
+    test("G9b 空改动不报疑似回归", test_find_regressions_skips_noop_current)
+    test("G10 疑似回归 exact", test_find_regressions_exact)
+    test("G11 疑似回归 near", test_find_regressions_near)
+    test("G12 无关改动不报", test_find_regressions_ignores_unrelated)
+    test("G13 同批不自比", test_find_regressions_ignores_same_batch)
+    test("G14 retime 与空 old 跳过", test_find_regressions_skips_retime_and_blank_old)
+    test("G15 轨道不同不比", test_find_regressions_respects_track)
+    test("G16 ledger 窗口", test_ledger_window)
 
     print("\n-- 2. regression_check 端到端 --")
-    test("G16 --conflicts 报告三处痕迹", test_regression_check_conflicts)
-    test("G17 --converged 过滤", test_regression_check_converged_filter)
-    test("G18 --ledger 打印台账", test_regression_check_ledger_prints_rows)
-    test("G19 --json 结构", test_regression_check_json_shape)
-    test("G20 选段开关真的起作用", test_regression_check_section_selectors)
-    test("G21 空 log 退出 1", test_regression_check_empty_log)
+    test("G17 --conflicts 报告三处痕迹", test_regression_check_conflicts)
+    test("G18 --settled 过滤", test_regression_check_settled)
+    test("G18b window=0 全部沉住", test_regression_check_window_zero_lists_everything_settled)
+    test("G19 --ledger 打印台账", test_regression_check_ledger_prints_rows)
+    test("G20 --json 结构", test_regression_check_json_shape)
+    test("G21 选段开关真的起作用", test_regression_check_section_selectors)
+    test("G22 空 log 退出 1", test_regression_check_empty_log)
 
     print("\n-- 3. cross_check --regression-window --")
-    test("G22 默认窗口报疑似回归", test_cross_check_reports_regression_by_default)
-    test("G23 window=0 完全关闭", test_cross_check_regression_window_zero_disables)
+    test("G23 默认窗口报疑似回归", test_cross_check_reports_regression_by_default)
+    test("G24 window=0 完全关闭", test_cross_check_regression_window_zero_disables)
 
     print("\n-- 4. 规则表结构性约束 (issue #7) --")
-    test("G24 仓库规则表自检通过", test_shipped_rules_are_valid)
-    test("G25 空串被拒", test_empty_string_rule_is_rejected)
-    test("G26 空白串被拒", test_whitespace_rule_is_rejected)
-    test("G27 坏正则被拒", test_bad_regex_is_rejected)
-    test("G28 非字符串被拒", test_non_string_rule_is_rejected)
-    test("G29 None 合法", test_none_rule_is_accepted)
-    test("G30 规则坏了 check_line/check_slice 当场炸", test_check_line_raises_on_broken_rules)
-    test("G31 audit_rules 分组计数", test_audit_rules_counts)
-    test("G32 --audit-rules 输出", test_audit_rules_cli)
-    test("G33 缺参数报错", test_cli_requires_slice_without_audit)
-    test("G34 坏规则启动 exit 2", test_cli_broken_rules_exit_2)
+    test("G25 仓库规则表自检通过", test_shipped_rules_are_valid)
+    test("G26 空串被拒", test_empty_string_rule_is_rejected)
+    test("G27 空白串被拒", test_whitespace_rule_is_rejected)
+    test("G28 坏正则被拒", test_bad_regex_is_rejected)
+    test("G29 非字符串被拒", test_non_string_rule_is_rejected)
+    test("G30 None 合法", test_none_rule_is_accepted)
+    test("G31 规则坏了 check_line/check_slice 当场炸", test_check_line_raises_on_broken_rules)
+    test("G32 audit_rules 分组计数", test_audit_rules_counts)
+    test("G33 --audit-rules 输出", test_audit_rules_cli)
+    test("G34 缺参数报错", test_cli_requires_slice_without_audit)
+    test("G35 坏规则启动 exit 2", test_cli_broken_rules_exit_2)
 
     print()
     print(f"  通过 {PASS} / 失败 {FAIL}")
