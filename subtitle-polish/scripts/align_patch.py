@@ -309,7 +309,13 @@ def main():
         spec = data.get("curve")
         if spec is None:
             if "curve_applicable" in data:
-                raise SystemExit("这份审计判 PASS，没输出曲线——不需要改时间轴。")
+                v = data.get("verdict") or "PASS"
+                if v == "UNVERIFIED":
+                    raise SystemExit(
+                        "这份审计判 UNVERIFIED（没验出来，不是通过），没有曲线可施加。\n"
+                        "先调小 --window/--min-n 让分时段凑够样本，再复测。")
+                raise SystemExit(
+                    "这份审计判 %s，没输出曲线——不需要改时间轴。" % v)
             spec = data  # 手写 spec
         if "kind" not in spec:
             raise SystemExit("spec 里没有 kind 字段，无法解释偏移函数：%s" % args.spec)

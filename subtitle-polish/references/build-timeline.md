@@ -18,15 +18,22 @@ python scripts/extract_subs.py --media S06E01.mkv --list
 python scripts/extract_subs.py --media S06E01.mkv \
     --out .subtitle-polish/streams --format srt
 
-# ③ 判轴：哪条与音频是一伙的
+# ③ 判轴：哪条与音频是一伙的（--write-credential 顺手把凭据写掉）
 python scripts/align_audit.py --sub streams/S06E01.s0.uk.srt \
     --asr-words asr_words_E01.json \
     --compare streams/S06E01.s1.us.srt \
     --compare streams/S06E01.s2.uk.sdh.srt \
-    --compare streams/S06E01.s3.us.sdh.srt
+    --compare streams/S06E01.s3.us.sdh.srt \
+    --write-credential --source-index 0 --source-family UK
 
 # ④ 只有在「没有同轴流」时才需要对轴（见 §3）
+
+# ⑤ 开工前确认凭据有效（毫秒级；翻译 pipeline 从这一步之后接手）
+python scripts/timeline_gate.py streams/S06E01.s0.uk.srt --media S06E01.mkv
 ```
+
+第 ③ 步产出的 `<episode>.ts.json` 就是**交给下一环的凭证**：翻译 pipeline 不必再验一遍，
+但也不能在凭据缺失时声称轴是对的。字段与失效规则见 `timeline-credential.md`。
 
 ---
 

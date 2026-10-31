@@ -184,6 +184,10 @@ python scripts/align_patch.py --sub a.srt --spec step.json --write
 
 # ⑤ 复测（同一份 asr-words 缓存，秒出）
 python scripts/align_audit.py --sub a.ass --asr-words w.json
+
+# ⑥ 写凭据 + 过闸门（阶段 0 与结案都要）
+python scripts/align_audit.py --sub a.ass --media m.mkv --write-credential
+python scripts/timeline_gate.py a.ass --media m.mkv
 ```
 
 模型目录：whisper 用 `large-v3`（首次会自动下载或指定本地目录）；qwen 需本地 `Qwen3-ForcedAligner-0.6B`。
@@ -194,7 +198,7 @@ python scripts/align_audit.py --sub a.ass --asr-words w.json
 
 ## 9. 结案口径
 
-字幕交付前三条都要过：
+字幕交付前三条都要过，而且**每条只有三态**（PASS 0 / FAIL 2 / UNVERIFIED 3）：
 
 ```bash
 python scripts/verify_fixes.py --batch-id <ts>    # 改的东西写进去了
@@ -222,3 +226,23 @@ python scripts/align_audit.py  --sub <ass> --media <片源>   # 写进去的东�
 **这次测试抓出的 bug**：曲线拟合早期写死 `run = max(run, c)`，假设偏移单向增大；遇到「字幕被推晚、delta 递减」的样本会把阶梯夹平，再由一个离群窄段反转成正向 +1.26——照它施加比不修更糟。同时窄段离群点会把阶跃边界带偏（真值 1337.9 s → 拟合 1102.7 s，中间 236 s 多推 0.44 s）。修法是方向感知单调 + 最小段长 + 局部中位滤波，见 §5。
 
 **已知限制**：单轮恢复 85~90%，残余 0.1~0.2 s（随位移量成比例少测，机制见 §5）。二轮实测没有可修内容（可修量 0.10 s，形态为孤立阶跃＝噪声），**这条链路的终点就是 0.1~0.2 s**。要更紧只能改输入——先判轴，别对着本来就同轴的流做对齐。
+
+---
+
+## 11. 凭据与三态（issue #9 / #10）
+
+审计算出的结论必须落成文件，否则它只活在终端输出里，下一个环节读不到。
+
+```bash
+python scripts/align_audit.py --sub a.ass --media m.mkv --write-credential
+# -> a.ts.json   （PASS 与 FAIL 都写）
+
+python scripts/timeline_gate.py a.ass --media m.mkv
+# -> 0 PASS / 2 FAIL / 3 UNVERIFIED / 4 AMBIGUOUS
+```
+
+**关键点是不给「静默跳过」留路。** 文档里写「报告里要注明未验时间轴」是软约束，赶工时一定被跳过；只有退出码非零，agent 才会真的停下来。
+
+**陈旧性优先于结论**：一份写着 PASS 的凭据，如果片源换了、文件被改过、或者改过时间轴没复测，它描述的都是过去的状态，必须判 UNVERIFIED 而不是放行。
+
+完整字段与判定顺序见 `timeline-credential.md`。
