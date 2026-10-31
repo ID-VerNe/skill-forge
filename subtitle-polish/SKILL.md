@@ -1,6 +1,6 @@
 ---
 name: subtitle-polish
-version: 1.8.3
+version: 1.9.0
 description: 字幕精校,支持自动/手动两种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。自动模式:输入 ASS 双语成品 + SRT 源,走 审计→人确认→修复 全流程,修复由脚本执行(dry-run/accept/rollback)。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。给了片源时可对音频做时间轴审计与修复(align_audit/align_patch)。也支持 /subtitle-polish 命令。
 ---
 
@@ -87,6 +87,8 @@ python <skill>/scripts/apply_fixes.py --rollback batch=<ts>_manual  # 回滚
 python <skill>/scripts/verify_fixes.py --batch-id <ts>   # 盘面 == log
 python <skill>/scripts/cross_check.py   --batch-id <ts>  # 中英对照复核
 python <skill>/scripts/align_audit.py   --sub <ass> --media <片源> --write-credential  # 对音频对齐
+python <skill>/scripts/align_audit.py   --sub <ass> --media <片源> --engine qwen \
+       --model <qwen3-aligner 目录>    # 精测(分块按显存自动选,不要手写 240)
 python <skill>/scripts/timeline_gate.py <ass> --media <片源>        # 凭据闸门(毫秒级)
 ```
 
@@ -162,7 +164,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --window 3
 | `cross_check.py` | 中英对照复核 + 撞车预警 + 动到历史结论 | 两模式 |
 | `regression_check.py` | 跨轮次台账/连续改动/批次沉住度(只读 log,不跑模型) | 两模式 |
 | `extract_subs.py` | 列/抽片源内嵌字幕流(判轴的前置) | 前置 |
-| `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎) | 两模式 |
+| `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎);qwen 分块按空闲显存自动规划 | 两模式 |
 | `align_patch.py` | 按偏移量改时间轴(线性/曲线/重定时);写 log、`--revert` 撤销 | 两模式 |
 | `timeline_gate.py` | 读凭据判时间轴能否用于开工(不跑模型) | 两模式 |
 | `precheck_timeline.py` | L0 结构哨兵:秒级时间轴体检(不加载模型) | 前置 |
