@@ -24,11 +24,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 CODEC_EXT = {
     "ass": ".ass", "ssa": ".ass", "subrip": ".srt", "srt": ".srt",
@@ -142,6 +145,50 @@ def extract(media, streams, out_dir, fmt, only=None):
     return picked
 
 
+def run_axis(media, picked, out_dir, asr_words=None):
+    """抽完直接判轴：一次 ASR，比对全部候选，把结论写进凭据。
+
+    一次而不是 N 次：`--compare` 复用同一份词级时间戳，4 条流也只跑一次模型。
+    `--credential-target chosen` 让凭据落在判定出的那条流上——判轴的产出就是
+    「这一集的轴定在哪」，凭据必须跟着结论走，而不是跟着第一个候选走。
+    """
+    primary = picked[0][1]
+    cmd = [sys.executable, os.path.join(HERE, "align_audit.py"),
+           "--sub", primary, "--media", media,
+           "--json", os.path.join(out_dir, "axis.json"),
+           "--report", os.path.join(out_dir, "axis.md"),
+           "--write-credential", "--credential-target", "chosen"]
+    for _k, path, _s in picked[1:]:
+        cmd += ["--compare", path]
+    if asr_words:
+        cmd += ["--asr-words", asr_words]
+
+    print("\n判轴（一次 ASR 比对 %d 条候选）" % len(picked))
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    out = (r.stdout or "") + (r.stderr or "")
+    for line in out.splitlines():
+        if line.startswith(("[axis]", "  轴族", "    ", "  →", "  [cred]")):
+            print(line)
+        elif "判定" in line or "MAD" in line:
+            print("  " + line.strip())
+
+    jp = os.path.join(out_dir, "axis.json")
+    res = None
+    if os.path.exists(jp):
+        try:
+            with open(jp, encoding="utf-8") as f:
+                res = json.load(f).get("axis")
+        except Exception:
+            res = None
+    if res:
+        print("\n  结论 %s —— %s" % (res["verdict"], res.get("reason", "")))
+        if res.get("chosen"):
+            print("  用 %s" % res["chosen"])
+        return {"code": res["code"], "axis": res}
+    print("  [!] 没拿到判定结果，原始输出：\n%s" % out[-1200:])
+    return {"code": 3, "axis": None}
+
+
 def main():
     ap = argparse.ArgumentParser(description="从片源抽字幕流")
     ap.add_argument("--media", required=True, help="MKV/MP4 等容器")
@@ -150,6 +197,9 @@ def main():
     ap.add_argument("--format", choices=["srt", "ass", "keep"], default="srt",
                     help="输出格式（默认 srt：避开样式名不是『英文』的坑）")
     ap.add_argument("--index", help="只抽指定序号（按 --list 的 s:N，逗号分隔，如 2,3）")
+    ap.add_argument("--axis", action="store_true",
+                    help="抽完直接判轴并把结论写进 <episode>.ts.json（需要片源音频）")
+    ap.add_argument("--asr-words", help="--axis 用：复用已有词级时间戳，跳过模型")
     args = ap.parse_args()
 
     streams = probe(args.media)
@@ -162,11 +212,22 @@ def main():
         only = {int(x.strip()) for x in args.index.split(",") if x.strip() != ""}
     print("\n抽流 -> %s（格式 %s）" % (args.out, args.format))
     picked = extract(args.media, streams, args.out, args.format, only)
+
+    if args.axis and picked:
+        if len(picked) == 1:
+            print("\n只有一条流，用不着判轴；直接写凭据：")
+            print("  python align_audit.py --sub %s --media %s --write-credential"
+                  % (picked[0][1], args.media))
+            return
+        res = run_axis(args.media, picked, args.out, args.asr_words)
+        sys.exit(res["code"])
+
     if len(picked) > 1:
         print("\n下一步：判哪条与音频同轴（不要把第一条当默认）")
         print("  python align_audit.py --sub %s --media %s --compare %s ..."
               % (picked[0][1], args.media,
                  " --compare ".join(p[1] for p in picked[1:])))
+        print("  或直接加 --axis 让脚本自己判（--asr-words 可复用缓存）")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,10 @@ python scripts/extract_subs.py --media S06E01.mkv --list
 python scripts/extract_subs.py --media S06E01.mkv \
     --out .subtitle-polish/streams --format srt
 
-# ③ 判轴：哪条与音频是一伙的（--write-credential 顺手把凭据写掉）
+# ③ 判轴：哪条与音频是一伙的（--axis 会一次 ASR 比对全部候选）
+python scripts/extract_subs.py --media S06E01.mkv --out streams --axis
+
+# ③b 手工版（想看中间过程时用）
 python scripts/align_audit.py --sub streams/S06E01.s0.uk.srt \
     --asr-words asr_words_E01.json \
     --compare streams/S06E01.s1.us.srt \

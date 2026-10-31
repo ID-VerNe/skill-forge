@@ -1,6 +1,6 @@
 ---
 name: subtitle-polish
-version: 1.5.0
+version: 1.6.0
 description: 字幕精校,支持自动/手动两种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。自动模式:输入 ASS 双语成品 + SRT 源,走 审计→人确认→修复 全流程,修复由脚本执行(dry-run/accept/rollback)。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。给了片源时可对音频做时间轴审计与修复(align_audit/align_patch)。也支持 /subtitle-polish 命令。
 ---
 
@@ -134,7 +134,7 @@ python <skill>/scripts/timeline_gate.py <ass> --media <片源>        # 凭据�
 └── scripts/                    # extract_slice / apply_fixes / global_replace
                                 #   / verify_fixes / cross_check / precheck_punct / pre_audit
                                 #   / extract_subs / align_audit / align_patch
-                                #   / timeline_gate + lib/
+                                #   / timeline_gate / precheck_timeline + lib/
 ```
 
 脚本速查:
@@ -152,6 +152,7 @@ python <skill>/scripts/timeline_gate.py <ass> --media <片源>        # 凭据�
 | `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎) | 两模式 |
 | `align_patch.py` | 按偏移量改时间轴(线性/曲线/重定时) | 两模式 |
 | `timeline_gate.py` | 读凭据判时间轴能否用于开工(不跑模型) | 两模式 |
+| `precheck_timeline.py` | L0 结构哨兵:秒级时间轴体检(不加载模型) | 前置 |
 
 项目产物(不进 skill):
 ```

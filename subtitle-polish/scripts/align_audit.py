@@ -37,6 +37,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import align_core as ac
+from lib import axis as ax
 from lib import credential as cred
 from lib import verdict as V
 
@@ -175,7 +176,7 @@ def print_summary(name, stats, n_rows, engine):
             for w in stats["windows"]))
 
 
-def build_report(args, stats, n_rows, engine, compare):
+def build_report(args, stats, n_rows, engine, compare, axis_res=None):
     L = ["# 对齐审计 · %s" % os.path.basename(args.sub), ""]
     if args.media_path.startswith("("):
         L.append("- 音频：%s（仅用缓存的词级时间戳）" % args.media_path)
@@ -246,10 +247,16 @@ def build_report(args, stats, n_rows, engine, compare):
             L.append("| %s | %d | %s | %.3f | %+.6f | %s s |"
                      % (label, cst["n_pairs"], _fmt(cst["median"]), cst["mad"],
                         cst["slope"], _fmt(cst["drift"], 2)))
-        best = min([(stats["mad"], os.path.basename(args.sub))]
-                   + [(c["mad"], lb) for lb, c in compare])
         L.append("")
-        L.append("→ 最贴合音频的是 **%s**（MAD %.3f）。" % (best[1], best[0]))
+        if axis_res:
+            L.append("**判定 %s** —— %s" % (axis_res["verdict"], axis_res.get("reason", "")))
+            L.append("")
+            if axis_res["verdict"] == "AMBIGUOUS":
+                L.append("> 候选之间差距在噪声带内，**不给出结论**。"
+                         "换 `--engine qwen` 复测，或人工确认用的是哪条流。")
+            elif axis_res["verdict"] == "NO_CANDIDATE":
+                L.append("> 没有一条候选过绝对门。片源可能不是这批字幕对应的版本，"
+                         "别在错的候选里挑「相对最好」的那条。")
         L.append("")
     L.append("## 建议")
     L.append("")
@@ -318,6 +325,8 @@ def main():
     ap.add_argument("--source-title", default=None, help="该流的标题")
     ap.add_argument("--source-family", default=None,
                     help="轴族短标签，如 UK / US（判轴时由 #11 自动填，也可手填）")
+    ap.add_argument("--credential-target", choices=["sub", "chosen"], default="sub",
+                    help="凭据写给谁：sub=--sub 这份（默认）；chosen=判定的胜者（判轴时用）")
     ap.add_argument("--strict", dest="strict", action="store_true", default=True,
                     help="按判定返回退出码（默认开）")
     ap.add_argument("--no-strict", dest="strict", action="store_false",
@@ -373,8 +382,9 @@ def main():
     stats = ac.summarize(pairs, args.window, tol, args.min_n)
     print_summary(os.path.basename(args.sub), stats, len(rows), engine)
 
-    # 3) 轴归属
+    # 3) 轴归属 —— 判的是「哪条可信」，不是「哪条最小」
     compare = []
+    compare_lookup = {}
     for ref in args.compare:
         ref_rows = ac.load_rows(ref, args.track or None)
         if not ref_rows:
@@ -385,14 +395,29 @@ def main():
             continue
         cst = ac.summarize(rp, args.window, tol, args.min_n)
         compare.append((os.path.basename(ref), cst))
-        print("  vs %-28s 中位 %s  MAD %.3f  斜率 %+.6f  全长 %s s"
+        compare_lookup[os.path.basename(ref)] = cst
+        print("  vs %-28s 中位 %s  MAD %.3f  斜率 %+.6f  全长 %s s  %s"
               % (os.path.basename(ref), _fmt(cst["median"]), cst["mad"],
-                 cst["slope"], _fmt(cst["drift"], 2)))
+                 cst["slope"], _fmt(cst["drift"], 2), cst["verdict"]))
+
+    axis_res = None
+    label_path = {os.path.basename(args.sub): args.sub}
+    for _p in args.compare:
+        label_path[os.path.basename(_p)] = _p
+    if compare:
+        cands = [{"label": os.path.basename(args.sub), "mad": stats["mad"],
+                  "ok": stats["ok"], "n_pairs": stats["n_pairs"]}]
+        cands += [{"label": lb, "mad": c["mad"], "ok": c["ok"],
+                   "n_pairs": c["n_pairs"]} for lb, c in compare]
+        axis_res = ax.adjudicate(cands)
+        print("\n[axis] " + ax.render(axis_res).strip())
+        if axis_res["chosen"] and axis_res["chosen"] != os.path.basename(args.sub):
+            print("  → 应当使用 **%s**，当前 --sub 这条不是同轴的。" % axis_res["chosen"])
 
     # 4) 落盘
     if args.report:
         os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
-        text = build_report(args, stats, len(rows), engine, compare)
+        text = build_report(args, stats, len(rows), engine, compare, axis_res)
         with open(args.report, "w", encoding="utf-8") as f:
             f.write(text + "\n")
         print("\n[report] %s" % args.report)
@@ -414,6 +439,7 @@ def main():
             "curve_base": round(base, 4) if stats["verdict"] == "FAIL" else 0.0,
             "curve_applicable": stats["verdict"] == "FAIL",
             "verdict": stats["verdict"],
+            "axis": axis_res,
         }
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=1)
@@ -426,20 +452,41 @@ def main():
     #    只写 PASS 的话，FAIL 在 gate 眼里会退化成「没有凭据」，分不出
     #    「验过、不对」和「没验过」——那正是 #10 要消灭的二义性。
     if args.write_credential:
+        # 默认给 --sub 写（「我让你审的这份是不是对的」）；
+        # --credential-target chosen 时给判定出的胜者写（「这一集的轴定在哪条流上」）。
+        # 两者不能混：拿别的文件的 PASS 去给错轴的文件背书是最糟的假绿。
+        cred_sub, cred_stats = args.sub, stats
+        if args.credential_target == "chosen" and axis_res and axis_res.get("chosen"):
+            c = axis_res["chosen"]
+            if c != os.path.basename(args.sub) and c in label_path:
+                cred_sub = label_path[c]
+                cred_stats = dict(compare_lookup[c])
+                print("[cred]   目标改为判定胜者：%s" % os.path.basename(cred_sub))
+        stats = cred_stats if cred_sub != args.sub else stats
+        # source 优先取判定出的胜者，其次取显式参数，最后从文件名反解。
+        # 「--source-index 靠人回忆着填」等于凭据本身没被验证过。
+        src_file = (axis_res or {}).get("chosen") or os.path.basename(args.sub)
+        tag = ax.parse_stream_tag(src_file)
         data = cred.build(
-            args.sub, stats, engine,
+            cred_sub, stats, engine,
             media=args.media if args.media and not args.media.startswith("(") else None,
-            source={"kind": "embedded_stream" if args.source_index is not None else "unknown",
-                    "index": args.source_index,
-                    "title": args.source_title,
-                    "family": args.source_family or "unknown"},
-            cross_checked=bool(compare) and len(compare) >= 1,
+            source={"kind": "embedded_stream" if tag["index"] is not None else "unknown",
+                    "index": (args.source_index if args.source_index is not None
+                              else tag["index"]),
+                    "title": args.source_title or src_file,
+                    "family": args.source_family or tag["family"],
+                    "sdh": tag["sdh"]},
+            cross_checked=bool(axis_res and axis_res.get("cross_checked")),
         )
         data["axis"]["total"] = len(rows)
-        p = cred.save(args.sub, data)
+        p = cred.save(cred_sub, data)
         print("[cred]   %s  verdict=%s" % (p, data["axis"]["verdict"]))
 
     code = V.from_verdict(stats["verdict"])
+    # 轴判定比单文件判定更「上层」：主文件 FAIL 是 2，但若多条候选无法区分，
+    # 说明不知道该信谁，必须报 AMBIGUOUS(4) 让人来看，不能当成「修一下就好」。
+    if axis_res and axis_res["code"] == V.AMBIGUOUS and code == V.PASS:
+        code = V.AMBIGUOUS
     if args.strict:
         sys.exit(code)
     print("\n[!] --no-strict：判定为 %s，但按调试模式返回 0。" % V.label(code))

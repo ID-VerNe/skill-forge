@@ -24,6 +24,14 @@
 
   没有片源的批次跑不了闸门，此时按 UNVERIFIED 交付（见 11 节），不要把它当成「环境检查通过」。
 
+- **L0 结构哨兵（可选，秒级）**：闸门之前想先看个大概，或手上还没有凭据：
+
+  ```bash
+  python <skill>/scripts/precheck_timeline.py <ass_or_dir> --media <片源> --baseline <条数/分>
+  ```
+
+  它只查包络越界、尾部缺口、长空洞、密度异常，不加载模型。**PASS 不等于轴对**，只表示没发现结构性错——别拿它代替 2.6。
+
 ## 1. 配对
 
 - 多文件：用 `lib/ass_srt_pair.pair_dirs(ass_dir, srt_dir)` 同名配对。
