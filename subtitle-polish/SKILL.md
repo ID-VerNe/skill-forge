@@ -15,6 +15,8 @@ description: 字幕精校,支持自动/手动两种模式。用户说"精校字�
 
 - 输入:ASS 双语成品(英文行 + 中文行成对,track 取值 `英文/中文/注释`)+ SRT 源(权威英文)
 - 可选:片源(MKV/MP4 或已抽好的 wav)。给了才能验时间轴,详见 `references/align-audit.md`
+- **翻译前的第 0 步**:若手上只有片源,先用 `extract_subs.py` 抽内嵌字幕流 + `align_audit --compare` 判轴,
+  拿到一条与音频同轴的英文 SRT 再开工。时间轴应在翻译前建立,不是交付前抢救——见 `references/build-timeline.md`
 - 不适用:无 SRT 源(拒绝运行)、VTT/单语成品、SRT 双语(不处理)
 - 修复手段:文本改走 extract_slice / apply_fixes / global_replace,时间改走 align_patch,
   **不直接 Edit ASS**
@@ -118,11 +120,12 @@ python <skill>/scripts/align_audit.py   --sub <ass> --media <片源>  # 对音�
 │   ├── punct-rules.md          # 标点规则细节
 │   ├── pre-audit.md            # 三轨预审用法
 │   ├── align-audit.md          # 对音频的时间轴审计与修复
+│   ├── build-timeline.md       # 翻译前先从片源建立可信时间轴
 │   └── prompt-injection.md     # prompt 构造约束
 ├── prompts/                    # audit/verify/synthesize 模板
 └── scripts/                    # extract_slice / apply_fixes / global_replace
                                 #   / verify_fixes / cross_check / precheck_punct / pre_audit
-                                #   / align_audit / align_patch + lib/
+                                #   / extract_subs / align_audit / align_patch + lib/
 ```
 
 脚本速查:
@@ -136,6 +139,7 @@ python <skill>/scripts/align_audit.py   --sub <ass> --media <片源>  # 对音�
 | `global_replace.py` | 跨文件纯文本替换 | 两模式 |
 | `verify_fixes.py` | 核验 log 已落盘 | 两模式 |
 | `cross_check.py` | 中英对照复核 + 撞车预警 | 两模式 |
+| `extract_subs.py` | 列/抽片源内嵌字幕流(判轴的前置) | 前置 |
 | `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎) | 两模式 |
 | `align_patch.py` | 按偏移量改时间轴(线性/曲线/重定时) | 两模式 |
 

@@ -46,6 +46,7 @@ ass 与 srt 可以是目录或单文件。多文件默认同名配对（去扩�
 - **特效标签自动还原**：replace/swap 时自动提取并保留原行 `{\be3}`、`{\an8}` 等前导标签，与 `final_new` 自带标签合并去重。
 - **标点预检**：`precheck_punct.py` 对照 translate_principle pipeline 的标点规则，精校前先规范化中文行（`……`→`…`、`，。、`→空格、数字间 `.` `,` 保留等），英文行不动。
 - **文本对 ≠ 时间对**：`verify_fixes` 与 `cross_check` 都不读时间字段，两者全绿时整集仍可能偏轴 2.9 秒。给了片源就必须跑 `align_audit.py`，判据是分时段 delta 中位极差（不是 delta 是否接近 0），且**不能对片源内嵌字幕流代替音频**。详见 `references/align-audit.md`。
+- **时间轴在翻译前建立，不在交付前抢救**：先用 `extract_subs.py` 抽流、`align_audit --compare` 判轴——多数片源里本来就有同轴的那一条。判轴优先于对轴，详见 `references/build-timeline.md`。
 
 ## 脚本
 
@@ -56,6 +57,7 @@ ass 与 srt 可以是目录或单文件。多文件默认同名配对（去扩�
 | `scripts/apply_fixes.py` | replace/delete/swap，dry-run/accept/rollback，自动还原特效标签 |
 | `scripts/verify_fixes.py` | 执行后验证：读 log.jsonl 按 srt_id 重读 ASS，核对 new_text 落盘 |
 | `scripts/global_replace.py` | 跨文件统一专名，可选 track |
+| `scripts/extract_subs.py` | 列 / 抽片源内嵌字幕流（判轴的前置） |
 | `scripts/align_audit.py` | **对音频**测时间偏差：分时段 delta 中位极差、线性斜率、轴归属（whisper/qwen 双引擎） |
 | `scripts/align_patch.py` | 改时间轴：线性补偿 / 分段曲线 / 逐条重定时，只替换时间字段，其余字节原样 |
 | `scripts/lib/` | time_fmt / ass_srt_pair / log / tags / paths / align_core 工具 |

@@ -83,18 +83,28 @@ def words_of(text: str):
 def load_rows(path: str, track=TRACK_EN):
     """读字幕为 [(start_sec, end_sec, text)]，按起始时间排序。
 
-    .ass/.ssa：按 track 过滤（`track=None` 表示不过滤，取全部对白）。
+    .ass/.ssa：按 track 过滤；`track=None` 不过滤。
     .srt/.vtt：全量。注释行跳过。
+
+    **过滤后为空时自动回退到全量**并告警：从片源抽出来的单语字幕流样式名
+    通常是 `Default` 之类，按 `英文` 过滤会一条都读不到。
     """
     subs = pysubs2.load(path, encoding="utf-8-sig")
     is_ass = path.lower().endswith((".ass", ".ssa"))
-    rows = []
+    rows, dropped = [], 0
     for ev in subs:
         if getattr(ev, "is_comment", False):
             continue
         if is_ass and track and style_to_track(ev.style) != track:
+            dropped += 1
             continue
         rows.append((ev.start / 1000.0, ev.end / 1000.0, ev.text))
+    if is_ass and track and not rows and dropped:
+        import sys as _sys
+        print("[warn] %s 里没有样式 %r（抽出的单语流常见），按全量 %d 条读取"
+              % (os.path.basename(path), track, dropped), file=_sys.stderr)
+        rows = [(ev.start / 1000.0, ev.end / 1000.0, ev.text)
+                for ev in subs if not getattr(ev, "is_comment", False)]
     rows.sort(key=lambda r: r[0])
     return rows
 
