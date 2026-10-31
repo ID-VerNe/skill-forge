@@ -185,6 +185,31 @@ python scripts/extract_subs.py --media S06E01.mkv --out streams --axis
 
 ---
 
+## 6b. 改完之后：记账、复测、可撤销
+
+`align_patch --write` 之后会自动做三件事，缺一不可：
+
+| 动作 | 为什么 |
+|---|---|
+| 写 `log.jsonl`（`action=retime_curve`） | 否则 `--rollback batch=` 回滚完文本、时间还错着，**回滚本身变成新的错误** |
+| 让时间轴凭据失效（`patched_at > computed_at`） | 闸门立刻转 UNVERIFIED，逼你复测 |
+| 记 `backups.jsonl` | `.bak` 不进 git，至少要能枚举、能对上是哪次操作 |
+
+撤销一次曲线：
+
+```bash
+python scripts/align_patch.py --sub a.ass --revert
+```
+
+从记录的 `backup` 整文件还原（逐字节），并补记一条 `revert_curve`。**不要**用
+`apply_fixes --rollback` 撤曲线——那是按行反向加回去，会累积浮点误差，也处理不了
+当时被钳位到 0 的条目。
+
+`verify_fixes` 会把 `retime_curve` 单列成「待复测」，既不算通过也不算失败：
+它动的是时间不是文本，「0 失败」不能替它背书。
+
+---
+
 ## 7. 三个必须处理的坑
 
 **① 分块切在句中**。强制对齐按块喂文本，块边界切断了句子，该行就会锚到块首——实测 `ass 602.12 → align 600.00`，差 −2.12 s。`--chunk` 的边界必须在目标块长 ±45 s 内找**最大字幕间隙**，前后再留 2 s 余量。
@@ -305,6 +330,26 @@ python scripts/precheck_timeline.py S06E01.ass --media S06E01.mkv --baseline 16.
 正常字幕的末条本来就落在片长的 0.90~0.99 之间（E01 实测 0.9688），比值同时受「片尾留白」和「帧率换算」两个未知量影响——**一个端点解不出两个未知数**。按 0.9688×1.0427 去修，整片会被推 110 秒。
 
 改成「尾部缺口 + 该段有没有对白」：差多少秒是观测值，有没有声音是验证过的，两者都成立才算问题。真因可能是截断、帧率错配或基准错位，报告里列出来，但**不假装能分辨**。
+
+### 拟合诊断：`spec_from_pairs` 现在会拒绝
+
+`align_audit --json` 里的 `fit` 字段：
+
+```json
+{"verdict":"FIT_OK","p90":0.13,"r2":0.94,"segs":4,"direction":-1,
+ "breaks":[],"hit_max_seg":false,"hit_min_pts":false}
+```
+
+- `direction` 由 **Theil-Sen 斜率**给出，不再比较首末两段——末段常是合并不全的窄段，
+  用它决定方向，一翻向就会把整条曲线夹平、末尾反转（v1.4.0 那次的 +1.26s 就是这么来的）
+- `p90 > 0.4` → `FIT_REJECTED`，`curve` 为 `null`，`align_patch` 拒绝施加。
+  阈值来由：正常阶梯拟合残差 P90 实测 0.13s，方法地板 0.1~0.2s，0.4 是地板的 2 倍
+- `breaks` 记录相邻段的反向冲突（> 0.15s）。**不夹平也不反转**——那两件事只有人能判，
+  可能是真实重剪接
+- `hit_max_seg` / `hit_min_pts` 表示拟合顶到了参数上限，实际形态可能更复杂
+
+被拒时改用 `--slope` 做线性补偿，或分区段手工处理。**不要**把 `FIT_REJECTED` 当成
+「拟合失败重试一下」——它说的是「这批数据不是分段常数形态」，重试没用。
 
 ### 边界（必须写在帮助里）
 

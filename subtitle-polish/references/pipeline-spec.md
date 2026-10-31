@@ -176,13 +176,40 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 ```
 一行一条。不进 git。
 
-**action 取值**：`replace | delete | swap | insert | retime | manual_edit | rollback | precheck_punct`。`manual_edit` 由 `apply_fixes.py --manual-log` 补记（破例 Edit ASS 兜底，见 `manual-flow.md` 兜底节）。
+**action 取值**：`replace | delete | swap | insert | retime | manual_edit | rollback | precheck_punct | retime_curve | revert_curve`。`manual_edit` 由 `apply_fixes.py --manual-log` 补记（破例 Edit ASS 兜底，见 `manual-flow.md` 兜底节）。
 
 **字段说明**：
 - `file`：归一化为绝对路径存储，rollback 比较时容忍相对路径/斜杠方向差异（filter_log 用 `_norm_file` 归一化两端比较）。
 - `old_text` / `new_text`：都记**实际落盘的 ASS 文本**（含合并后的 `{\be3}` 等标签），forward 与 rollback 对称、可重放。replace 的 new_text = `_replace_text` 后的 `e.text`（不是 fixes 里的裸 final_new）。
 - **`retime` 是唯一的例外**：它的 `old_text` / `new_text` 存**时间串** `"<start>-<end>"`（秒，两位小数），如 `"1422.12-1425.43"` → `"1422.12-1428.91"`。复用这两个字段是为了不动 `append_log` 签名与已有日志格式。读日志时注意 `action == "retime"` 的行里它们不是文本。
 - rollback 定位：优先 srt_id→timestamp→Dialogue；srt 推不到时用 new_text 去 tag 后在 subs 里搜当前内容（fallback）。`retime` 条目的 new_text 是时间串，**不走 fallback**，只按 srt_id + track 定位。
+
+### 文件级动作：retime_curve / revert_curve
+
+`align_patch` 改的是**整条轴**，不是某一行。硬塞进逐条语义会变成 N 条一模一样的
+记录，所以单列两种 action，`srt_id=0` / `track="*"` 表示「文件级」：
+
+```json
+{"ts":"2026-10-31T14:20:11","batch_id":"20261031_142011","action":"retime_curve",
+ "file":"C:/abs/path/e01.ass","srt_id":0,"track":"*","old_text":"","new_text":"",
+ "spec":{"kind":"curve","segments":[[0,-0.28],[613.6,-0.82]]},
+ "max_shift":-1.94,"n_events":763,"backup":"C:/abs/path/e01.ass.align.bak",
+ "fit":{"verdict":"FIT_OK","p90":0.13,"r2":0.94,"segs":4,"direction":-1},
+ "category":"时间轴","reason":"align_patch"}
+```
+
+- `spec`：实际施加的偏移函数（曲线或线性），可重放
+- `backup`：`.bak` 绝对路径，`--revert` 从它逐字节还原
+- `fit`：当时的拟合诊断。回看历史时才知道**那一次拟合可不可信**——P90 0.13 和 0.38 是两个性质
+
+`verify_fixes` 对这两种 action 不算通过也不算失败，单列「待复测」——它动的是时间，
+不是文本，「0 失败」不能替它背书。
+
+### backups.jsonl
+
+`.subtitle-polish/backups.jsonl` 记 `{ts, batch_id, action, path, backup, sha1}`。
+解决「8 集批量后 16~24 个 `.bak` 混在目录里、哪个对应哪次操作只能猜时间戳」——
+`.bak` 不进 git，误删就没了，至少要能枚举出来。
 
 ## rollback
 
@@ -194,5 +221,10 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 所有操作都留记录，避免单条回滚破坏成对修改（可整 batch 回滚后再选择性重做）。
 
 **manual_edit 的 rollback**：破例 Edit 补记的 `manual_edit` 条目，rollback 时按 `old_text` + track + 时间戳定位回退（同 replace）。`manual_edit` 的 old_text 是 Edit 前的文本，rollback 把它写回去。
+
+**retime_curve 的 rollback**：不走 `apply_fixes --rollback`，用 `align_patch --revert`——
+从记录的 `backup` 整文件还原（逐字节），并补记一条 `revert_curve`。
+分开的原因：曲线是一次作用于全部 N 条的，按行「反向加回去」会累积浮点误差，
+而且没法处理当时被钳位（< 0）的条目。
 
 **retime 的 rollback**：解析 `old_text` 的时间串，把 `start`/`end` 写回。文本不动，所以合并场景（replace + retime + delete）整 batch 回滚时，文本由 replace 那条还原、时间轴由 retime 那条还原。delete 条目回滚仍无法自动重建（脚本只打印提示，需人工补），这是既有限制。
