@@ -1,6 +1,6 @@
 ---
 name: subtitle-polish
-version: 1.7.0
+version: 1.8.0
 description: 字幕精校,支持自动/手动两种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。自动模式:输入 ASS 双语成品 + SRT 源,走 审计→人确认→修复 全流程,修复由脚本执行(dry-run/accept/rollback)。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。给了片源时可对音频做时间轴审计与修复(align_audit/align_patch)。也支持 /subtitle-polish 命令。
 ---
 
@@ -112,6 +112,17 @@ python <skill>/scripts/timeline_gate.py <ass> --media <片源>        # 凭据�
 **每条预警都要人看**;但它召回只有 4/15(其余是「同场景换句」「缩译掩盖漏译」,
 字符串判据抓不到),所以预警表干净**不能**当作全文正确。详见 `references/auto-flow.md` 11b 节。
 
+另外两条判据都只看**当前盘面**,没有「这一行上一轮刚被改过」这个事实。于是同一行
+可能被连续几轮来回改,而每轮 verify 0 失败、cross_check 0 预警——**没有任何信号
+能发现这个来回**(skill-forge issue #5 #6)。所以**每轮动工前**先读台账:
+
+```bash
+python <skill>/scripts/regression_check.py --ledger --conflicts --window 3
+```
+
+台账整段贴进审计 prompt,并要求「判为错误时须说明当时那条理由错在哪」。
+详见 `references/auto-flow.md` 11c 节。
+
 ## 文件结构
 
 ```
@@ -132,7 +143,8 @@ python <skill>/scripts/timeline_gate.py <ass> --media <片源>        # 凭据�
 │   └── prompt-injection.md     # prompt 构造约束
 ├── prompts/                    # audit/verify/synthesize 模板
 └── scripts/                    # extract_slice / apply_fixes / global_replace
-                                #   / verify_fixes / cross_check / precheck_punct / pre_audit
+                                #   / verify_fixes / cross_check / regression_check
+                                #   / precheck_punct / pre_audit
                                 #   / extract_subs / align_audit / align_patch
                                 #   / timeline_gate / precheck_timeline + lib/
 ```
@@ -147,7 +159,8 @@ python <skill>/scripts/timeline_gate.py <ass> --media <片源>        # 凭据�
 | `apply_fixes.py` | 执行 fixes.json / 回滚 / `--manual-log` | 两模式 |
 | `global_replace.py` | 跨文件纯文本替换 | 两模式 |
 | `verify_fixes.py` | 核验 log 已落盘 | 两模式 |
-| `cross_check.py` | 中英对照复核 + 撞车预警 | 两模式 |
+| `cross_check.py` | 中英对照复核 + 撞车预警 + 疑似回归 | 两模式 |
+| `regression_check.py` | 跨轮次台账/连续改动/已收敛(只读 log,不跑模型) | 两模式 |
 | `extract_subs.py` | 列/抽片源内嵌字幕流(判轴的前置) | 前置 |
 | `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎) | 两模式 |
 | `align_patch.py` | 按偏移量改时间轴(线性/曲线/重定时);写 log、`--revert` 撤销 | 两模式 |

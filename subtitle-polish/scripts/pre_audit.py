@@ -8,7 +8,10 @@ audit-report.md，必须经 Claude 独立审计 + verify 后才能进报告。
 三轨：
   轨 1  gemini-3.1-flash-lite：N=5 passes，取 intersection。快稳，信达雅强。
   轨 2  glm-5.2：N=5 passes，reasoning=none，取 intersection。慢但抓硬伤。
-  轨 3  check_fluency：纯规则翻译腔检查，秒级，召回 100%。
+  轨 3  check_fluency：纯规则翻译腔检查，秒级，无 LLM 成本。precision 可用，
+        recall 只覆盖确定性那部分（issue #7：加了英文字段来源对照，去掉
+        忠实直译的假阳性；代价是 "有来源但用得过头" 这类不再报，实测 63 条
+        → 2 条真阳性）。它的价值是**两 LLM 都抓不到确定性命中**，不是覆盖率。
 
 收窄 prompt（禁字符损坏/专名/原文拼写）—— probe 验证过降假阳 82%。
 

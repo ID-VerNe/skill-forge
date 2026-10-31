@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pysubs2
 
 from lib.ass_srt_pair import parse_srt, TRACK_ZH, TRACK_EN
+from lib import regress as rg
 from lib.log import read_log, filter_log
 from lib.paths import resolve_work_dir, report_path
 from lib.tags import extract_leading_tags
@@ -116,13 +117,16 @@ def main():
     ap.add_argument("--collision-only", action="store_true", help="只输出撞车预警")
     ap.add_argument("--window", type=int, default=3, help="邻块窗口，默认 3")
     ap.add_argument("--floor", type=float, default=0.55, help="撞车阈值，默认 0.55")
+    ap.add_argument("--regression-window", type=int, default=3,
+                    help="比对前几个 batch 的历史改动查回归（0=关闭，默认 3）")
     ap.add_argument("--work-dir", default=".subtitle-polish")
     ap.add_argument("--ass", help="成品 ASS（默认从 log 推断）")
     ap.add_argument("--srt-path", help="配对 SRT")
     args = ap.parse_args()
 
     wd = resolve_work_dir(args.work_dir)
-    entries = read_log(wd)
+    all_entries = read_log(wd)
+    entries = all_entries
     if args.batch_id:
         entries = filter_log(entries, batch_id=args.batch_id)
     if not entries:
@@ -205,12 +209,42 @@ def main():
             lines.insert(9 + i, f"| {sid} | {nbr} | {sc:.2f} |")
         lines.insert(9 + len(collisions), "")
 
+    # ---- 疑似回归（issue #5）：本轮的 old_text 命中了历史某轮的 new_text
+    regs = []
+    if args.regression_window > 0 and entries:
+        cur_batch = {e.get("batch_id") for e in entries}
+        past = [e for e in all_entries if e.get("batch_id") not in cur_batch]
+        if args.regression_window:
+            batches = []
+            for e in sorted(past, key=lambda x: x.get("ts", "")):
+                b = e.get("batch_id")
+                if b not in batches:
+                    batches.append(b)
+            keep = set(batches[-args.regression_window:])
+            past = [e for e in past if e.get("batch_id") in keep]
+        regs = rg.find_regressions(entries, past, args.floor)
+
+    if regs:
+        lines += ["", "## 疑似回归：本轮改掉了近几轮刚修好的译文", "",
+                  "| srt | 命中类型 | 相似度 | 本轮 old | 历史 new | 历史 batch |",
+                  "|---|---|---|---|---|---|"]
+        for r in regs:
+            lines.append("| %s | %s | %.2f | %s | %s | %s |" % (
+                r["cur"].get("srt_id"), r["kind"], r["sim"],
+                rg.clean(r["cur"].get("old_text", ""))[:24] or "—",
+                rg.clean(r["hist"].get("new_text", ""))[:24] or "—",
+                r["hist"].get("batch_id", "")))
+        lines += ["",
+                  "> 只报不阻断。改回去有时是对的（上一轮确实改错了），"
+                  "查一下历史 batch 的理由再决定是否 `--rollback batch=<id>`。", ""]
+
     text = "\n".join(lines)
     out = report_path(wd, "cross-check.md")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         f.write(text)
-    print(f"[*] 复核 {len(want)} 块，撞车预警 {len(collisions)} 条")
+    print(f"[*] 复核 {len(want)} 块，撞车预警 {len(collisions)} 条，"
+          f"疑似回归 {len(regs)} 条")
     print(f"[*] 报告写入 {out}")
     return 0
 

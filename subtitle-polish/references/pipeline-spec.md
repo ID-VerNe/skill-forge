@@ -211,6 +211,25 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 解决「8 集批量后 16~24 个 `.bak` 混在目录里、哪个对应哪次操作只能猜时间戳」——
 `.bak` 不进 git，误删就没了，至少要能枚举出来。
 
+### 跨轮次读取：batch_id 是「轮」的键
+
+`log.jsonl` 累积的是**全部历史**，而审计只该看最近几轮。跨轮次判据（`regression_check.py`、
+`cross_check --regression-window`）全靠 `batch_id` 分轮，所以它必须**每次运行唯一**，
+不能在多轮之间复用同一个值——复用会让「同一行被 3 轮改过」退化成「同一轮改了 3 次」，
+`converged()` 也会因为「同一 batch 不算两轮」而永远判不出收敛。
+
+只读 log、不跑模型的四条判据（skill-forge issue #5 #6）：
+
+| 判据 | 看什么 | 产物 |
+|---|---|---|
+| 台账 | 近 N 轮改过哪些行 / 改成什么 / 当时理由 | `regression_check.py --ledger` |
+| 连续改动 | 同一 `(file, srt_id, track)` 被 ≥2 个 batch 改过 | `--conflicts` |
+| 已收敛 | 连续两个 batch 的 `new_text` 相同 | `--converged` |
+| 疑似回归 | 本轮 `old_text` 命中历史某轮的 `new_text`（优先精确命中） | `cross_check --regression-window` |
+
+`retime` / `retime_curve` / `revert_curve` 不参与——它们不动文本，混进来会让
+「这一行被改了几轮」算错。
+
 ## rollback
 
 三种粒度，按 log.jsonl 反向应用 old_text：

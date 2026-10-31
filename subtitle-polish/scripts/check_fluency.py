@@ -24,6 +24,7 @@ LLM（gemini-3.1 / glm-5.2）对书面语召回仅 6-11%，本脚本配合英文
 用法：
   python check_fluency.py <slice.txt> [--out report.json]
   python check_fluency.py <slice.txt>   # 打印到 stdout
+  python check_fluency.py --audit-rules # 只自检规则表，不查字幕
 """
 from __future__ import annotations
 
@@ -72,6 +73,69 @@ MACHINE_PATTERNS = [
     (r"[，。！？]{2,}", "重复标点"),
 ]
 
+
+def validate_rules(rules: Dict[str, object] | None = None) -> List[str]:
+    """启动自检：FORMAL_WORDS 每个值要么是 ``None``，要么是能编译的正则。
+
+    为什么需要这个函数：注释挡不住手滑。往表里加词时最自然的动作是复制上一行
+    再改，很容易留下一个 ``""``。而 ``""`` 在这里是**特别坏的**值：
+
+        if en_pat and re.search(en_pat, en, re.I):   # "" → 假，跳过查源
+            continue
+        confidence = "medium" if en_pat is None else "high"   # "" is None → False → high
+
+    于是空串会静默退化成「查过英文、确认无来源」并且标成 high —— 把一个忘了写
+    来源的词伪装成经过对照的高置信命中。这不是风格问题，是把规则的语义偷偷改了。
+
+    返回问题列表（空 = 通过）。不抛异常，方便测试逐条断言，也方便 main() 决定
+    怎么退出。
+    """
+    table = FORMAL_WORDS if rules is None else rules
+    problems: List[str] = []
+    for word, pat in table.items():
+        if pat is None:
+            continue
+        if not isinstance(pat, str):
+            problems.append(
+                f"{word!r}: 值是 {type(pat).__name__}，只接受 None 或正则字符串")
+            continue
+        if not pat.strip():
+            problems.append(
+                f"{word!r}: 值是空串/空白。空串是 falsy，check_line 会静默"
+                f"退化成「无英文字面对应物」，同时 confidence 仍标 high。"
+                f"无来源请显式写 None，有来源请写真正的正则")
+            continue
+        try:
+            re.compile(pat)
+        except re.error as e:
+            problems.append(f"{word!r}: 正则编译失败（{e}）：{pat}")
+    return problems
+
+
+def _raise_if_rules_invalid() -> None:
+    """check_line / check_slice 的入口闸门。
+
+    放在这里而不是只放 main()，是因为 pre_audit.py 直接 import check_slice，
+    不经过 main()。规则坏了必须在那条路径上也立刻炸，否则一个空串能让预审
+    静默多报一堆假阳性。
+    """
+    problems = validate_rules()
+    if problems:
+        raise ValueError("FORMAL_WORDS 配置有误：\n  - " + "\n  - ".join(problems))
+
+
+def audit_rules(rules: Dict[str, object] | None = None) -> Dict[str, list]:
+    """人工审规则用：把「有英文来源」和「只能靠语境判断」分开列。
+
+    只打印不判定。用途是给加词的人一面镜子：如果他新加的词落进了 bare 组，
+    说明这条规则只能报 medium，不能当 high 用。
+    """
+    table = FORMAL_WORDS if rules is None else rules
+    bare, sourced = [], []
+    for word, pat in table.items():
+        (bare if pat is None else sourced).append(word)
+    return {"total": len(table), "sourced": sorted(sourced), "bare": sorted(bare)}
+
 # 长度比阈值。
 # 注意：ASS 字幕常把一句英文长句按时间轴拆成多行，单行中文看起来"过短"
 # 但和相邻行拼起来译文完整。单行长度比在字幕场景精度接近 0%（实测
@@ -96,6 +160,11 @@ def check_line(en: str, zh: str, len_ratio: bool = False) -> List[Dict]:
 
     每个 hit: {"axis": "达", "rule": ..., "detail": ..., "suggestion": ...}
     """
+    # 规则表坏了就立刻炸，不要带着一个空串继续跑出一堆假阳性。
+    # 不做「首次校验后缓存」：re.compile 本身有缓存，逐行校验的成本是字典遍历，
+    # 而缓存会让「运行中有人改了 FORMAL_WORDS」这种测试场景漏过去。
+    _raise_if_rules_invalid()
+
     hits = []
     # 1. 书面语黑名单（issue #7：先查英文有没有对应来源，避免把忠实直译误判成翻译腔）
     for word, en_pat in FORMAL_WORDS.items():
@@ -179,13 +248,43 @@ def check_slice(slice_path: Path, len_ratio: bool = False) -> List[Dict]:
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("slice", help="切片文件（extract_slice.py 输出）")
+    ap.add_argument("slice", nargs="?", help="切片文件（extract_slice.py 输出）")
     ap.add_argument("--out", help="写 JSON 到此路径（不给则打印到 stdout）")
     ap.add_argument("--summary", action="store_true",
                     help="只打印每类计数摘要，不列明细")
     ap.add_argument("--len-ratio", action="store_true",
                     help="开启长度比检查（默认关——字幕单行精度接近 0%）")
+    ap.add_argument("--audit-rules", action="store_true",
+                    help="只自检并列出规则表（分「有英文来源」/「只能靠语境」两组），不查字幕")
     args = ap.parse_args()
+
+    # 启动自检：先看规则表，再看字幕。规则坏了查字幕没意义——
+    # 空串会静默退化成「无来源 + high」，跑出来的报告是错的但看着像对的。
+    problems = validate_rules()
+    if problems:
+        print("规则自检失败，FORMAL_WORDS 配置有误：", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.audit_rules:
+        a = audit_rules()
+        print(f"规则自检通过：{a['total']} 个词，"
+              f"{len(a['sourced'])} 个有英文来源，{len(a['bare'])} 个无字面对应物")
+        print()
+        print(f"有英文来源（英文对得上就不报，标 confidence=high）：{len(a['sourced'])} 个")
+        print("  " + " / ".join(a["sourced"]))
+        print()
+        print(f"无英文字面对应物（照报，但只能靠语境判断，**不要当 high 报**）："
+              f"{len(a['bare'])} 个")
+        print("  " + (" / ".join(a["bare"]) if a["bare"] else "（无）"))
+        print()
+        print("加词须知：值为 None 表示「英文不会有对应词」（空动词、公文腔虚词）。")
+        print("若这个词在英文里其实有说法，就写来源正则——否则会把忠实直译报成翻译腔。")
+        return
+
+    if not args.slice:
+        ap.error("缺少切片文件（或改用 --audit-rules 只自检规则）")
 
     slice_path = Path(args.slice)
     if not slice_path.is_file():
