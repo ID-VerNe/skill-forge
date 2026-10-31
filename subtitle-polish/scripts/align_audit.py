@@ -100,12 +100,90 @@ def _pick_boundaries(rows, target=240.0):
     return bounds
 
 
-def tokens_qwen(wav, rows, model_dir, chunk=240.0, language="English"):
+# ---------------------------------------------------------------- 分块规划
+#
+# 实测峰值（MiB，含模型常驻，相对「别的程序占用」的基线增量）。
+# 环境：RTX 4060 Laptop 8G / bf16 / 基线 ~1040 MiB / 整集 2648s。
+# 复现：`_probe_aligner_vram.py`（同一套测量法，见本轮记录）。
+#
+#   分块   峰值增量    单块对齐耗时
+#    60s     2461        1.1s
+#    90s     3323        0.8s
+#   120s     4899        1.3s
+#   150s     7872        2.9s     <- 顶到 WDDM 预算
+#   180s     7885       41.0s     <- 开始静默溢出
+#   240s     7898       91.7s
+#
+# 「顶到预算」的判据不是 nvidia-smi 的绝对值，而是它与 torch 自报的差额：
+# 从 150s 起 nvidia-smi 钉在 7898 不动，torch 的 max_memory_allocated 却
+# 从 3756 一路涨到 6162——差额就是被驱动搬到系统内存、走 PCIe 的部分。
+# 它不报错，只变慢（1.3s -> 41s，32 倍）。
+QWEN_PEAK_MIB = {30: 2150, 60: 2461, 90: 3323, 120: 4899}
+# 与 whisperX 项目 core/qwen_pipeline/transcribe.py 的 VRAM_HEADROOM_MIB 同值：
+# 留出的余量要够后续阶段（VAD / diarizer）以及别处 GUI 程序的波动。
+QWEN_VRAM_HEADROOM_MIB = 600
+QWEN_CHUNK_LADDER = (120, 90, 60, 30)
+
+
+def free_vram_mib():
+    """空闲专属显存（MiB），0 表示读不到/没有 CUDA。
+
+    与 whisperX 项目里的 `core.qwen_pipeline.transcribe.free_vram_mib()` 和
+    `core.models_manager.get_free_vram_gb()` **是同一个调用**（torch 的
+    `mem_get_info`），语义一致，所以两边的数字可以直接对照。
+    这里不 import 它，是为了让本脚本脱离那个工程也能跑；换的是取数方式的话
+    才算另造轮子，抄同一行不算。
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free, _ = torch.cuda.mem_get_info()
+            return int(free // (1024 ** 2))
+    except Exception:  # noqa: BLE001 — 探不到就当未知，走保守分支
+        pass
+    return 0
+
+
+def plan_chunk(free_mib=None):
+    """按空闲显存挑分块长度。返回 (chunk_seconds, reason)。
+
+    为什么调分块而不是调精度：bf16 常驻 1849 MiB、fp32 3506 MiB，往低走
+    没有更省的形式（fp16 与 bf16 同宽）；而分块从 120s 放到 240s 多花
+    2.4 GB。**能退的是分段长度，不是精度。**
+
+    `free_mib <= 0` 是「读不到」的哨兵（沿用 whisperX 那边
+    `get_free_vram_gb()` 返回 0.0 表示 unknown 的约定），此时取最小档：
+    代价只是多切几刀，而选大了的代价是静默溢出——慢 30 倍还不报错。
+    取最小档还有个附带好处：曲线对空闲显存单调，不会出现「读到 0 反而
+    比读到 250 更激进」这种说不过去的行为。
+    """
+    if free_mib is None:
+        free_mib = free_vram_mib()
+    smallest = QWEN_CHUNK_LADDER[-1]
+    if free_mib <= 0:
+        return smallest, ("读不到空闲显存，按最小档 %ds 保守切分；"
+                          "关掉占用显存的程序可自动升档" % smallest)
+    for c in QWEN_CHUNK_LADDER:
+        need = QWEN_PEAK_MIB[c] + QWEN_VRAM_HEADROOM_MIB
+        if free_mib >= need:
+            return c, ("空闲 %d MiB >= %d MiB（峰值 %d + 余量 %d）"
+                       % (free_mib, need, QWEN_PEAK_MIB[c],
+                          QWEN_VRAM_HEADROOM_MIB))
+    return smallest, ("空闲仅 %d MiB，低于 %ds 的建议值 %d MiB；"
+                      "关掉占用显存的程序可避免溢出到系统内存"
+                      % (free_mib, smallest,
+                         QWEN_PEAK_MIB[smallest] + QWEN_VRAM_HEADROOM_MIB))
+
+
+def tokens_qwen(wav, rows, model_dir, chunk=None, language="English"):
     """Qwen3-ForcedAligner 分块全局强制对齐 -> 词级时间戳。
 
     与 whisperX 的 align 关键差别：`align(audio, text)` **不接收时间窗**，
     是在给定音频段内对整段文本做全局对齐。原字幕偏 2~3 秒也不影响结果，
     只要块边界留足余量。
+
+    `chunk=None` 时按空闲显存自动规划（见 `plan_chunk`）。旧默认 240s 在
+    8GB 卡上必定溢出，实测整集跑 9~11 分钟；90s 只要 40 秒。
     """
     try:
         import torch
@@ -114,13 +192,19 @@ def tokens_qwen(wav, rows, model_dir, chunk=240.0, language="English"):
     except ImportError as e:
         raise SystemExit("需要 qwen_asr / torch / soundfile：%s" % e)
 
+    if chunk is None:
+        chunk, why = plan_chunk()
+        print("  分块规划：%ds（%s）" % (chunk, why), flush=True)
+
     data, sr = sf.read(wav, dtype="float32")
     total = len(data) / float(sr)
     bounds = _pick_boundaries(rows, chunk)
     edges = [0.0] + bounds + [total]
 
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = Qwen3ForcedAligner.from_pretrained(
-        model_dir, dtype=torch.bfloat16, device_map="cuda")
+        model_dir, dtype=torch.bfloat16, device_map=dev)
+
 
     print("  强制对齐：%d 段，共 %.0fs 音频" % (len(edges) - 1, total), flush=True)
     tokens = []
@@ -312,6 +396,8 @@ def main():
     ap.add_argument("--compare", action="append", default=[],
                     help="附带比对的候选基准（可多次），用于轴归属判定")
     ap.add_argument("--window", type=float, default=180.0, help="分时段窗长（秒）")
+    ap.add_argument("--chunk", type=float, default=None,
+                    help="qwen 引擎的分块时长（秒）；默认按空闲显存自动规划")
     ap.add_argument("--tol", type=float, default=None,
                     help="分时段中位极差阈值（秒）。默认按引擎取：qwen 0.3 / whisper 0.5")
     ap.add_argument("--min-n", type=int, default=5, help="时段最少样本数")
@@ -356,7 +442,8 @@ def main():
         if args.engine == "qwen":
             if not args.model:
                 ap.error("--engine qwen 必须给 --model")
-            tokens = tokens_qwen(args.media_path, rows, args.model)
+            tokens = tokens_qwen(args.media_path, rows, args.model,
+                                 chunk=args.chunk)
             engine = "qwen3-forced-aligner"
         else:
             model = args.model or "large-v3"
