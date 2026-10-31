@@ -1,6 +1,6 @@
 ---
 name: subtitle-polish
-version: 1.8.1
+version: 1.8.2
 description: 字幕精校,支持自动/手动两种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。自动模式:输入 ASS 双语成品 + SRT 源,走 审计→人确认→修复 全流程,修复由脚本执行(dry-run/accept/rollback)。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。给了片源时可对音频做时间轴审计与修复(align_audit/align_patch)。也支持 /subtitle-polish 命令。
 ---
 
@@ -159,7 +159,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --window 3
 | `apply_fixes.py` | 执行 fixes.json / 回滚 / `--manual-log` | 两模式 |
 | `global_replace.py` | 跨文件纯文本替换 | 两模式 |
 | `verify_fixes.py` | 核验 log 已落盘 | 两模式 |
-| `cross_check.py` | 中英对照复核 + 撞车预警 + 疑似回归 | 两模式 |
+| `cross_check.py` | 中英对照复核 + 撞车预警 + 动到历史结论 | 两模式 |
 | `regression_check.py` | 跨轮次台账/连续改动/批次沉住度(只读 log,不跑模型) | 两模式 |
 | `extract_subs.py` | 列/抽片源内嵌字幕流(判轴的前置) | 前置 |
 | `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎) | 两模式 |

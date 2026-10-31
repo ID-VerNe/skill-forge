@@ -117,8 +117,8 @@ def main():
     ap.add_argument("--collision-only", action="store_true", help="只输出撞车预警")
     ap.add_argument("--window", type=int, default=3, help="邻块窗口，默认 3")
     ap.add_argument("--floor", type=float, default=0.55, help="撞车阈值，默认 0.55")
-    ap.add_argument("--regression-window", type=int, default=3,
-                    help="比对前几个 batch 的历史改动查回归（0=关闭，默认 3）")
+    ap.add_argument("--regression-window", type=int, default=0,
+                    help="只比对更早的最近 N 个 batch（0=全部，默认；负数=关闭）")
     ap.add_argument("--work-dir", default=".subtitle-polish")
     ap.add_argument("--ass", help="成品 ASS（默认从 log 推断）")
     ap.add_argument("--srt-path", help="配对 SRT")
@@ -209,11 +209,22 @@ def main():
             lines.insert(9 + i, f"| {sid} | {nbr} | {sc:.2f} |")
         lines.insert(9 + len(collisions), "")
 
-    # ---- 疑似回归（issue #5）：本轮的 old_text 命中了历史某轮的 new_text
+    # ---- 动到了历史刚定下的内容（issue #5）：本轮 old_text 命中更早某轮的 new_text
+    #
+    # 两个必须卡住的地方：
+    # 1. `past` 只能是**更早**的批次。按「不在当前批次里」筛会把后来的批次也算进来，
+    #    于是报告写出「历史 batch = r11」——而 r11 在 r10 之后，因果倒置。
+    # 2. 窗口 0 = 全部（与 regression_check --window 语义一致）。默认也是全部：
+    #    要看的那一轮可能很远——S06E04 里 r15 推翻的是 r7 的结论，隔了 8 轮，
+    #    窗口取 3 根本看不见。漏看的代价是原地打转，多看的代价只是再过一眼。
     regs = []
-    if args.regression_window > 0 and entries:
+    if args.regression_window >= 0 and entries:
         cur_batch = {e.get("batch_id") for e in entries}
-        past = [e for e in all_entries if e.get("batch_id") not in cur_batch]
+        cur_ts = min((e.get("ts", "") for e in entries if e.get("batch_id") in cur_batch),
+                     default="")
+        past = [e for e in all_entries
+                if e.get("batch_id") not in cur_batch
+                and cur_ts and e.get("ts", "") < cur_ts]
         if args.regression_window:
             batches = []
             for e in sorted(past, key=lambda x: x.get("ts", "")):
@@ -225,8 +236,10 @@ def main():
         regs = rg.find_regressions(entries, past, args.floor)
 
     if regs:
-        lines += ["", "## 疑似回归：本轮改掉了近几轮刚修好的译文", "",
-                  "| srt | 命中类型 | 相似度 | 本轮 old | 历史 new | 历史 batch |",
+        lines += ["", "## 动到了历史刚定下的内容", "",
+                  "> 这些行的**当前内容**是第 X 轮刚定下的，本轮把它改掉了。",
+                  "> 改不一定错，但要先看第 X 轮为什么那么定。", "",
+                  "| srt | 命中类型 | 相似度 | 本轮改掉的内容 | 第 X 轮定下的 | 第 X 轮 |",
                   "|---|---|---|---|---|---|"]
         for r in regs:
             lines.append("| %s | %s | %.2f | %s | %s | %s |" % (
@@ -235,8 +248,8 @@ def main():
                 rg.clean(r["hist"].get("new_text", ""))[:24] or "—",
                 r["hist"].get("batch_id", "")))
         lines += ["",
-                  "> 只报不阻断。改回去有时是对的（上一轮确实改错了），"
-                  "查一下历史 batch 的理由再决定是否 `--rollback batch=<id>`。", ""]
+                  "> 只报不阻断。改掉历史结论有时是对的（上一轮确实错了），"
+                  "但要能说出那条理由错在哪。要退回请用 `--rollback batch=<id>`。", ""]
 
     text = "\n".join(lines)
     out = report_path(wd, "cross-check.md")
@@ -244,7 +257,7 @@ def main():
     with open(out, "w", encoding="utf-8") as f:
         f.write(text)
     print(f"[*] 复核 {len(want)} 块，撞车预警 {len(collisions)} 条，"
-          f"疑似回归 {len(regs)} 条")
+          f"动到历史结论 {len(regs)} 条")
     print(f"[*] 报告写入 {out}")
     return 0
 

@@ -471,15 +471,14 @@ def test_regression_check_empty_log():
 # 3. cross_check --regression-window
 # ══════════════════════════════════════════════════════════════════
 
-def _cross_check_regs(window):
-    # R6 改错、R7 改回，R8 又改错 → 从 R8 的角度看，old_text 命中了 R6 之后
-    # 又被 R7 写成的那一版
-    rows = flipflop_trail()
+def _cross_check_regs(rows, batch, window=None):
     wd = WorkDir(rows)
     try:
-        p = _run("cross_check.py", ["--work-dir", wd.dir, "--batch-id", "R8",
-                                    "--ass", wd.ass, "--srt-path", wd.srt,
-                                    "--regression-window", str(window)])
+        args = ["--work-dir", wd.dir, "--batch-id", batch,
+                "--ass", wd.ass, "--srt-path", wd.srt]
+        if window is not None:
+            args += ["--regression-window", str(window)]
+        p = _run("cross_check.py", args)
         assert p.returncode == 0, p.stderr + p.stdout
         md = open(os.path.join(wd.dir, "reports", "cross-check.md"),
                   encoding="utf-8").read()
@@ -488,18 +487,48 @@ def _cross_check_regs(window):
         wd.close()
 
 
-def test_cross_check_reports_regression_by_default():
-    stdout, md = _cross_check_regs(3)
-    assert "疑似回归 1 条" in stdout, stdout
-    assert "## 疑似回归" in md, md
-    assert "exact" in md, md
+def test_cross_check_reports_overwritten_history_by_default():
+    """R8 把 R7 刚定下的文本改掉了 → 默认就要报出来。
+
+    默认窗口是「全部」，不是 3：要看的那一轮可能很远。实测 S06E04 里
+    r15 推翻的是 r7 的结论，隔了 8 轮，窗口取 3 根本看不见。
+    """
+    stdout, md = _cross_check_regs(flipflop_trail(), "R8")
+    assert "动到历史结论 1 条" in stdout, stdout
+    assert "## 动到了历史刚定下的内容" in md, md
+    assert "| 1 | exact | 1.00 |" in md, md
+    assert "20261030_r7" in md or "| R7 |" in md, md
     assert "只报不阻断" in md, md
 
 
-def test_cross_check_regression_window_zero_disables():
-    stdout, md = _cross_check_regs(0)
-    assert "疑似回归 0 条" in stdout, stdout
-    assert "## 疑似回归" not in md, f"--regression-window 0 应完全关闭，实际报告里还有：{md[-400:]}"
+def test_cross_check_ignores_later_batches():
+    """`past` 只能是更早的批次。
+
+    按「不在当前批次里」筛会把**未来**批次也拉进来，于是报告写出
+    「第 X 轮 = R9」，而 R9 发生在 R8 之后——因果倒置。
+    真实数据上就是这么错的（r10 的报告里出现了 r11）。
+    """
+    rows = flipflop_trail() + [
+        # R9 在 R8 之后，把 #1 改成「这就是菲尔的地盘」
+        _entry("R9", 1, "这正是菲尔的强项", "这就是菲尔的地盘",
+               ts="2026-10-01T13:00:00"),
+    ]
+    stdout, md = _cross_check_regs(rows, "R8")
+    assert "R9" not in md.split("## 动到了历史")[-1], \
+        f"R9 在 R8 之后，不该出现在「历史」里：{md[-500:]}"
+    assert "| R7 |" in md, md
+
+
+def test_cross_check_regression_window_negative_disables():
+    stdout, md = _cross_check_regs(flipflop_trail(), "R8", window=-1)
+    assert "动到历史结论 0 条" in stdout, stdout
+    assert "## 动到了历史" not in md, f"--regression-window -1 应关闭，实际：{md[-400:]}"
+
+
+def test_cross_check_regression_window_can_narrow():
+    """N=1 只看紧邻的上一个批次 → R7 就是上一个，仍然命中。"""
+    stdout, md = _cross_check_regs(flipflop_trail(), "R8", window=1)
+    assert "动到历史结论 1 条" in stdout, stdout
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -654,8 +683,10 @@ if __name__ == "__main__":
     test("G22 空 log 退出 1", test_regression_check_empty_log)
 
     print("\n-- 3. cross_check --regression-window --")
-    test("G23 默认窗口报疑似回归", test_cross_check_reports_regression_by_default)
-    test("G24 window=0 完全关闭", test_cross_check_regression_window_zero_disables)
+    test("G23 默认报「动到历史结论」", test_cross_check_reports_overwritten_history_by_default)
+    test("G24 排除更晚的批次", test_cross_check_ignores_later_batches)
+    test("G24b 负数关闭", test_cross_check_regression_window_negative_disables)
+    test("G24c 窗口可收窄", test_cross_check_regression_window_can_narrow)
 
     print("\n-- 4. 规则表结构性约束 (issue #7) --")
     test("G25 仓库规则表自检通过", test_shipped_rules_are_valid)
