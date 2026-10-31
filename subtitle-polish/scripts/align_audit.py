@@ -25,6 +25,7 @@
       --engine qwen --model /path/to/qwen3-aligner-0.6b --json out.json
 
 输出：stdout 摘要 + 可选 `--report`(md) / `--json`(含曲线 spec，供 align_patch 用)。
+退出码（见 lib/verdict.py）：PASS 0 / FAIL 2 / UNVERIFIED 3。`--no-strict` 回到 0。
 """
 from __future__ import annotations
 
@@ -36,6 +37,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import align_core as ac
+from lib import credential as cred
+from lib import verdict as V
 
 
 # ---------------------------------------------------------------- 引擎
@@ -162,7 +165,10 @@ def print_summary(name, stats, n_rows, engine):
           % (stats["slope"], _fmt(stats["drift"], 2), stats["x_span"]))
     print("  分时段(%ds)中位极差 %.3f s  -> %s"
           % (stats["window"], stats["window_span"],
-             "PASS" if stats["ok"] else "FAIL（阈值 %.2fs）" % stats["tol"]))
+             stats["verdict"] if stats["verdict"] != "FAIL"
+             else "FAIL（阈值 %.2fs）" % stats["tol"]))
+    if stats.get("verdict_reason"):
+        print("    %s" % stats["verdict_reason"])
     if stats["windows"]:
         print("  各时段：", " ".join(
             "%d-%ds:%s" % (w["lo"], w["hi"], _fmt(w["median"], 2))
@@ -184,12 +190,35 @@ def build_report(args, stats, n_rows, engine, compare):
                 100.0 * stats["n_pairs"] / n_rows if n_rows else 0.0,
                 stats["reject"]["dropped"], stats["reject"]["thr"]))
     L.append("")
+    # 结案口径钉在开头：这份报告的结论只有三态，不写「基本对上」这类模糊话。
+    L.append("## 时间轴状态")
+    L.append("")
+    L.append("| 项 | 值 |")
+    L.append("|---|---|")
+    L.append("| 判定 | **%s** |" % stats["verdict"])
+    L.append("| 分时段中位极差 | %.3f s（阈值 %.2f s） |"
+             % (stats["window_span"], stats["tol"]))
+    L.append("| delta 中位 / MAD | %s / %.3f |"
+             % (_fmt(stats["median"]), stats["mad"]))
+    L.append("| 全长漂移 | %s s（斜率 %+.6f，跨度 %.0f s） |"
+             % (_fmt(stats["drift"], 2), stats["slope"], stats["x_span"]))
+    L.append("| 引擎 / 锚点 | %s / %d of %d |" % (engine, stats["n_pairs"], n_rows))
+    L.append("")
+    if stats["verdict"] == "FAIL":
+        L.append("> FAIL 意味着**不许结案**：修时间轴（`align_patch`）后必须重跑本审计，"
+                 "直到 PASS 或明确按 UNVERIFIED 交付。")
+        L.append("")
+    elif stats["verdict"] == "UNVERIFIED":
+        L.append("> UNVERIFIED 意味着**没验出来**，不是通过。按 UNVERIFIED 交付，"
+                 "交付说明里不许出现「全部通过」「验证完毕」。")
+        L.append("")
     L.append("## 判定")
     L.append("")
     L.append("| 指标 | 值 | 阈值 | 结论 |")
     L.append("|---|---|---|---|")
     L.append("| 分时段中位极差 | %.3f s | ≤ %.2f s | %s |"
-             % (stats["window_span"], stats["tol"], "PASS" if stats["ok"] else "**FAIL**"))
+             % (stats["window_span"], stats["tol"],
+                "PASS" if stats["ok"] else ("**%s**" % stats["verdict"])))
     L.append("| 线性漂移（全长 %.0fs） | %s s | — | — |"
              % (stats["x_span"], _fmt(stats["drift"], 2)))
     L.append("| delta 中位 / MAD | %s / %.3f | — | 只看平坦度，不看绝对值 |"
@@ -225,7 +254,13 @@ def build_report(args, stats, n_rows, engine, compare):
     L.append("## 建议")
     L.append("")
     coarse = not engine.startswith("qwen")
-    if stats["ok"]:
+    if stats["verdict"] == "UNVERIFIED":
+        L.append("**本次没验出来。** %s" % stats.get("verdict_reason", ""))
+        L.append("")
+        L.append("调小 `--window`（如 60）或调小 `--min-n` 让时段凑得够；"
+                 "仍不行说明字幕密度不足以支撑分时段判据，"
+                 "按 UNVERIFIED 交付，并在交付说明里写明「未验时间轴」。")
+    elif stats["verdict"] == "PASS":
         L.append("对齐在阈值内，无需改时间轴。")
         if coarse:
             L.append("")
@@ -233,6 +268,7 @@ def build_report(args, stats, n_rows, engine, compare):
                      "「>0.5s 的粗错」。若下游仍反馈偏轴，换 `--engine qwen` 复测，"
                      "别把这条 PASS 当成「亚 0.3s 级也对」。")
     elif coarse:
+
         L.append("窗间极差 %.2f s 超过 whisper 阈值，但**先别改**——whisper 引擎的"
                  "极差在 0.3~0.5s 区间几乎全是噪声（实测从未改动过的集也有 0.30s）。"
                  % stats["window_span"])
@@ -275,10 +311,26 @@ def main():
     ap.add_argument("--cache-dir", default=".subtitle-polish/align")
     ap.add_argument("--json", help="输出逐条明细 + 曲线 spec")
     ap.add_argument("--report", help="输出 md 报告")
+    ap.add_argument("--write-credential", action="store_true",
+                    help="写 <episode>.ts.json 凭据（PASS 和 FAIL 都写，供 timeline_gate 读）")
+    ap.add_argument("--source-index", type=int, default=None,
+                    help="用的哪条内嵌流下标（记进凭据，防拿错轴）")
+    ap.add_argument("--source-title", default=None, help="该流的标题")
+    ap.add_argument("--source-family", default=None,
+                    help="轴族短标签，如 UK / US（判轴时由 #11 自动填，也可手填）")
+    ap.add_argument("--strict", dest="strict", action="store_true", default=True,
+                    help="按判定返回退出码（默认开）")
+    ap.add_argument("--no-strict", dest="strict", action="store_false",
+                    help="永远 exit 0（仅本地调试，不要写进流程）")
     args = ap.parse_args()
 
+    # 没有音频也没有词级缓存：这不是「跑失败了」，是「没验」，必须是 UNVERIFIED。
+    # 旧版走 ap.error 直接崩，退出码是 2，与 FAIL 撞车，机器分不出两者。
     if not args.asr_words and not args.media:
-        ap.error("需要 --media 或 --asr-words 之一")
+        print("[x] 需要 --media 或 --asr-words 之一：没有音频就无法验轴。", file=sys.stderr)
+        print("    只有字幕时的结构检查用 precheck_timeline.py（L0，秒级）。",
+              file=sys.stderr)
+        sys.exit(V.UNVERIFIED)
 
     rows = ac.load_rows(args.sub, args.track or None)
     if not rows:
@@ -356,15 +408,41 @@ def main():
             "engine": engine,
             "stats": stats,
             "pairs": [[round(x, 3), round(y, 4)] for x, y, _ in pairs],
-            "curve": spec if not stats["ok"] else None,
-            "curve_base": round(base, 4) if not stats["ok"] else 0.0,
-            "curve_applicable": not stats["ok"],
+            # 只有 FAIL 才给曲线。PASS 的残余是噪声；UNVERIFIED 是没有判据，
+            # 两种都不该让下游拿到一条可以施加上去的曲线。
+            "curve": spec if stats["verdict"] == "FAIL" else None,
+            "curve_base": round(base, 4) if stats["verdict"] == "FAIL" else 0.0,
+            "curve_applicable": stats["verdict"] == "FAIL",
+            "verdict": stats["verdict"],
         }
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=1)
         tail = ("（含 curve spec，可直接喂 align_patch --spec）"
-                if not stats["ok"] else "（判 PASS，不输出曲线）")
+                if stats["verdict"] == "FAIL"
+                else "（判 %s，不输出曲线）" % stats["verdict"])
         print("[json]   %s  %s" % (args.json, tail))
+
+    # 5) 凭据：PASS 与 FAIL 都写。
+    #    只写 PASS 的话，FAIL 在 gate 眼里会退化成「没有凭据」，分不出
+    #    「验过、不对」和「没验过」——那正是 #10 要消灭的二义性。
+    if args.write_credential:
+        data = cred.build(
+            args.sub, stats, engine,
+            media=args.media if args.media and not args.media.startswith("(") else None,
+            source={"kind": "embedded_stream" if args.source_index is not None else "unknown",
+                    "index": args.source_index,
+                    "title": args.source_title,
+                    "family": args.source_family or "unknown"},
+            cross_checked=bool(compare) and len(compare) >= 1,
+        )
+        data["axis"]["total"] = len(rows)
+        p = cred.save(args.sub, data)
+        print("[cred]   %s  verdict=%s" % (p, data["axis"]["verdict"]))
+
+    code = V.from_verdict(stats["verdict"])
+    if args.strict:
+        sys.exit(code)
+    print("\n[!] --no-strict：判定为 %s，但按调试模式返回 0。" % V.label(code))
 
 
 if __name__ == "__main__":

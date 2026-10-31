@@ -291,6 +291,10 @@ def summarize(pairs, window=180.0, tol=0.3, min_n=5):
 
     判定用 `window_span`（分时段中位数极差），**不是** delta 是否接近 0：
     delta 有 +0.1~0.2s 的天然提前量，绝对值无意义，平坦度才有意义。
+
+    三态，不是二态：**一个合格时段都没凑出来时是 UNVERIFIED，不是 PASS。**
+    早期版本 `win_span` 在 `win` 为空时取 0.0，于是"字幕太稀、窗口全被 min_n
+    滤掉"会得到一个空判 PASS——最该报警的情况反而全绿（issue #10 同源）。
     """
     keep, rej = robust_reject(pairs)
     k, b, n, x_span = linear_fit(keep)
@@ -300,6 +304,16 @@ def summarize(pairs, window=180.0, tol=0.3, min_n=5):
     center = median(meds) if meds else 0.0
     worst = max(win, key=lambda w: abs(w["median"] - center)) if win else None
     deltas = [p[1] for p in keep]
+
+    if not win:
+        verdict, reason = "UNVERIFIED", (
+            "%d 个时段都不足 %d 条（字幕过稀或窗长过大），无法判定"
+            % (int(x_span // window) + 1 if x_span else 0, min_n))
+    elif win_span <= tol:
+        verdict, reason = "PASS", ""
+    else:
+        verdict, reason = "FAIL", "窗间极差 %.3f s 超过阈值 %.2f s" % (win_span, tol)
+
     return {
         "n_pairs": len(pairs),
         "n_keep": n,
@@ -315,7 +329,9 @@ def summarize(pairs, window=180.0, tol=0.3, min_n=5):
         "window_span": win_span,
         "worst_window": worst,
         "tol": tol,
-        "ok": win_span <= tol,
+        "verdict": verdict,
+        "verdict_reason": reason,
+        "ok": verdict == "PASS",
     }
 
 

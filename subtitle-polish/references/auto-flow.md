@@ -4,9 +4,25 @@
 
 输入 ASS 双语成品 + SRT 源，走 审计→人确认→修复 全流程。每阶段结束向用户报告进度。**门1（md 报告后）与门2（dry-run 后）停下等用户，不自动推进。**
 
-## 0. 环境检查
+## 0. 环境检查 + 时间轴闸门
 
 - 系统有 python（默认）。检查 `pysubs2`：`python -c "import pysubs2"`，失败则 `python -m pip install pysubs2`。
+- **时间轴闸门（默认拒绝）**：读 `<episode>.ts.json` 凭据，判定这批字幕能不能开工。
+
+  ```bash
+  python <skill>/scripts/timeline_gate.py <ass_dir> --media <片源目录或文件>
+  ```
+
+  | 退出码 | 含义 | 该怎么办 |
+  |---|---|---|
+  | 0 | 凭据有效且 PASS | 开工 |
+  | 2 | 凭据判定 FAIL | 先 `align_patch` 修轴再复测 |
+  | 3 | 无凭据 / 已失效 | 跑 `align_audit --write-credential` |
+  | 4 | 多条候选轴无法区分 | 人工确认用的是哪条流 |
+
+  **不给「静默跳过」留路**：文档里写「必须写明未验」是软约束，赶工时一定被跳过；只有退出码非零才会真的停下来。凭据细节见 `timeline-credential.md`。
+
+  没有片源的批次跑不了闸门，此时按 UNVERIFIED 交付（见 11 节），不要把它当成「环境检查通过」。
 
 ## 1. 配对
 
@@ -37,15 +53,28 @@ python <skill>/scripts/precheck_punct.py <ass_file_or_dir> --out .subtitle-polis
 - 人若想精校前先统一标点，可在门 1 后单独 `--accept` 跑一次 precheck（独立 batch，可回滚），与主修 fixes 分开。
 - **标点规则细节见 `punct-rules.md`；批次顺序（precheck --accept 必须在 apply_fixes 之前）见 `batch-ordering.md`**——顺序错了 precheck 会改掉主修写入的 `……`、删掉主修有意加的 `(EMU)` 译注。
 
-## 2.6. 对齐审计（可选，需片源）
+## 2.6. 对齐审计（需片源；无片源则本条判据记为 UNVERIFIED）
 
-标点预检后、审计前。**只在用户给了片源时跑**；没片源就跳过，但最终报告里必须写明「本次未验时间轴」，不能默认它是对的。
+标点预检后、审计前。这不是「可选」步骤，是**第三条结案判据的来源**：
+
+| 情形 | 结论 | 能不能结案 |
+|---|---|---|
+| 跑了，PASS | 轴可信 | 能 |
+| 跑了，FAIL | 轴有问题 | 不能，先修 |
+| 没跑 / 没片源 | 不知道 | **不能**，只能按 UNVERIFIED 交付 |
+
+没片源不是「跳过」，是「记为 UNVERIFIED」——两者在报告里的分量完全不同，见 `align-audit.md` 的结案节。
 
 ```bash
 python <skill>/scripts/align_audit.py --sub <ass> --media <mkv|mp4|wav> \
     --report .subtitle-polish/reports/align-<stem>.md \
-    --json .subtitle-polish/align/<stem>.json
+    --json .subtitle-polish/align/<stem>.json \
+    --write-credential --source-index <n> --source-family UK
 ```
+
+`--write-credential` 写 `<episode>.ts.json`（见 `timeline-credential.md`）。**PASS 和 FAIL 都写**：只写 PASS 的话，FAIL 在闸门眼里会退化成「没有凭据」，「验过不对」和「没验过」又混在一起了。
+
+退出码：PASS 0 / FAIL 2 / UNVERIFIED 3。批处理里直接看退出码，别靠读 stdout。
 
 - 多集就每集各跑一次，汇总成一张表进报告（锚点数 / MAD / 斜率 / 分时段极差 / 判定）。
 - 判据是**分时段中位极差**，不是 delta 是否接近 0——delta 天然带 +0.1~0.2s 提前量，绝对值没有意义。
@@ -164,7 +193,16 @@ python <skill>/scripts/cross_check.py   --batch-id <ts>
 python <skill>/scripts/align_audit.py   --sub <ass> --media <片源>   # 有片源时必跑
 ```
 
-第三条缺片源时跑不了，但报告里要写明「未验时间轴」。**不要用「对本片内嵌字幕流」代替**——实测 8 集里有 3 集的内嵌流自己就偏 2.4~2.9 秒，拿它当基准等于自证。
+第三条缺片源时跑不了，**结案结论必须是 UNVERIFIED，不能写「通过」**。报告里不许出现「全部通过」「验证完毕」这类措辞。**不要用「对本片内嵌字幕流」代替**——实测 8 集里有 3 集的内嵌流自己就偏 2.4~2.9 秒，拿它当基准等于自证。
+
+写结论前先跑闸门，它读凭据、不跑模型，毫秒级：
+
+```bash
+python <skill>/scripts/timeline_gate.py <ass_or_dir> --media <片源>
+# 0 PASS / 2 FAIL / 3 UNVERIFIED / 4 AMBIGUOUS
+```
+
+凭据失效（片源换了、文件被改过、改过时间轴没复测）同样判 UNVERIFIED——过期的 PASS 不是 PASS。
 
 - 读 log.jsonl，按 srt_id + track 用 ass_srt_pair 重读 ASS，逐条核对每条操作记录的 new_text 是否真的落盘（delete 验该行已不存在）。输出带 ass_time 方便人对照视频。
 - 输出 `.subtitle-polish/reports/verify-fixes.md`。有失败条目则列出期望/实际/原因/ass_time，agent 或人据此排查。

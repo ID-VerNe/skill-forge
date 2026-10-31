@@ -1,6 +1,6 @@
 ---
 name: subtitle-polish
-version: 1.4.0
+version: 1.5.0
 description: 字幕精校,支持自动/手动两种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。自动模式:输入 ASS 双语成品 + SRT 源,走 审计→人确认→修复 全流程,修复由脚本执行(dry-run/accept/rollback)。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。给了片源时可对音频做时间轴审计与修复(align_audit/align_patch)。也支持 /subtitle-polish 命令。
 ---
 
@@ -14,6 +14,9 @@ description: 字幕精校,支持自动/手动两种模式。用户说"精校字�
 ## 适用范围
 
 - 输入:ASS 双语成品(英文行 + 中文行成对,track 取值 `英文/中文/注释`)+ SRT 源(权威英文)
+- **时间轴契约**:输入字幕的时间轴**必须可信,且必须能证明**。证明形式是 `<episode>.ts.json` 凭据,
+  由 `align_audit --write-credential` 产出,由 `timeline_gate.py` 在阶段 0 校验。
+  没有凭据 = 没验 = 不许按「通过」结案。详见 `references/timeline-credential.md`
 - 可选:片源(MKV/MP4 或已抽好的 wav)。给了才能验时间轴,详见 `references/align-audit.md`
 - **翻译前的第 0 步**:若手上只有片源,先用 `extract_subs.py` 抽内嵌字幕流 + `align_audit --compare` 判轴,
   拿到一条与音频同轴的英文 SRT 再开工。时间轴应在翻译前建立,不是交付前抢救——见 `references/build-timeline.md`
@@ -83,8 +86,12 @@ python <skill>/scripts/apply_fixes.py --rollback batch=<ts>_manual  # 回滚
 ```bash
 python <skill>/scripts/verify_fixes.py --batch-id <ts>   # 盘面 == log
 python <skill>/scripts/cross_check.py   --batch-id <ts>  # 中英对照复核
-python <skill>/scripts/align_audit.py   --sub <ass> --media <片源>  # 对音频对齐
+python <skill>/scripts/align_audit.py   --sub <ass> --media <片源> --write-credential  # 对音频对齐
+python <skill>/scripts/timeline_gate.py <ass> --media <片源>        # 凭据闸门(毫秒级)
 ```
+
+三条判据的结论只有三态:**PASS(0) / FAIL(2) / UNVERIFIED(3)**。`UNVERIFIED` 不是「通过」,
+是「没验」——报告里不许写成「全部通过」。
 
 **`verify_fixes` 0 失败不等于成品正确。** 它比的是「盘面 == log 里的 new_text」,
 是恒等式:只要字写进去就必然通过,与译文对不对无关。实测一轮 99 条修复 verify 报
@@ -120,12 +127,14 @@ python <skill>/scripts/align_audit.py   --sub <ass> --media <片源>  # 对音�
 │   ├── punct-rules.md          # 标点规则细节
 │   ├── pre-audit.md            # 三轨预审用法
 │   ├── align-audit.md          # 对音频的时间轴审计与修复
+│   ├── timeline-credential.md  # 时间轴凭据(sidecar)与阶段 0 闸门
 │   ├── build-timeline.md       # 翻译前先从片源建立可信时间轴
 │   └── prompt-injection.md     # prompt 构造约束
 ├── prompts/                    # audit/verify/synthesize 模板
 └── scripts/                    # extract_slice / apply_fixes / global_replace
                                 #   / verify_fixes / cross_check / precheck_punct / pre_audit
-                                #   / extract_subs / align_audit / align_patch + lib/
+                                #   / extract_subs / align_audit / align_patch
+                                #   / timeline_gate + lib/
 ```
 
 脚本速查:
@@ -142,6 +151,7 @@ python <skill>/scripts/align_audit.py   --sub <ass> --media <片源>  # 对音�
 | `extract_subs.py` | 列/抽片源内嵌字幕流(判轴的前置) | 前置 |
 | `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎) | 两模式 |
 | `align_patch.py` | 按偏移量改时间轴(线性/曲线/重定时) | 两模式 |
+| `timeline_gate.py` | 读凭据判时间轴能否用于开工(不跑模型) | 两模式 |
 
 项目产物(不进 skill):
 ```
@@ -150,7 +160,8 @@ python <skill>/scripts/align_audit.py   --sub <ass> --media <片源>  # 对音�
 ├── reports/           # audit-report.md / detail / dry-run.md / optional-fixes.md
 ├── fixes.json
 ├── optional-fixes.json
-└── log.jsonl          # 不进 git,.gitignore 加它
+├── log.jsonl          # 不进 git,.gitignore 加它
+└── (字幕同目录) <episode>.ts.json   # 时间轴凭据,进 git
 ```
 
 ## 重要约束
