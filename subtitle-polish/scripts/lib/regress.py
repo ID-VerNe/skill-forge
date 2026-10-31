@@ -44,6 +44,20 @@ def ratio(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def _is_text_change(e: dict) -> bool:
+    """这条记录真的改了文本吗。
+
+    `old_text == new_text` 的记录不是文本改动。最典型的来源：`retime` 在
+    `--manual-log` 里没有时间戳字段可用（issue #3），只能以 `replace` 补记，
+    old 与 new 完全相同。不排除它，「被 N 轮改过」会把纯改时间的一轮算进去。
+
+    实测代价（S06E04 的真实 log）：#390 被算成「3 轮改过、还没收敛」，
+    实际文本只变过 2 次；#390 英文轨被算成「2 轮、已收敛」，实际只变过 1 次——
+    而「1 轮」根本不该出现在「连续改动」里。
+    """
+    return clean(e.get("old_text", "")) != clean(e.get("new_text", ""))
+
+
 def history(entries: list, file: str = "") -> dict:
     """log -> {(file, srt_id, track): [按时间序的改动]}。
 
@@ -56,6 +70,8 @@ def history(entries: list, file: str = "") -> dict:
         if not e.get("srt_id"):
             continue
         if file and e.get("file") != file:
+            continue
+        if not _is_text_change(e):
             continue
         key = (e.get("file", ""), int(e["srt_id"]), e.get("track", ""))
         out.setdefault(key, []).append({
@@ -102,12 +118,50 @@ def reversals(trail: list, min_sim: float = 0.85, edge: float = 0.15) -> list:
     return out
 
 
-def converged(trail: list) -> bool:
-    """连续两轮给出相同结论。"""
-    if len(trail) < 2:
-        return False
-    return clean(trail[-1]["new"]) == clean(trail[-2]["new"]) and trail[-1]["batch"] != \
-        trail[-2]["batch"]
+def settled(hist: dict, recent: set) -> list:
+    """改过、但最近 N 轮没再被动的行 —— 唯一能从 log 观测到的「沉住」。
+
+    为什么不用「连续两轮给出相同 new_text」：那个判据在**一致的日志里永远为假**。
+    trail 里相邻两条满足 `old[i] == new[i-1]`，若再有 `new[i] == new[i-1]`，
+    则 `old[i] == new[i]`——这条记录是个空改动，会被 `_is_text_change` 滤掉。
+    换句话说，它能命中的只有 bug 本身。
+
+    根子上：log 只记改动，不记「看过了、同意」。**一致是不留痕的**，
+    所以「已经收敛」不可观测。可观测的是它的反面：改完之后又被人动了。
+    """
+    out = []
+    for key, hs in hist.items():
+        if not hs:
+            continue
+        if hs[-1]["batch"] in recent:
+            continue
+        out.append({"key": key, "last": hs[-1], "n_rounds": len(hs)})
+    out.sort(key=lambda x: (x["key"][1], x["key"][2]))
+    return out
+
+
+def churn(hist: dict) -> list:
+    """按 batch 统计「这批改的行，后来又被改过多少」——批次沉住度。
+
+    回答的是同一个问题（这活到底稳没稳），但在能观测的层面上：
+    一批改动被后续轮次推回去的比例越高，说明那批的判断越不可靠。
+    """
+    first_ts, touched, last_batch = {}, {}, {}
+    for key, hs in hist.items():
+        for h in hs:
+            b = h["batch"]
+            touched.setdefault(b, set()).add(key)
+            if b not in first_ts or h["ts"] < first_ts[b]:
+                first_ts[b] = h["ts"]
+        last_batch[key] = hs[-1]["batch"]
+
+    rows = []
+    for b in sorted(touched, key=lambda x: first_ts[x]):
+        keys = touched[b]
+        again = [k for k in keys if last_batch[k] != b]
+        rows.append({"batch": b, "n": len(keys), "again": len(again),
+                     "rate": round(len(again) / len(keys), 3) if keys else 0.0})
+    return rows
 
 
 def find_regressions(current: list, past: list, floor: float = 0.55) -> list:
@@ -124,6 +178,8 @@ def find_regressions(current: list, past: list, floor: float = 0.55) -> list:
     for c in current:
         if c.get("action") not in TEXT_ACTIONS:
             continue
+        if not _is_text_change(c):
+            continue  # 文本没变，谈不上「改掉了历史修好的译文」
         old = c.get("old_text", "")
         if not clean(old):
             continue
