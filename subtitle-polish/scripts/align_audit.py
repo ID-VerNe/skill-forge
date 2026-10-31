@@ -118,6 +118,7 @@ def tokens_qwen(wav, rows, model_dir, chunk=240.0, language="English"):
     model = Qwen3ForcedAligner.from_pretrained(
         model_dir, dtype=torch.bfloat16, device_map="cuda")
 
+    print("  强制对齐：%d 段，共 %.0fs 音频" % (len(edges) - 1, total), flush=True)
     tokens = []
     for ci in range(len(edges) - 1):
         lo, hi = edges[ci], edges[ci + 1]
@@ -139,6 +140,8 @@ def tokens_qwen(wav, rows, model_dir, chunk=240.0, language="English"):
             if txt:
                 tokens.append((float(w.start_time) + a0,
                                float(w.end_time) + a0, txt))
+        print("    块 %2d  %5.0f-%5.0f s  %3d 条  token %d"
+              % (ci, lo, hi, len(sel), len(items)), flush=True)
     return tokens
 
 

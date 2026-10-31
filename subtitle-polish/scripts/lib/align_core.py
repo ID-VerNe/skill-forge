@@ -374,50 +374,85 @@ def spec_from_linear(slope: float, origin: float):
     return {"kind": "linear", "slope": float(slope), "origin": float(origin)}
 
 
-def spec_from_pairs(pairs, nseg=0):
-    """把逐条偏移拟合成分段常数曲线（单调不减 + 首段归零）。
+def spec_from_pairs(pairs, nseg=0, min_pts=12, local_window=6, local_tol=1.0):
+    """把逐条偏移拟合成分段常数曲线（方向感知单调 + 首段归零）。
 
-    单调约束：剪辑点只会让偏移单向累加，不会回退。
-    首段归零：ASR/对齐器与字幕起点存在系统性偏置（实测 base −0.279s），
-    不减去它就会把整集平推一段，反而制造新偏移。
+    三道处理，顺序不能换：
+
+    1. **局部中位滤波**：先去掉局部尖峰（ASR 听错、个别人名）。全局 MAD 剔除
+       在这里不够用——阶梯型偏移会让中位数落在两级之间，MAD 被撑大，阈值
+       放宽到 ±3.5s，尖峰全被放进来，进而把分段边界带偏（实测真值第 2 级在
+       1337.9s，被拉到了 1102.7s，中间 236s 多推 0.44s）。
+    2. **最小段长**：点数不足的窄段并入邻居。窄段常数不可信，且会制造假阶跃。
+    3. **方向感知单调**：偏移只会沿一个方向累加，不会回退；但**方向可能是负的**
+       （字幕被推晚 → delta 递减）。早期版本写死 `run = max(run, c)`，遇到递减
+       样本会把整条曲线夹平、末尾一个离群段反转成正向，照着施加会把字幕推得更偏。
+
+    首段归零：对齐器与字幕起点存在系统性偏置（实测 base −0.279s），不减去
+    就会把整集平推一段，反而制造新偏移。
+
+    返回 (spec, base)。
     """
-    segs = _segfit(pairs, nseg)
+    pts = _local_filter(sorted(pairs), local_window, local_tol)
+    segs = _segfit(pts, nseg, min_pts=min_pts)
     if not segs:
         return {"kind": "curve", "segments": []}, 0.0
-    run, fixed = -1e9, []
-    for t0, t1, c in segs:
-        run = max(run, c)
-        fixed.append((t0, t1, run))
-    base = fixed[0][2]
+
+    direction = 1 if segs[-1][2] >= segs[0][2] else -1
+    run, fixed = None, []
+    for t0, _t1, c, _n in segs:
+        if run is None:
+            run = c
+        elif direction > 0:
+            run = max(run, c)
+        else:
+            run = min(run, c)
+        fixed.append((t0, run))
+    base = fixed[0][1]
     return ({"kind": "curve",
-             "segments": [[round(t0, 2), round(c - base, 4)] for t0, _t1, c in fixed]},
+             "segments": [[round(t0, 2), round(c - base, 4)] for t0, c in fixed]},
             base)
 
 
-def _segfit(pairs, nseg=0, max_seg=9):
-    """分段常数拟合：枚举段数，取 BIC 最小者。返回 [(t0, t1, const)]。"""
+def _local_filter(pts, window=6, tol=1.0):
+    """按 ±window 邻点的中位数滤掉局部尖峰，保住阶梯结构。"""
+    n = len(pts)
+    out = []
+    for k, (x, y) in enumerate(pts):
+        m = median([p[1] for p in pts[max(0, k - window):min(n, k + window + 1)]])
+        if abs(y - m) <= tol:
+            out.append((x, y))
+    return out
+
+
+def _mean_of(pts, i, j):
+    return sum(p[1] for p in pts[i:j + 1]) / float(j - i + 1)
+
+
+def _segfit(pts, nseg=0, max_seg=9, min_pts=12):
+    """分段常数拟合：枚举段数取 BIC 最小者，再把窄段并入邻居。
+
+    返回 [(t0, t1, const, n_pts)]。
+    """
     import math
 
-    pts = sorted(pairs)
     n = len(pts)
     if n < 8:
         return []
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
+    pre = [0.0] * (n + 1)
+    pre2 = [0.0] * (n + 1)
+    for i, y in enumerate(ys):
+        pre[i + 1] = pre[i] + y
+        pre2[i + 1] = pre2[i] + y * y
+
+    def cost(i, j):  # [i, j)
+        m = j - i
+        s = pre[j] - pre[i]
+        return (pre2[j] - pre2[i]) - s * s / m
 
     def fit(k):
-        # DP：把 n 个点切成 k 段，最小化各段内平方误差
-        pre = [0.0] * (n + 1)
-        pre2 = [0.0] * (n + 1)
-        for i, y in enumerate(ys):
-            pre[i + 1] = pre[i] + y
-            pre2[i + 1] = pre2[i] + y * y
-
-        def cost(i, j):  # [i, j)
-            m = j - i
-            s = pre[j] - pre[i]
-            return (pre2[j] - pre2[i]) - s * s / m
-
         INF = float("inf")
         dp = [[INF] * (n + 1) for _ in range(k + 1)]
         bk = [[0] * (n + 1) for _ in range(k + 1)]
@@ -434,8 +469,7 @@ def _segfit(pairs, nseg=0, max_seg=9):
         out, j = [], n
         for seg in range(k, 0, -1):
             i = bk[seg][j]
-            m = j - i
-            out.append((xs[i], xs[j - 1], (pre[j] - pre[i]) / m))
+            out.append((i, j - 1))
             j = i
         return list(reversed(out))
 
@@ -444,12 +478,33 @@ def _segfit(pairs, nseg=0, max_seg=9):
     for k in candidates:
         if k >= n:
             continue
-        segs = fit(k)
+        bounds = fit(k)
         rss = 0.0
-        for t0, t1, c in segs:
-            rss += sum((y - c) ** 2 for x, y in pts if t0 <= x <= t1)
+        for i, j in bounds:
+            c = _mean_of(pts, i, j)
+            rss += sum((y - c) ** 2 for y in ys[i:j + 1])
         rss = max(rss, 1e-9)
         bic = n * math.log(rss / n) + 3 * k * math.log(n)
         if best is None or bic < best[0]:
-            best = (bic, segs)
-    return best[1] if best else []
+            best = (bic, bounds)
+    if not best:
+        return []
+
+    # 窄段并入邻居（首段过窄则并入下一段）
+    merged, pending = [], None
+    for i, j in best[1]:
+        if (j - i + 1) < min_pts:
+            if merged:
+                pi, _pj = merged[-1]
+                merged[-1] = (pi, j)
+                continue
+            pending = (i, j)
+            continue
+        if pending is not None:
+            i, pending = pending[0], None
+        merged.append((i, j))
+    if pending is not None and merged:
+        _pi, pj = merged[0]
+        merged[0] = (pending[0], pj)
+
+    return [(xs[i], xs[j], _mean_of(pts, i, j), j - i + 1) for i, j in merged]
