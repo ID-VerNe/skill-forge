@@ -37,6 +37,23 @@ python <skill>/scripts/precheck_punct.py <ass_file_or_dir> --out .subtitle-polis
 - 人若想精校前先统一标点，可在门 1 后单独 `--accept` 跑一次 precheck（独立 batch，可回滚），与主修 fixes 分开。
 - **标点规则细节见 `punct-rules.md`；批次顺序（precheck --accept 必须在 apply_fixes 之前）见 `batch-ordering.md`**——顺序错了 precheck 会改掉主修写入的 `……`、删掉主修有意加的 `(EMU)` 译注。
 
+## 2.6. 对齐审计（可选，需片源）
+
+标点预检后、审计前。**只在用户给了片源时跑**；没片源就跳过，但最终报告里必须写明「本次未验时间轴」，不能默认它是对的。
+
+```bash
+python <skill>/scripts/align_audit.py --sub <ass> --media <mkv|mp4|wav> \
+    --report .subtitle-polish/reports/align-<stem>.md \
+    --json .subtitle-polish/align/<stem>.json
+```
+
+- 多集就每集各跑一次，汇总成一张表进报告（锚点数 / MAD / 斜率 / 分时段极差 / 判定）。
+- 判据是**分时段中位极差**，不是 delta 是否接近 0——delta 天然带 +0.1~0.2s 提前量，绝对值没有意义。
+- 阈值按引擎：whisper 0.5s / qwen 0.3s。**whisper 判 FAIL 先换 `--engine qwen` 复核再动手**，0.3~0.5s 区间几乎全是引擎噪声。
+- 要改时间轴走 `align_patch.py`（默认 dry-run，自动 `.bak`），不要手改时间戳。
+- 想复用已转好的 ASR 结果就存下 `--json`/词级缓存，复测秒出。
+- **完整口径见 `align-audit.md`**：为什么不能对字幕流验、轴归属判定、三种修复手段、三个坑。
+
 ## 2.7. 三轨预审（可选开关）
 
 标点预检后、审计前，**可选**跑三轨预审（gemini-3.1 + glm-5.2 + 规则检查）给 Claude 子 agent（stage 3）提供总览线索。用户显式 `--pre-audit` 或说"先预审"才跑，默认不开。
@@ -138,13 +155,16 @@ python <skill>/scripts/apply_fixes.py .subtitle-polish/fixes.json --accept --bat
 
 ## 11. 执行后验证
 
-结案条件是**两条都满足**:`verify_fixes` 0 失败 **AND** `cross_check` 中英对照复核通过。
-前者证明「改的东西写进去了」,后者证明「写进去的是这一句该有的译文」。只跑前者不算验完。
+结案条件是**三条都满足**：`verify_fixes` 0 失败 **AND** `cross_check` 中英对照复核通过 **AND** `align_audit` 极差在阈值内。
+第一条证明「改的东西写进去了」，第二条证明「写进去的是这一句该有的译文」，第三条证明「它出现在对的时间」。只跑第一条不算验完，前两条都不读时间字段。
 
 ```bash
 python <skill>/scripts/verify_fixes.py --batch-id <ts>
 python <skill>/scripts/cross_check.py   --batch-id <ts>
+python <skill>/scripts/align_audit.py   --sub <ass> --media <片源>   # 有片源时必跑
 ```
+
+第三条缺片源时跑不了，但报告里要写明「未验时间轴」。**不要用「对本片内嵌字幕流」代替**——实测 8 集里有 3 集的内嵌流自己就偏 2.4~2.9 秒，拿它当基准等于自证。
 
 - 读 log.jsonl，按 srt_id + track 用 ass_srt_pair 重读 ASS，逐条核对每条操作记录的 new_text 是否真的落盘（delete 验该行已不存在）。输出带 ass_time 方便人对照视频。
 - 输出 `.subtitle-polish/reports/verify-fixes.md`。有失败条目则列出期望/实际/原因/ass_time，agent 或人据此排查。

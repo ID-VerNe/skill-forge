@@ -1,7 +1,7 @@
 ---
 name: subtitle-polish
-version: 1.3.0
-description: 字幕精校,支持自动/手动两种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。自动模式:输入 ASS 双语成品 + SRT 源,走 审计→人确认→修复 全流程,修复由脚本执行(dry-run/accept/rollback)。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。也支持 /subtitle-polish 命令。
+version: 1.4.0
+description: 字幕精校,支持自动/手动两种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。自动模式:输入 ASS 双语成品 + SRT 源,走 审计→人确认→修复 全流程,修复由脚本执行(dry-run/accept/rollback)。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。给了片源时可对音频做时间轴审计与修复(align_audit/align_patch)。也支持 /subtitle-polish 命令。
 ---
 
 # subtitle-polish 字幕精校 Skill
@@ -14,8 +14,10 @@ description: 字幕精校,支持自动/手动两种模式。用户说"精校字�
 ## 适用范围
 
 - 输入:ASS 双语成品(英文行 + 中文行成对,track 取值 `英文/中文/注释`)+ SRT 源(权威英文)
+- 可选:片源(MKV/MP4 或已抽好的 wav)。给了才能验时间轴,详见 `references/align-audit.md`
 - 不适用:无 SRT 源(拒绝运行)、VTT/单语成品、SRT 双语(不处理)
-- 修复手段:只调脚本(extract_slice / apply_fixes / global_replace),**不直接 Edit ASS**
+- 修复手段:文本改走 extract_slice / apply_fixes / global_replace,时间改走 align_patch,
+  **不直接 Edit ASS**
 
 ## 调用约定
 
@@ -79,16 +81,23 @@ python <skill>/scripts/apply_fixes.py --rollback batch=<ts>_manual  # 回滚
 ```bash
 python <skill>/scripts/verify_fixes.py --batch-id <ts>   # 盘面 == log
 python <skill>/scripts/cross_check.py   --batch-id <ts>  # 中英对照复核
+python <skill>/scripts/align_audit.py   --sub <ass> --media <片源>  # 对音频对齐
 ```
 
 **`verify_fixes` 0 失败不等于成品正确。** 它比的是「盘面 == log 里的 new_text」,
 是恒等式:只要字写进去就必然通过,与译文对不对无关。实测一轮 99 条修复 verify 报
 0 失败,其中 15 条把原本正确的译文换成了邻行/同场景另一句的译文(skill-forge issue #1)。
 
-所以结案条件是 **两者都满足**:
+所以结案条件是:
 
 - `verify_fixes` 0 失败 —— 证明「改了的东西确实写进去了」;
-- `cross_check` 中英对照逐块读过 —— 证明「写进去的是这一句该有的译文」。
+- `cross_check` 中英对照逐块读过 —— 证明「写进去的是这一句该有的译文」;
+- `align_audit` 分时段中位极差在阈值内 —— 证明「写进去的东西出现在对的时间」。
+
+前两条都不读时间字段,**文本全对、时间轴整集偏 2.9 秒的成品照样全绿**(skill-forge issue #8)。
+第三条也不能用「对本片内嵌字幕流」代替——内嵌流自己可能就错轴。详见 `references/align-audit.md`。
+
+无片源时第三条跑不了,但必须在报告里写明「本次未验时间轴」,不能默认它是对的。
 
 `cross_check` 会输出撞车预警(新译文 ≈ ±3 邻块现有中文)。误报率实测为 0,
 **每条预警都要人看**;但它召回只有 4/15(其余是「同场景换句」「缩译掩盖漏译」,
@@ -108,10 +117,12 @@ python <skill>/scripts/cross_check.py   --batch-id <ts>  # 中英对照复核
 │   ├── glossary-handling.md    # 不带术语表原则
 │   ├── punct-rules.md          # 标点规则细节
 │   ├── pre-audit.md            # 三轨预审用法
+│   ├── align-audit.md          # 对音频的时间轴审计与修复
 │   └── prompt-injection.md     # prompt 构造约束
 ├── prompts/                    # audit/verify/synthesize 模板
 └── scripts/                    # extract_slice / apply_fixes / global_replace
-                                #   / verify_fixes / cross_check / precheck_punct / pre_audit + lib/
+                                #   / verify_fixes / cross_check / precheck_punct / pre_audit
+                                #   / align_audit / align_patch + lib/
 ```
 
 脚本速查:
@@ -125,6 +136,8 @@ python <skill>/scripts/cross_check.py   --batch-id <ts>  # 中英对照复核
 | `global_replace.py` | 跨文件纯文本替换 | 两模式 |
 | `verify_fixes.py` | 核验 log 已落盘 | 两模式 |
 | `cross_check.py` | 中英对照复核 + 撞车预警 | 两模式 |
+| `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎) | 两模式 |
+| `align_patch.py` | 按偏移量改时间轴(线性/曲线/重定时) | 两模式 |
 
 项目产物(不进 skill):
 ```

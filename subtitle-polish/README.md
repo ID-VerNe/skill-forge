@@ -45,6 +45,7 @@ ass 与 srt 可以是目录或单文件。多文件默认同名配对（去扩�
 - **不 Edit ASS**：所有修改走脚本，skill 只编排流程。
 - **特效标签自动还原**：replace/swap 时自动提取并保留原行 `{\be3}`、`{\an8}` 等前导标签，与 `final_new` 自带标签合并去重。
 - **标点预检**：`precheck_punct.py` 对照 translate_principle pipeline 的标点规则，精校前先规范化中文行（`……`→`…`、`，。、`→空格、数字间 `.` `,` 保留等），英文行不动。
+- **文本对 ≠ 时间对**：`verify_fixes` 与 `cross_check` 都不读时间字段，两者全绿时整集仍可能偏轴 2.9 秒。给了片源就必须跑 `align_audit.py`，判据是分时段 delta 中位极差（不是 delta 是否接近 0），且**不能对片源内嵌字幕流代替音频**。详见 `references/align-audit.md`。
 
 ## 脚本
 
@@ -55,7 +56,9 @@ ass 与 srt 可以是目录或单文件。多文件默认同名配对（去扩�
 | `scripts/apply_fixes.py` | replace/delete/swap，dry-run/accept/rollback，自动还原特效标签 |
 | `scripts/verify_fixes.py` | 执行后验证：读 log.jsonl 按 srt_id 重读 ASS，核对 new_text 落盘 |
 | `scripts/global_replace.py` | 跨文件统一专名，可选 track |
-| `scripts/lib/` | time_fmt / ass_srt_pair / log / tags / paths 工具 |
+| `scripts/align_audit.py` | **对音频**测时间偏差：分时段 delta 中位极差、线性斜率、轴归属（whisper/qwen 双引擎） |
+| `scripts/align_patch.py` | 改时间轴：线性补偿 / 分段曲线 / 逐条重定时，只替换时间字段，其余字节原样 |
+| `scripts/lib/` | time_fmt / ass_srt_pair / log / tags / paths / align_core 工具 |
 
 ## 产出（项目侧，不进 skill）
 
@@ -72,6 +75,7 @@ ass 与 srt 可以是目录或单文件。多文件默认同名配对（去扩�
 
 - Python 3（系统 python）
 - `pysubs2`（skill 启动时自动 `pip install pysubs2`）
+- 对齐审计另需（只在跑 `align_audit.py` 时）：`faster-whisper` + large-v3 模型；或 `qwen_asr` + `Qwen3-ForcedAligner-0.6B` + `soundfile`/`torch`。视频抽音轨需 `ffmpeg`。缺这些不影响文本精校。
 
 ## 范围与边界
 
