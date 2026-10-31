@@ -12,7 +12,7 @@
     3. media.sha1 与当前片源不符           -> UNVERIFIED   换片了
     4. files[].sha1 与当前文件不符         -> UNVERIFIED   文件被外部改过
     5. files[].patched_at > computed_at   -> UNVERIFIED   改过时间轴但没复测
-    6. axis.verdict != PASS               -> FAIL
+    6. axis.verdict 不是 PASS            -> 按原样透传 FAIL(2) / AMBIGUOUS(4)
     7. 其余                               -> PASS
 
 **顺序有意义**：陈旧性（2~5）必须排在 verdict（6）前面。一份写着 PASS 的凭据，
@@ -200,8 +200,14 @@ def build(sub_path: str, stats: dict, engine: str, media: Optional[str] = None,
             "mad": stats.get("mad"),
             "drift": stats.get("drift"),
             "window_span": stats.get("window_span"),
+            # 跨分块复核（qwen）：两种分块各给一个极差，判定看两者是否一致
+            "window_spans": stats.get("window_spans"),
+            "chunks": stats.get("chunks"),
+            "verdict_reason": stats.get("verdict_reason"),
             "tol": stats.get("tol"),
-            "verdict": "PASS" if stats.get("ok") else "FAIL",
+            # 这里不能用 `"PASS" if ok else "FAIL"`：四态里还有 AMBIGUOUS，
+            # 那样写会把它压成 FAIL，而「测不准」和「验出来是错的」不是一回事。
+            "verdict": stats.get("verdict") or ("PASS" if stats.get("ok") else "FAIL"),
             "cross_checked": bool(cross_checked),
             "l0": l0,
         },
