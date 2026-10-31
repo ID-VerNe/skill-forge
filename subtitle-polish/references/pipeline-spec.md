@@ -226,7 +226,7 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 | 连续改动 | 同一 `(file, srt_id, track)` 被 ≥2 个 batch 改过 | `--conflicts` |
 | 沉住 | 改过、但最近 N 轮没再被动 | `--settled` |
 | 批次沉住度 | 每轮改的行里，后来又被改过的比例 | 报告「批次沉住度」表 |
-| 疑似回归 | 本轮 `old_text` 命中历史某轮的 `new_text`（优先精确命中） | `cross_check --regression-window` |
+| 动到历史结论 | 本轮 `old_text` 命中**更早**某轮的 `new_text`（优先精确命中） | `cross_check --regression-window` |
 
 `retime` / `retime_curve` / `revert_curve` 不参与——它们不动文本，混进来会让
 「这一行被改了几轮」算错。
