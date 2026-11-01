@@ -407,6 +407,50 @@ def test_regression_check_ledger_prints_rows():
         wd.close()
 
 
+def test_regression_check_ledger_no_reason():
+    """--no-reason:台账只给「改了什么」,不给「为什么改」。
+
+    reason 属判断结论。贴进审计 prompt 会让 agent 顺着上轮逻辑往下推
+    (这正是 issue #6 里 bag 连推三轮的成因),所以多轮疗程注台账时必须剥掉它,
+    只留 srt_id/轮次/改动前后。prompt-injection.md 规则 4。
+    """
+    entries = [
+        _entry("R6", 1, "这正是菲尔的强项", "这就是菲尔的地盘",
+               ts="2026-10-01T10:00:00",
+               reason="只看虚词「正是」没判 bag 的义项"),
+    ]
+    wd = WorkDir(entries)
+    try:
+        out_full = os.path.join(wd.dir, "full.md")
+        out_bare = os.path.join(wd.dir, "bare.md")
+
+        p = _run("regression_check.py",
+                 ["--work-dir", wd.dir, "--ledger", "--out", out_full])
+        assert p.returncode == 0, p.stderr
+        full = open(out_full, encoding="utf-8").read()
+        assert "当时理由" in full and "bag 的义项" in full, full
+
+        p = _run("regression_check.py",
+                 ["--work-dir", wd.dir, "--ledger", "--no-reason",
+                  "--out", out_bare])
+        assert p.returncode == 0, p.stderr
+        bare = open(out_bare, encoding="utf-8").read()
+
+        # 事实保留
+        assert "| 1 | R6 |" in bare, bare
+        assert "这正是菲尔的强项" in bare and "这就是菲尔的地盘" in bare, bare
+        # 判断结论必须不见
+        assert "bag 的义项" not in bare, "reason 被泄进台账了:\n" + bare
+        assert "当时理由 |" not in bare and "| 当时理由" not in bare, "理由列还在:\n" + bare
+        # 提示语也要跟着换：没有理由列，就不能要求 agent「说明当时理由错在哪」
+        assert "这条改动错在哪" in bare, bare
+        assert "当时那条理由错在哪" not in bare, bare
+        # 但要明确告诉读者"这里刻意没有理由"，否则人会以为忘了输出
+        assert "不含当时理由" in bare, bare
+    finally:
+        wd.close()
+
+
 def test_regression_check_json_shape():
     wd = WorkDir(flipflop_trail())
     try:
@@ -678,6 +722,7 @@ if __name__ == "__main__":
     test("G18 --settled 过滤", test_regression_check_settled)
     test("G18b window=0 全部沉住", test_regression_check_window_zero_lists_everything_settled)
     test("G19 --ledger 打印台账", test_regression_check_ledger_prints_rows)
+    test("G19b --no-reason 剥掉判断结论", test_regression_check_ledger_no_reason)
     test("G20 --json 结构", test_regression_check_json_shape)
     test("G21 选段开关真的起作用", test_regression_check_section_selectors)
     test("G22 空 log 退出 1", test_regression_check_empty_log)

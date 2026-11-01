@@ -49,3 +49,12 @@ glue-engineer/.glue/
 
 # .claude/workflows — 本机 workflow 脚本,不作为仓库内容
 /.claude/workflows/
+
+# 外部仓库的本地克隆(自带 .git),不作为仓库内容
+/_repo_agency-agents/
+
+# 过程产物与草稿,不作为仓库内容
+/.handoffs/
+/.web2md/
+/outputs/
+/apple_ui_breakdown/

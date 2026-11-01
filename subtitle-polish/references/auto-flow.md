@@ -1,13 +1,29 @@
-# 自动流程（阶段 0→11）
+# 自动审校流程：一轮（round）的 0→11 骨架
 
-本文件是 subtitle-polish **自动模式**的流程。主 `SKILL.md` 路由到此。
+本文件是 subtitle-polish **自动审校模式**的**单轮**流程。主 `SKILL.md` 路由到此。
 
-输入 ASS 双语成品 + SRT 源，走 审计→人确认→修复 全流程。每阶段结束向用户报告进度。**门1（md 报告后）与门2（dry-run 后）停下等用户，不自动推进。**
+**本文件只管「一轮内部怎么走」。「跑几轮、轮次怎么排、每道门停不停、怎么回滚到第 N 轮末」
+在 `rounds-spec.md`**——不要在本文件里找轮次表。
+
+读法：
+
+| 你要做的事 | 读哪里 |
+|---|---|
+| 跑 R1–R11 整条疗程 / 无监管 `--auto` | `rounds-spec.md` §1 轮次表 + §3 六道闸 + §4 定格 |
+| 本轮到底审哪几类 | 本文件 §3 审计 —— 类别清单由 `round_scope` 注入,不在这里写死 |
+| 门 1 / 门 2 停不停 | 本文件 §6 §9 —— 逐步模式停,`--auto` 跳过 |
+| 回滚一轮 | `rounds-spec.md` §5.3 |
+
+一轮的输入是 ASS 双语成品 + SRT 源。阶段 0→11 走完即为「一轮」。
+
+**轮次编号与 batch_id 的纪律：一轮一个 batch_id,不复用。** `verify_fixes --batch-id` 会把
+同 id 的记录合并验,复用会让两轮的账混在一起（`rounds-spec.md` §8）。
 
 ## 0. 环境检查 + 时间轴闸门
 
 - 系统有 python（默认）。检查 `pysubs2`：`python -c "import pysubs2"`，失败则 `python -m pip install pysubs2`。
-- **时间轴闸门（默认拒绝）**：读 `<episode>.ts.json` 凭据，判定这批字幕能不能开工。
+- **时间轴闸门只需要在疗程开头跑一次**，不必每轮重跑（片源与凭据不随文本改动变化）。
+  但若本轮动过时间轴（`align_patch`），必须复测——过期的 PASS 不是 PASS。
 
   ```bash
   python <skill>/scripts/timeline_gate.py <ass_dir> --media <片源目录或文件>
@@ -104,13 +120,65 @@ python <skill>/scripts/pre_audit.py <slice.txt> --context .subtitle-polish/conte
 
 ## 3. 审计（自适应起 agent）
 
+**本阶段是本文件唯一按轮次变化的阶段。** `round_scope` 决定审计 prompt 里的**类别清单**：
+R4 只写「只看第 1 类」，R7 只写「只看第 4 类」，R10 写「全 7 类，只看前 9 轮残留 + 交叉污染」。
+
+`round_scope` 的注入方式：
+
+- `prompts/audit.tmpl` 的 `{round_scope}` 占位符 —— 填入本轮类别清单（见 `rounds-spec.md` §1 轮次表）；
+- 台账段 `{ledger}` —— 从 `regression_check.py --ledger --no-reason` 取，整段贴入（见 §11c）；
+- 线索段 `{seeds}` —— 仅 R11 填，来自 `scan_seed.py`（锚点 + 上下文段）。非 R11 填一句
+  「本轮未启用第 8 类，无锚点」；
+- 白名单段 `{inclusive_list}` —— 仅 R11 填，内容来自 `inclusive-language.md`（L4 白名单必须贴，
+  否则 agent 会把 `母头` 判成敏感词）。
+
+**`round_scope` 只改 prompt 里的类别清单，不裁剪切片文件。** 类别专轮一律全量出片，
+禁止「只切含专名的块」「按关键词采样」这类省 token 做法（`rounds-spec.md` §2，硬约束）。
+
+**判断归 agent，脚本只定位。** 这是本阶段的总原则，第 8 类的锚点尤其只是线索——
+详见 `subagent-delegation.md`。任何一类都不许拿脚本命中当结论。
+
 - 每文件份数 = `max(1, round(块数/700))`。
 - **小文件短路**：单文件块数 ≤ 200 时，主 agent 可直接审计该切片，不必另起子 agent（省成本）。> 200 必须起子 agent。边界明确，不要因"已读完整切片"自行放宽阈值。
-- 每份起一个子 agent，prompt 用 `prompts/audit.tmpl`，填入 `{slice_path}`、`{start_block}`、`{end_block}`、`{project_context}`。
+- 每份起一个子 agent，prompt 用 `prompts/audit.tmpl`，填入 `{slice_path}`、`{start_block}`、`{end_block}`、`{project_context}`、`{round_scope}`、`{ledger}`、`{seeds}`、`{inclusive_list}`。
+- **按切片切，不按类别切**：一个子 agent 在自己的 `[start_block, end_block]` 里把这轮范围内的
+  所有类别一起过。理由见 `subagent-delegation.md`「切分单位」。
 - project_context 来源（按优先级）：① 用户 prompt 里写的背景；② `.subtitle-polish/context.md`；③ **两者都没有时，主 agent 读 SRT 前 50 块 + ASS 样式自动合成一段项目背景**（领域、话题、疑似专名列表）。
-- 子 agent 后台跑期间，**主 agent 用 grep/正则独立预扫可疑点**（专名不一致、异常字符、ASR 错词模式），子 agent 返回后合并两边发现。
+- 子 agent 并行跑期间，**主 agent 用 `scan_seed.py` 出锚点、跑 `regression_check` 备下一轮台账**。
+  锚点的唯一用途是 subagent 回来后**对照找漏**（某段有锚点但它一条没报 → 回问它怎么判的），
+  不是主 agent 自己去判。
 - 子 agent 报告：附 [start_block, end_block] 范围 + 问题列表（srt_id/ass_time/类别/严重度/英文/现译/问题/建议）。
-- **prompt 构造约束见 `prompt-injection.md`**：项目背景只放中性领域事实，不放翻译判断结论；预扫发现只供主 agent 合并用，不喂给审计 agent。
+- **prompt 构造约束见 `prompt-injection.md`**：项目背景只放中性领域事实，不放翻译判断结论；预扫发现只供主 agent 合并用，不喂给审计 agent。**历史改动可以贴，历史判断结论不可以贴**（贴了就变成锚定，agent 会顺着上一轮的理由往下推）。
+
+### 3b. R11（第 8 类）的特殊流程
+
+R11 **走和 1–7 类相同的「并行 subagent 读全文」流程**，只是多两步：先出锚点喂进去、
+出来再对白名单核一遍。**不是**「脚本判定、agent 只归类」。
+
+```bash
+# 1) 出线索（每片一份，与切片一一对应）
+python <skill>/scripts/scan_seed.py .subtitle-polish/slices/<stem>_p1.txt \
+    --out .subtitle-polish/reports/seed-<stem>_p1.json
+
+# 2) 词表判定（给主 agent 合并时核对，不作为判据）
+python <skill>/scripts/scan_inclusive.py <ass> --srt <srt> --layer L1,L2,L3
+# 退出码 0 = 词表无命中；1 = 有命中（不是错误）；2 = 输入非法
+```
+
+- **锚点只用于定位**：`seed-*.json` 的 `instruction` 段原样贴进 `{seeds}`。agent 必须通读自己
+  那一片，**锚点外也可报**（换了说法的首次/主权/歧视），但必须写理由。
+- **agent 自己判 L1/L2/L3**：L1 换词即可；L2 需看英文与上下文，且**不得直接采纳**脚本给的
+  `suggestion`；L3 只进报告不改；判「不是问题」的锚点记 `false_positive`。
+- **白名单是默认值，不是禁区**：`whitelist_hits` 形态的行默认判「不是问题」。agent 若认为确实该改，
+  只能写 L3 并给理由，**不得自行生成替换词绕过白名单**，同时写进报告「建议改清单」交人。
+- **C 子域（政治与主权）零自动改**：一律 `flag`，不进 `fixes.json`。政治是判断问题而非词语问题，
+  脚本给不出、agent 也不该给「改法」。要落盘需显式 `--politics` 且仍须门 2 逐条确认。
+- **清单只是起点**：完整清单在 `references/inclusive-language.md`，脚本内置清单与之同源，
+  `tests/test_subtitle_polish_inclusive.py` 的 `t_list_in_sync_with_md` 会抓漂移。
+  **但清单外的表述是常态，不是意外**——锚点之外也要报（须写清为什么），这才是本类的主要产出。
+
+**`scan_inclusive.py` 返回 0 条候选时，不许在报告里写「本类无问题」**——只写「词表无命中」。
+两者差别就是「判过了」和「只查了词表」。
 
 ## 4. 验证轮1（按类别打包）
 
@@ -146,6 +214,18 @@ python <skill>/scripts/pre_audit.py <slice.txt> --context .subtitle-polish/conte
 
 ## 6. 人确认门1
 
+**门 1 是「监管轴」上的一个点，不是流程的固定阶段。** 处置由监管模式决定：
+
+| 监管 | 门 1 |
+|---|---|
+| 逐步（默认） | 停下等用户逐条裁定 |
+| 无监管（`--auto`） | **不停**。默认全量 `accepted`，`enabled=true` 直接进 fixes.json。报告里每条仍保留「建议译文 + 问题描述」，供人事后逐条否决 |
+
+无监管模式下**唯一不自动 accepted 的情形**是本轮 `n_fixes / 总块数 > 30%`——
+此时不放行，本轮按 `skip` 处理并回滚（`rounds-spec.md` §4 最后一行），总账写「该轮建议发散，需人工」。
+
+逐步模式下的门 1 细则：
+
 - 把 audit-report.md 路径告诉用户，**停下**。
 - 用户回复形式："修 <id列表>，<id> 是误报，<id> 特意翻的"。
 - **回复自相矛盾时**（如"6 字幕正确"+"修 1-4 和 6"）**不要猜**，用 AskUserQuestion 对矛盾的 id 逐条澄清：accepted / misreport / intentional / skipped。自然语言报 id 列表容易自带矛盾，逐条结构化澄清能从源头消除。
@@ -176,6 +256,15 @@ python <skill>/scripts/apply_fixes.py .subtitle-polish/fixes.json --dry-run
 
 ## 9. 人确认门2
 
+同样是监管轴上的点：
+
+| 监管 | 门 2 |
+|---|---|
+| 逐步（默认） | 停下等用户显式 accept |
+| 无监管（`--auto`） | **不停**。`gate_out`（dry-run）通过即 `--accept`。dry-run 报定位失败/撞车 → 本轮 `skip`，不执行 |
+
+逐步模式细则：
+
 - 把 dry-run.md 路径告诉用户，**停下**。
 - 用户显式 accept 后才执行。**门1的"修 1-5"只授权生成 fixes.json 和跑 dry-run，不等于门2通过**。除非用户在门1明确说"全修并直接执行"（合并语义），否则必须等门2独立确认。
 - 用 AskUserQuestion 让用户选译文时，**选项 label 必须唯一**；省略号统一全角 `……` 或半角 `…`，不要混用（视觉差异极小易被当重复，上一轮实测因此触发校验报错要重试）。
@@ -185,6 +274,9 @@ python <skill>/scripts/apply_fixes.py .subtitle-polish/fixes.json --dry-run
 ```bash
 python <skill>/scripts/apply_fixes.py .subtitle-polish/fixes.json --accept --batch-id <ts>
 ```
+
+- **batch_id 一轮一个，全局唯一。** 无监管模式由 `round_orchestrator.py init_run` 传入，
+  不要手写、不要复用（`rounds-spec.md` §8）。
 - 按 srt_id + track 定位（srt_id→timestamp→ass Dialogue）。
 - 每条写 `.subtitle-polish/log.jsonl`（ts/batch_id/action/file/srt_id/track/old_text/new_text/category/reason）。
 - 备份原文件为 `.bak`。
@@ -202,6 +294,15 @@ python <skill>/scripts/align_audit.py   --sub <ass> --media <片源>   # 有片�
 ```
 
 第三条缺片源时跑不了，**结案结论必须是 UNVERIFIED，不能写「通过」**。报告里不许出现「全部通过」「验证完毕」这类措辞。**不要用「对本片内嵌字幕流」代替**——实测 8 集里有 3 集的内嵌流自己就偏 2.4~2.9 秒，拿它当基准等于自证。
+
+**失败时的处置按监管模式分叉**（`rounds-spec.md` §3 六道闸）：
+
+| 闸 | 逐步 | 无监管 |
+|---|---|---|
+| `verify_fixes` 有失败 | 停下给人看,不得自行结案 | **回滚本轮快照**,本轮 `verdict=rollback`,后续轮次照跑 |
+| `cross_check` 有预警 | 每条都要人看 | 不阻断,进 `final-report.md` 的改动总账待裁 |
+| `regression_check` 有冲突 | 人看 | 标记;下一轮 prompt 强制贴台账 |
+| `timeline_gate` FAIL/AMBIGUOUS | 停 | **整体定格**,后续轮次全 skip |
 
 写结论前先跑闸门，它读凭据、不跑模型，毫秒级：
 
@@ -246,8 +347,13 @@ python <skill>/scripts/cross_check.py --batch-id <ts>
 **每轮开工前先读台账**（skill-forge issue #5 #6）：
 
 ```bash
-python <skill>/scripts/regression_check.py --ledger --conflicts --window 3
+python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 ```
+
+`--no-reason` 是**给 prompt 用的那一份**：只给「哪一行被改成什么」这个事实，不给上一轮的
+`reason`（判断结论）。贴以前把理由也贴进去，agent 会顺着上轮逻辑往下推——`bag` 那次连推
+三轮就是这么发生的。要人工复看理由，另跑一次不带 `--no-reason` 的（那份别贴进 prompt）。
+详见 `prompt-injection.md` 规则 4。
 
 输出 `.subtitle-polish/reports/regression.md`，三样东西：
 
@@ -288,10 +394,17 @@ R8 这正是菲尔的强项 → 这就是菲尔的地盘     （又改回去）
 其余仍需人做的事：
 
 - 重跑审计前，先确认上一轮 verify + 对照复核都过了；不过就回滚，不要把坏状态当基线。
-- 每轮开始前**保留一份快照**（如 `.subtitle-polish/<run>/S06E04.eng.ass.before.bak`），与执行后做 diff；
+- **每轮开始前保留一份快照**。无监管模式由 `round_orchestrator.py` 自动做
+  （`.subtitle-polish/runs/<stamp>/rNN.ass` + `logs/rNN.jsonl`，见 `rounds-spec.md` §5）；
+  逐步模式手工存 `.subtitle-polish/<run>/S06E04.eng.ass.before.bak`，与执行后做 diff。
   差异里出现「中文行内容等于其邻块内容」的，直接判为回归。
 - 报告里写明本轮相对快照改了多少行（中文/英文各几行），便于下一轮比对。
+- 每轮跑完记一次轮次状态（`n_fixes` / `verdict` / `snapshot`），否则后面算不出沉住度：
 
+  ```bash
+  python <skill>/scripts/round_orchestrator.py --run <stamp> --record r07 \
+      --n-fixes 12 --verdict keep --batch-id <ts>
+  ```
 
 ## 全局替换（跨文件统一专名）
 

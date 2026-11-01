@@ -223,6 +223,7 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 | 判据 | 看什么 | 产物 |
 |---|---|---|
 | 台账 | 近 N 轮改过哪些行 / 改成什么 / 当时理由 | `regression_check.py --ledger` |
+| 台账（贴 prompt 用） | 同上但**不含理由列**，防判断结论注入 | `regression_check.py --ledger --no-reason` |
 | 连续改动 | 同一 `(file, srt_id, track)` 被 ≥2 个 batch 改过 | `--conflicts` |
 | 沉住 | 改过、但最近 N 轮没再被动 | `--settled` |
 | 批次沉住度 | 每轮改的行里，后来又被改过的比例 | 报告「批次沉住度」表 |
