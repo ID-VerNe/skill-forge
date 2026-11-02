@@ -418,6 +418,16 @@ def _replace_text(e, new_text: str):
     - new_text 不带标签：补原行标签（如 {\\be3}新译文）
     - new_text 带 {\\an8}：保留原 {\\be3} + 追加 {\\an8}（{\\be3}{\\an8}新译文）
     - new_text 带与原行相同标签：去重，不重复
+
+    ⚠️ 这里**不对 new_body 做 strip**。曾经有人为了「顺手清理行尾空格」加了一句
+    `new_body.strip()`，结果是：final_new 与原译只差一个尾部空格时，写盘后
+    `e.text` 与原值不同 → 差异检测多出一条 → 报告里「改了几条」从 36 变 37，
+    而 log 里查不到任何对应条目（因为没有任何 fix 触发写盘）。
+
+    那个空格本不该算改动。口径见 pipeline-spec「空白修剪不计入语义改动」：
+    空白增减既不产生 log 条目，也不该被当成一处语义差异；要比对就先归一化再比。
+    **清理空白属于 precheck_punct 的职责**（有独立 action、有 log），不该顺手混进
+    replace 里——混进来的改动无人记账，台账就不再是唯一真相来源。
     """
     orig_tags, _ = extract_leading_tags(e.text)
     new_tags, new_body = extract_leading_tags(new_text)
