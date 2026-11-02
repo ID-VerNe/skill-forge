@@ -123,7 +123,7 @@ S06E04 那次 3% 的教训就是拿规则去近似语义判断——同样的错
 
 - **`prompts/review_and_polish_v2.prompt`**（`C:\Users\VerNe\Downloads\Documents\translate_principle\subtitle pipeline source\subtitle\prompts\`）：口语优先/情绪还原/节奏把控/文化本地化/人物一致性五原则；禁用书面语 `进行`/`实施`/`开展`
 - **`core/quality_checker.py`**（同 pipeline）：`TranslationQualityChecker` 类，书面语黑名单 + 机翻特征正则 + 长度比。skill 的 `scripts/check_fluency.py` 照搬此规则（收窄了长度比阈值以适应字幕单行）
-- **`prompts/post_check.prompt`**：第 5 维"语域匹配与机翻腔消除"（adversarial 终审维度）
+- **`prompts/post_check.prompt`**：第 5 维"语域匹配与机翻腔消除"（终审维度，需逐条举证）
 - **`prompts/webui_step_3.prompt`**：语感分析"指出翻译腔过重的长难句"+ 边界界定（事实区死守/情感区放开）
 
 ## 报表约束

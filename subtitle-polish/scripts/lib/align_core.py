@@ -246,16 +246,86 @@ def robust_reject(pairs, k_mad=6.0, floor=1.5):
     时间轴，留着会把回归斜率拉飞（实测未剔除时 E08 首跑斜率 +0.000660，
     真实值 −0.000080）。
 
-    返回 (keep, info)。
+    返回 (keep, info)。info 里 **必须带上被剔掉的每一条**（C4，issue v1.15）：
+    原来只返回 `dropped` 计数，审计员看到「剔除离群 43 条」无法判断剔得对不对。
+    E02 的 whisper 剔 43、qwen 剔 50，其中最大 delta 达 −19.75 s——这种量级
+    到底是真的文本错位、还是门禁阈值设错了，只看计数永远答不上来。
+
+    info["thr_mode"] 说明阈值是哪个档生效的，因为这直接决定这条判据的性质：
+      - "floor"：mad 太小，`k_mad*mad` 低于 1.5 s 硬下限，实际卡的是 floor。
+        **此时 k_mad 参数完全没起作用**，改它不会有任何变化——这是最容易
+        误判调参方向的地方。
+      - "k_mad"：正常按 MAD 倍数在卡。
     """
     ys = [p[1] for p in pairs]
     if not ys:
-        return [], {"med": 0.0, "mad": 0.0, "thr": 0.0, "dropped": 0}
+        return [], {"med": 0.0, "mad": 0.0, "thr": 0.0, "thr_mode": "floor",
+                    "dropped": 0, "drop_idx": [], "rejected": [],
+                    "max_abs_dev": 0.0}
     med = median(ys)
     mad = mad_of(ys, med)
-    thr = max(floor, k_mad * mad)
-    keep = [p for p in pairs if abs(p[1] - med) <= thr]
-    return keep, {"med": med, "mad": mad, "thr": thr, "dropped": len(pairs) - len(keep)}
+    k_thr = k_mad * mad
+    thr = max(floor, k_thr)
+    keep, rejected = [], []
+    for p in pairs:
+        dev = p[1] - med
+        if abs(dev) <= thr:
+            keep.append(p)
+        else:
+            # 带偏差值与方向：正=音频晚于字幕，负=字幕晚于音频。
+            # 只给 idx 和 delta，审计员还得自己回去减中位数。
+            rejected.append({
+                "idx": p[2] if len(p) > 2 else None,
+                "start": round(p[0], 3),
+                "delta": round(p[1], 4),
+                "dev": round(dev, 4),
+            })
+    rejected.sort(key=lambda r: -abs(r["dev"]))
+    info = {
+        "med": med,
+        "mad": mad,
+        "thr": thr,
+        "thr_mode": "floor" if floor >= k_thr else "k_mad",
+        "k_mad": k_mad,
+        "floor": floor,
+        "dropped": len(pairs) - len(keep),
+        # drop_idx 是给下游做集合运算的（"这条为什么没进拟合"），
+        # rejected 是给人看的（排序后偏差最大的在最前）。
+        "drop_idx": [r["idx"] for r in rejected],
+        "rejected": rejected,
+        "max_abs_dev": abs(rejected[0]["dev"]) if rejected else 0.0,
+    }
+    return keep, info
+
+
+def format_reject_table(info, limit=20):
+    """把 robust_reject 的 info 渲染成几行可打印文本（CLI 与报告共用）。
+
+    limit：控制台只印偏差最大的前 N 条，末尾补「共 N 条」。
+    **返回全文，不截断调用方要落盘的部分**——截断只作用于显示，
+    这与 D1（报告不许截断）是同一条纪律：给人看的地方可以省行，
+    留证据的地方不能。
+    """
+    n = info.get("dropped", 0)
+    if not n:
+        return ["  离群剔除：0 条（无需复核）"]
+    mode = info.get("thr_mode")
+    head = ("  离群剔除 %d 条：阈值 %.2f s 生效于 **%s**"
+            % (n, info.get("thr") or 0.0,
+               "硬下限 floor（k_mad=%.1f 未起作用）" % (info.get("k_mad") or 0.0)
+               if mode == "floor"
+               else "k_mad×MAD（MAD=%.3f）" % (info.get("mad") or 0.0)))
+    out = [head,
+           "  最大偏差 %.2f s" % (info.get("max_abs_dev") or 0.0),
+           "  偏差最大的 %d 条（dev=delta−中位，正=音频晚于字幕）："
+           % min(limit, n)]
+    for r in (info.get("rejected") or [])[:limit]:
+        out.append("    idx=%-6s start=%-9.3f delta=%+.3f dev=%+.3f"
+                   % (r["idx"] if r["idx"] is not None else "?",
+                      r["start"], r["delta"], r["dev"]))
+    if n > limit:
+        out.append("    …（共 %d 条，完整清单见 --json 的 stats.reject.rejected）" % n)
+    return out
 
 
 def linear_fit(pairs):

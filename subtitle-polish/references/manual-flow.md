@@ -20,6 +20,10 @@
 
 **多轮迭代时，每轮 M2 开始前重新跑 extract_slice.py**——切片是提取时的快照，上一批 accept 后 ASS 已变，旧切片的"现译"列是过期数据，直接 grep 会导致 dry-run 自检时现译与用户描述不符。第一轮无需重提（ASS 未动）。
 
+> 重提时，`--out` 目录里若有上一轮切片，会被整目录改名为 `<out>_stale_<时间戳>/`（A2，issue v1.15）。
+> **这是归档不是删除**——上一轮切片的「现译」列过期了，但它是上一轮判定的依据，
+> 事后要回答「当时看到的是什么」得靠它。同目录两套并存才是真问题（基准分裂）。
+
 ```bash
 python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slices/
 ```

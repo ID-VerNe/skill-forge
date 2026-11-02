@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import os
 import re
 from dataclasses import dataclass, field
@@ -28,6 +29,11 @@ from .time_fmt import ass_to_seconds, srt_to_seconds
 
 TIME_TOLERANCE = 0.5  # 秒，时间戳模糊匹配容差
 TEXT_RATIO_THRESHOLD = 0.85  # 文本相似度阈值
+
+# 容差窗外最近邻差值的上报上限（秒）。超过它就认为该块在 ASS 里
+# 根本没对应内容（素材不同版 / 轨缺失），报「配对失败」而不是「错位 N 秒」。
+# 30 s 足够覆盖连续漂移曲线的量级（S06E02 全长 869 块、最大差 1.92 s）。
+MAX_REPORTABLE_OFFSET = 30.0
 
 TRACK_EN = "英文"
 TRACK_ZH = "中文"
@@ -300,6 +306,35 @@ def _match_by_time_and_text(srt_block: SrtBlock, ass_blocks: List[AssDialogue]) 
     return deduped
 
 
+def _nearest_ass_offset(srt_block: SrtBlock, ass_blocks: List[AssDialogue]):
+    """容差窗外最近的 ass 起点与 srt 起点之差（秒）。没有任何 ass 行时返回 None。
+
+    只用来**判断「到底是错位还是缺失」**，不参与配对决策——配对仍是
+    `_match_by_time_and_text` 的事，这里多出来的信息只写进异常标记，
+    不改任何一行是否被配上（改配对行为要连带改 A5 定位器，是批次 F 的事）。
+
+    为什么按时间轴取最近邻而不是按索引：两轨条数不同（S06E02 是
+    ass 1738 / srt 869，ass 有中英两条各 869 条但有 95 条 ass_only），
+    同索引根本不指向同一句台词。
+
+    阈值 MAX_REPORTABLE_OFFSET 的用处：差 30 秒的「最近邻」说明这一块
+    在 ASS 里压根没有对应内容，那是缺失不是错位。超过就不报偏移量，
+    让调用方走 PAIRING_FAILED 分支。
+    """
+    if not ass_blocks:
+        return None
+    starts = sorted({b.start for b in ass_blocks})
+    i = bisect.bisect_left(starts, srt_block.start)
+    cands = [starts[j] for j in (i - 1, i) if 0 <= j < len(starts)]
+    if not cands:
+        return None
+    near = min(cands, key=lambda x: abs(x - srt_block.start))
+    off = near - srt_block.start
+    if abs(off) > MAX_REPORTABLE_OFFSET:
+        return None
+    return off
+
+
 def pair(ass_blocks: List[AssDialogue], srt_blocks: List[SrtBlock]) -> List[PairedBlock]:
     """按 srt 块配对 ass 行，生成 PairedBlock 列表。"""
     paired = []
@@ -346,10 +381,27 @@ def pair(ass_blocks: List[AssDialogue], srt_blocks: List[SrtBlock]) -> List[Pair
                         break
         # 漏译：有英文无中文（音效块除外）
         if pb.english and not pb.chinese:
-            anomalies.append("SRT_HAS_ASS_NONE")  # 中文行缺失
+            anomalies.append("ZH_MISSING")
+        # 两边都没配上，且不是纯音效块 —— 必须再往下分两种（A1，issue v1.15）。
+        #
+        # 原本这两种共用一个 SRT_HAS_ASS_NONE，`pipeline-spec.md` 又把含义写成
+        # 「漏译/丢行」，于是「没配上」被读成「漏译」，审计员照着去补内容。
+        # S06E02 的 R5 p1 报出 38 条假漏译、重跑归零，根因就在这里。
+        #
+        # 第一版修正只把它们拆成 ZH_MISSING / PAIRING_FAILED 两个名字，**还不够**：
+        # 实测 S06E02 全片 869 块里被标 PAIRING_FAILED 的 47 条，逐条回查 ASS
+        # **全部都有完整中英对照**，一条都不是「两边都空」——它们是 srt 与 ass
+        # 的起点差 0.50~1.92 s、超出了 ±0.5 s 容差窗。两类事故的处置完全相反：
+        #   超容差     → 轴的问题，该放宽容差或先做轴校准，**绝不能补译**
+        #   真的没有行 → 素材不同版/轨缺失，该换素材
+        # 合成一个标签，读的人分不出来，只会一律当「漏译」处理。
         if not pb.english and not pb.chinese and not sb.is_sound_effect_only():
-            # 非音效却两边都没匹配，标 SRT_HAS_ASS_NONE
-            anomalies.append("SRT_HAS_ASS_NONE")
+            # 容差窗外最近的 ass 起点差多少：有值 → 是错位，不是缺失。
+            near = _nearest_ass_offset(sb, ass_blocks)
+            if near is not None:
+                anomalies.append(f"PAIRING_OUT_OF_TOLERANCE(off={near:+.2f}s)")
+            else:
+                anomalies.append(f"PAIRING_FAILED(srt_id={sb.index})")
         pb.lines = track_lines
         pb.anomalies = anomalies
         paired.append(pb)

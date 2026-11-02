@@ -12,7 +12,16 @@
   这不是建议范围，是硬边界：报出去的 srt_id 只要落在这个区间外，下游 `apply_fixes`
   会直接 reject（A2 的结构预检），证据一下就全没了。见下文「## srt_id 的边界」。
   每行还带 `<ass_time>` 时间戳（如 `0:01:16.56-0:01:18.00`），你在输出里**必须保留**，方便人对照视频定位。
-- 切片头注可能含异常标记：ASS_HAS_SRT_NONE / SRT_HAS_ASS_NONE / ONE_TO_MANY / MULTI_SAME_LANG / ASS_TRACK_OVERWRITE（英文行内容含中文字符，即英文轨被中文覆盖）（这些本身就要报为问题或辅助判断）
+- 切片头注可能含异常标记：ASS_HAS_SRT_NONE / **ZH_MISSING** / **PAIRING_OUT_OF_TOLERANCE(off=±N.NNs)** / **PAIRING_FAILED(srt_id=N)** / ONE_TO_MANY / MULTI_SAME_LANG / ASS_TRACK_OVERWRITE（英文行内容含中文字符，即英文轨被中文覆盖）（这些本身就要报为问题或辅助判断）
+  - **`ZH_MISSING`**：英文在、中文空 → 这是**真漏译**，报「译文缺失」。
+  - **`PAIRING_OUT_OF_TOLERANCE(off=±N.NNs)`**：两边都空，但 ASS 里**有这句**，
+    只是起点差超了 ±0.5s（off 就是差值）。这是**轴**的问题，不是漏译。
+    报「srt_id N 时间轴超容差 off=…，需先校轴」，**不要补译**——原文和译文都在，
+    你补的那条会和 ASS 里已有的撞车。
+  - **`PAIRING_FAILED`**：两边都空，且 ASS 里**根本没有对应行** → 真缺内容。
+    报「srt_id N 无对应行，疑素材不同版」，同样**不要补译**——英文原文都不在，
+    补出来只能是凭空编的。
+    （这三个标记原本共用一个 `SRT_HAS_ASS_NONE`，E02 因此报出 38 条假漏译。）
 
 ## 项目背景
 

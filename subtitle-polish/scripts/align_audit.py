@@ -316,6 +316,11 @@ def print_summary(name, stats, n_rows, engine):
           % (stats["n_pairs"], n_rows,
              100.0 * stats["n_pairs"] / n_rows if n_rows else 0.0,
              stats["reject"]["dropped"], stats["reject"]["thr"]))
+    # C4（issue v1.15）：剔除必须给清单，不能只给计数。
+    # "剔了 43 条"和"剔了哪 43 条、偏差多大"是两件事——后者才能回答
+    # "剔得对不对"。控制台限制条数，完整清单进 --json。
+    for ln in ac.format_reject_table(stats.get("reject") or {}):
+        print(ln)
     print("  delta 中位 %s  MAD %.3f" % (_fmt(stats["median"]), stats["mad"]))
     print("  斜率 %+.6f  全长 %s s  (跨度 %.0fs)"
           % (stats["slope"], _fmt(stats["drift"], 2), stats["x_span"]))
@@ -349,6 +354,30 @@ def build_report(args, stats, n_rows, engine, compare, axis_res=None):
              % (stats["n_pairs"], n_rows,
                 100.0 * stats["n_pairs"] / n_rows if n_rows else 0.0,
                 stats["reject"]["dropped"], stats["reject"]["thr"]))
+    # C4：报告里也要有清单。审计报告是「事后唯一的判据记录」，
+    # 只写计数，等于要求读报告的人相信一个没被检验过的黑箱。
+    rej = stats.get("reject") or {}
+    if rej.get("dropped"):
+        L.append("")
+        L.append("### 离群剔除明细")
+        L.append("")
+        L.append("阈值 %.2f s，生效于 %s。最大偏差 %.2f s。"
+                 % (rej.get("thr") or 0.0,
+                    "硬下限 floor（`k_mad` 未起作用）"
+                    if rej.get("thr_mode") == "floor"
+                    else "`k_mad`×MAD",
+                    rej.get("max_abs_dev") or 0.0))
+        L.append("")
+        L.append("| idx | start(s) | delta | dev=delta−中位 |")
+        L.append("|---|---|---|---|")
+        for r in rej.get("rejected") or []:
+            L.append("| %s | %.3f | %+.3f | %+.3f |"
+                     % (r["idx"] if r["idx"] is not None else "?",
+                        r["start"], r["delta"], r["dev"]))
+        L.append("")
+        L.append("> dev 为正 = 音频发声晚于字幕显示。若整批 dev 同号且量级接近，"
+                 "多是一次整体错位（该修轴），不是噪声（该剔）；"
+                 "若正负混杂且量级分散，才是文本不一致。")
     L.append("")
     # 结案口径钉在开头：这份报告的结论只有三态，不写「基本对上」这类模糊话。
     L.append("## 时间轴状态")
@@ -521,6 +550,10 @@ def main():
         with open(args.asr_words, encoding="utf-8") as f:
             tokens = [tuple(x) for x in json.load(f)]
         engine = "asr-words:" + os.path.basename(args.asr_words)
+        # 复用词级缓存时模板名仍是「对齐器」：threshold 是引擎的属性，不是
+        # 本次是否真的跑了模型的属性。whisper 的缓存也要拿 whisper 的阈值判。
+        if args.engine == "qwen":
+            engine = "qwen3-forced-aligner"
         args.media_path = args.media or "(未提供音频)"
     else:
         args.media_path = ac.media_to_wav(args.media, args.cache_dir)
@@ -541,6 +574,15 @@ def main():
             alt_runs = runs[1:]
             engine = "qwen3-forced-aligner"
             args.chunks_used = [c for c, _ in runs]
+            # 缓存主分块那趟：同集后续的重审（改完轴再来一遍）不必重跑模型。
+            qcache = os.path.join(
+                args.cache_dir,
+                "asr_words_qwen_%s.json"
+                % os.path.splitext(os.path.basename(args.sub))[0])
+            os.makedirs(os.path.dirname(qcache) or ".", exist_ok=True)
+            with open(qcache, "w", encoding="utf-8") as f:
+                json.dump([list(t) for t in tokens], f)
+            print("  [cache] %s" % qcache)
         else:
             model = args.model or "large-v3"
             cache = os.path.join(
@@ -637,7 +679,7 @@ def main():
 
     if args.json:
         os.makedirs(os.path.dirname(args.json) or ".", exist_ok=True)
-        keep, _ = ac.robust_reject(pairs)
+        keep, rej_info = ac.robust_reject(pairs)
         spec, base, fdiag = ac.spec_from_pairs([(p[0], p[1]) for p in keep])
         if fdiag["verdict"] != "FIT_OK":
             print("[!] 拟合被拒：%s" % fdiag.get("reason", ""), file=sys.stderr)
@@ -654,6 +696,11 @@ def main():
             "curve_base": round(base, 4) if stats["verdict"] == "FAIL" else 0.0,
             "curve_applicable": stats["verdict"] == "FAIL" and spec is not None,
             "fit": fdiag,
+            # C4：这里再算一次 robust_reject 是为了让「喂给 spec_from_pairs 的
+            # 到底是哪些点」有据可查。stats.reject 来自 summarize() 的首次剔除，
+            # 两次输入相同、阈值相同，结果必然一致；落地到 json 里是为了让
+            # 下游（align_patch / 报告 / 取证）不必重跑也能核对。
+            "reject": rej_info,
             "verdict": stats["verdict"],
             "axis": axis_res,
         }

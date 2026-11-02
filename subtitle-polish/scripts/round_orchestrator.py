@@ -552,6 +552,35 @@ def _rollback_cmd(ass: str, batch_id: str = "", srt_id=None) -> str:
     return "# 无可用回滚标识"
 
 
+def _md_cell(text, limit: int = 0) -> str:
+    """把任意文本塞进 Markdown 表格单元格（D1，issue v1.15）。
+
+    这里是**去截断**，不是换一种截断：
+      原来四处写着 `[:16]` / `[:18]` / `[:20]`，改动总账里「原译」和「终译」
+      只显示前 20 个字。而这一列就是整份报告的存在理由——读报告的人要判断
+      「这条改动对不对」，看的是完整的两句话。截到 20 字之后，「He was going
+      to say」和「He was going to say something」在表里长得一模一样，两条
+      不同的改动在视觉上无法区分。
+
+    真正需要处理的不是长度，是表格抗性：
+      - `|` 会被解析成分列符，整行错位 → 转义成 `\\|`
+      - 换行会截断表格行 → 换成 `<br>`（Markdown 表格内可用）
+      - `\\` 本身要先转义，否则会吃掉后面补的转义符
+    limit 参数留给调用方显式限制，**默认 0 = 不限**——纪律是「默认给全」，
+    要短得由调用方明说不说「顺便截一下」。
+    """
+    if text is None:
+        return ""
+    s = str(text)
+    s = s.replace("\\", "\\\\")
+    s = s.replace("|", "\\|")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.replace("\n", "<br>")
+    if limit and len(s) > limit:
+        s = s[:limit] + "…"
+    return s
+
+
 def render_report(wd: str, stamp, extra_stamps=None) -> str:
     """出总账。`stamp` 可传单个 run 名，也可传列表（D3：`--runs a,b`）。
 
@@ -644,7 +673,7 @@ def _render_single_report(wd: str, stamp: str) -> str:
         for c in conflicts:
             sid = c["key"][1]
             trail = " → ".join(
-                "「%s」" % (t.get("new", "")[:16] or "—") for t in c["trail"])
+                "「%s」" % (_md_cell(t.get("new", "")) or "—") for t in c["trail"])
             # B3：这一列以前硬写着 `--rollback id=N`，但只有 srt_id 没有 file，
             # 照着抄会回滚到**同号的所有文件**。走 _rollback_cmd() 统一生成，
             # 顺带把 file 带上。
@@ -669,8 +698,8 @@ def _render_single_report(wd: str, stamp: str) -> str:
         for s in struct[:40]:
             L.append("| %s | %s | %s | %s → %s | %s |" % (
                 s.get("kind", "?"), s.get("srt_id", ""), s.get("track", ""),
-                (s.get("old_text") or "")[:18], (s.get("new_text") or "")[:18],
-                (s.get("reason") or "")[:20]))
+                _md_cell(s.get("old_text")) or "", _md_cell(s.get("new_text")) or "",
+                _md_cell(s.get("reason")) or ""))
         if len(struct) > 40:
             L.append("| … | | | 其余 %d 条见 log.jsonl | |" % (len(struct) - 40))
         L += ["", "> 这些改动没有走 fixes.json 的撞车预检，冲突排查时优先看这里。", ""]
@@ -682,7 +711,7 @@ def _render_single_report(wd: str, stamp: str) -> str:
         for r in ledger:
             cmd = _rollback_cmd(r.get("file") or m["ass"], srt_id=r["srt_id"])
             L.append("| %s | %s | %s | %s | %s | %s | `%s` |" % (
-                r["srt_id"], r["track"], r["old"][:20] or "—", r["new"][:20] or "—",
+                r["srt_id"], r["track"], _md_cell(r["old"]) or "—", _md_cell(r["new"]) or "—",
                 r["category"] or "—", len(r["batches"]), cmd))
         L.append("")
         # B3：整批回滚给的是 batch_id，不是轮 id——两者长得像（都在 --run 上下文里），

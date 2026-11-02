@@ -63,7 +63,14 @@ python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slice
 - 按 srt 块序号切，~700 块/份 + 100 块 overlap。
 - 输出 `.subtitle-polish/slices/<stem>_p<n>.txt`，一 block 一行：
   `<srt_id> | <ass_time> | <英文> | <中文> | <注释>`
-- 头注列异常标记：ASS_HAS_SRT_NONE / SRT_HAS_ASS_NONE / ONE_TO_MANY / MULTI_SAME_LANG / ASS_TRACK_OVERWRITE
+- 头注列异常标记：ASS_HAS_SRT_NONE / ZH_MISSING / PAIRING_OUT_OF_TOLERANCE(off=±N.NNs) / PAIRING_FAILED(srt_id=N) / ONE_TO_MANY / MULTI_SAME_LANG / ASS_TRACK_OVERWRITE
+  （`ZH_MISSING`=英文在中文空，真漏译；`PAIRING_OUT_OF_TOLERANCE`=有内容但超出 ±0.5s，轴错位；`PAIRING_FAILED`=真的没有对应行。三者都不该补译。见 `pipeline-spec.md` 异常标记表。）
+- **两道门禁先过再写盘**：① 整份非空率 < 50% → 整份作废；② 未配上率 > 10% → abort 并列 srt_id 与形态构成。
+  顺序固定（先空再零星），反过来会让全空切片先报「未配上 100%」。
+  **门禁不许绕过**：过不去说明轴或素材有问题，先修再切。
+- **重建即归档**：`--out` 目录里已有切片时，整目录改名为 `<out>_stale_<YYYYmmdd_HHMMSS>`，
+  不做原地覆盖。旧切片是上次判定的依据（报告说「R7 p2 读了 slices_v2」，事后取证靠它），
+  但同目录两套并存正是审计事实基准分裂的成因。**归档不删除。**
 
 ## 2.5. 标点预检
 
@@ -188,7 +195,7 @@ python <skill>/scripts/scan_inclusive.py <ass> --srt <srt> --layer L1,L2,L3
 
 - 把同类问题打包给一个验证 agent，prompt 用 `prompts/verify.tmpl`（支持 `{findings}` 列表，多条独立给结论）。
 - 输入：每条问题 + 前后各 5 块上下文 + srt 原文。**上下文用 `scripts/build_verify_ctx.py` 构造**（输入 findings.json + 切片文件 + srt，输出 verify_ctx.txt，主 agent 把输出 inline 进 `{findings}` 占位符，不靠 SendMessage 二次喂、不让 verify agent 自己 Read ctx 文件）。
-- **adversarial 默认驳回**：只有找不到反驳理由才确认。**prompt 构造见 `prompt-injection.md`**：verify prompt 不放项目背景段（verify.tmpl 本身没有该占位符），主 agent 不得在模板外私加。
+- **逐条举证，双向驳回**：复核员对每条发现回答「证据是否支持这个改动」，确认和驳回**都要给出原文依据**，只写「不像问题」不算理由。不得设方向性默认值（原来的「adversarial，默认驳回」已废弃）。**prompt 构造见 `prompt-injection.md`**：verify prompt 不放项目背景段（verify.tmpl 本身没有该占位符），主 agent 不得在模板外私加。
 - 验证 agent 发现 srt_id 与 srt 原文不符时，输出 `corrected_srt_id`（发现报的 id 错但英文真实存在时）；发现**喂来的上下文块 srt_id 与实际不符**时，输出 `context_error`（结构化字段，描述哪个上下文块 id 错了）。主 agent 见到 `context_error` 必须重读切片构造上下文重跑 verify，不能埋掉。
 - 补 agent 触发（绝对阈值，**超过即必须补，不得加软条件跳过**）：某文件验证驳回率 > 40%，或确认问题密度 > 1/100 块 → 补 agent 重看**整个文件**。最多补 2 轮。单文件场景阈值同样适用。详见 `pipeline-spec.md` 补 agent 节。
 

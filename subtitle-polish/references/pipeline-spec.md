@@ -41,11 +41,31 @@
 | 标记 | 含义 |
 |------|------|
 | `ASS_HAS_SRT_NONE` | ass 有 Dialogue 但 srt 没有对应块（ass 多出行） |
-| `SRT_HAS_ASS_NONE` | srt 块在 ass 里找不到对应（漏译/丢行） |
+| `ZH_MISSING` | 配上了英文、中文轨是空的 —— **真·漏译**，该补 |
+| `PAIRING_OUT_OF_TOLERANCE(off=±N.NNs)` | 两边都空，但 ASS 里有这句，只是**起点差超出 ±0.5s 容差窗** —— 轴错位，该校轴，**不是漏译、不是缺内容** |
+| `PAIRING_FAILED(srt_id=N)` | 两边都空，且 ASS 里**根本没有对应行** —— 素材不同版 / 轨缺失，该换素材 |
 | `ONE_TO_MANY` | 一个 srt 块在 ass 里配到多个时间戳相近的行 |
 | `MULTI_SAME_LANG` | 同一 block 内有多个英文行或多个中文行（不允许；最多英-中-注） |
 | `ASS_TRACK_OVERWRITE` | 英文行的可见文本含中文字符（英文轨被中文覆盖，生产缺陷） |
 | `TIME_TEXT_DRIFT` | 时间戳匹配但英文文本仅部分相似（ass 可能人工调轴），需人工核查 |
+
+> **三个「没配上」的标记必须分开（A1，issue v1.15）。**
+> 它们原本共用一个 `SRT_HAS_ASS_NONE`，而这张表又把含义写成「漏译/丢行」——
+> 于是「配对没成」被读成「这几行漏译了」，审计员照着去补内容。
+> E02 的 R5 p1 报了 38 条假漏译、重跑后归零，根因就在这里。
+>
+> 判别顺序（**先看英文轨，再看 ASS 里有没有**）：
+> 1. 英文有、中文空 → `ZH_MISSING`（漏译）
+> 2. 两边都空，容差窗外 30 s 内有 ass 起点 → `PAIRING_OUT_OF_TOLERANCE`（轴错位）
+> 3. 两边都空，30 s 内什么都没有 → `PAIRING_FAILED`（真缺内容）
+>
+> **只拆成前两种是不够的**（第一版修正的教训）：S06E02 全片 869 块里
+> 被标「配对失败」的 47 条，逐条回查 ASS **全部都有完整中英对照**——它们是
+> 起点差 0.50~1.92 s 的超容差，一条真缺失都没有。两类处置完全相反，
+> 合成一个名字就等于没分。
+>
+> 另注：`parse_ass` 会跳过空文本行，所以「ASS 行在但文本为空」在结构上
+> 不会出现在配对里——`PAIRING_FAILED` 只可能由「ASS 里压根没有这段」触发。
 
 ## 配对算法（lib/ass_srt_pair.py）
 
@@ -55,7 +75,7 @@
 2. 在 ass Dialogue 里找时间戳相差 ±0.5s 内的候选行。
 3. 对候选行做文本相似度（fuzzy ratio，归一化去标点/去说话人标记后），>85 才配对；纯音效块（srt 全是 `[xxx]`）按时间戳配即可。
 4. 时间戳不过但文本相似度 >85 → 仍配对并标 anomaly 提示时间偏移（应对 ass 人工调轴场景）。
-5. 任一校验不过 → 标 unpaired（SRT_HAS_ASS_NONE 或 ASS_HAS_SRT_NONE）。
+5. 校验不过 → 按**英文轨在不在、ASS 里有没有**分别标：英文在中文空 → `ZH_MISSING`；两边都空且容差窗外 30 s 内有 ass 起点 → `PAIRING_OUT_OF_TOLERANCE(off=…)`；30 s 内也没有 → `PAIRING_FAILED(srt_id=N)`。
 6. 一个 srt 块配到多行 → 同 track 取时间戳最近的（距离相同则全留，那是真重复行 → ONE_TO_MANY / MULTI_SAME_LANG）。
 7. 同一 block 内同语言多行（且时间戳距离不同）→ 已在 6 里去重，不会再误标 MULTI_SAME_LANG。真同时间戳重复行仍标 MULTI_SAME_LANG。
 8. 英文行可见文本含中文 → ASS_TRACK_OVERWRITE。

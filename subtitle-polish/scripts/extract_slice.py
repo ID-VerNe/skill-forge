@@ -35,6 +35,138 @@ DEFAULT_OVERLAP = 100
 # 于是整轮审计基于空气做出结论，报告上还写着「本轮已审」。
 MIN_NONEMPTY_RATE = 0.5
 
+# A1（issue v1.15）：未配上率上限。
+#
+# 与 MIN_NONEMPTY_RATE 不是同一个判据，别合并：
+#   非空率  低于 50%  = 「这份切片基本是空的」→ 整份作废
+#   未配上率 高于 10% = 「这份切片大部分是好的，但有相当一批块根本没配上」
+# 后者更隐蔽：切片看起来正常，只有零星几行是空的，审计员读到会当成「这几行漏译了」
+# 而去补内容。S06E02 的 38 条假漏译就是从 45 行空单元格来的（5.2%），
+# 当时没有这条判据，切片照常交给了子代理。
+MAX_UNPAIRED_RATE = 0.10
+
+# 旧切片归档目录名。重建切片时，如果 --out 指向的目录里已有别的切片，
+# 不做原地覆盖，整目录改名为 <out>_stale_<时间戳>。
+STALE_SUFFIX = "_stale"
+
+# 未配上的两种形态。**两者都算「未配上」，都要过门禁，但处置完全不同**，
+# 所以分开统计、分开报（A1 第二版修正）：
+#   PAIRING_OUT_OF_TOLERANCE → 轴错位。ASS 里有内容，只是起点差超了容差窗。
+#                              该放宽容差或先做轴校准；**补译是错的**。
+#   PAIRING_FAILED           → 真的没有对应行。素材不同版 / 轨缺失；该换素材。
+# 只统计后者的门禁等于形同虚设——S06E02 全片 47 条未配上，**全部**是前者，
+# 一条后者都没有。
+PAIRING_TAGS = ("PAIRING_FAILED", "PAIRING_OUT_OF_TOLERANCE")
+
+
+def _pairing_tag(pb):
+    """该块命中的未配上标记前缀；都未命中返回 ""。"""
+    for a in (pb.anomalies or []):
+        for tag in PAIRING_TAGS:
+            if a.startswith(tag):
+                return tag
+    return ""
+
+
+def pairing_failed_ids(paired, tags=PAIRING_TAGS) -> list:
+    """未配上的 srt_id 列表（默认两种形态都算）。"""
+    want = (tags,) if isinstance(tags, str) else tuple(tags)
+    return [pb.srt_id for pb in paired
+            if _pairing_tag(pb) in want]
+
+
+def pairing_offset(pb):
+    """从 PAIRING_OUT_OF_TOLERANCE(off=+0.69s) 里取偏移秒数；非该形态返回 None。"""
+    for a in (pb.anomalies or []):
+        if a.startswith("PAIRING_OUT_OF_TOLERANCE"):
+            m = re.search(r"off=([+-]?[\d.]+)s", a)
+            if m:
+                return float(m.group(1))
+    return None
+
+
+def _pairing_breakdown(paired) -> str:
+    """一行统计：两种形态各多少条、超容差的偏移区间。"""
+    oot = [p for p in paired if _pairing_tag(p) == "PAIRING_OUT_OF_TOLERANCE"]
+    hard = [p for p in paired if _pairing_tag(p) == "PAIRING_FAILED"]
+    parts = []
+    if oot:
+        offs = [abs(x) for x in (pairing_offset(p) for p in oot) if x is not None]
+        rng = ("（偏移 %.2f~%.2f s）" % (min(offs), max(offs))) if offs else ""
+        parts.append("超容差 %d 条%s" % (len(oot), rng))
+    if hard:
+        parts.append("无对应行 %d 条" % len(hard))
+    return " + ".join(parts)
+
+
+def assert_pairing_ok(paired, ass_path: str, srt_path: str,
+                      label: str = "") -> None:
+    """未配上率门禁（A1 / issue v1.15）。
+
+    **必须在写任何切片之前调**，与 assert_not_empty 同一个位置、同一个理由：
+    写出去再检查，坏切片已经在下一道工序手上了。
+    """
+    bad = pairing_failed_ids(paired)
+    total = len(paired)
+    if not total:
+        return
+    rate = len(bad) / total
+    if rate <= MAX_UNPAIRED_RATE:
+        return
+    sample = ", ".join(str(i) for i in bad[:20])
+    more = f" …（共 {len(bad)} 条）" if len(bad) > 20 else ""
+    raise SystemExit(
+        f"[!] {label} 未配上 {len(bad)}/{total} 块（{rate:.1%} > "
+        f"{MAX_UNPAIRED_RATE:.0%}）：{_pairing_breakdown(paired)}\n"
+        f"    srt_id: {sample}{more}\n"
+        f"    这不是「这些行漏译了」——这些块的英文和中文列都是空的。\n"
+        f"    若把切片交下去，审计员会看到空单元格并报成「译文缺失」，\n"
+        f"    然后去补根本不存在的内容（S06E02 的 38 条假漏译就是这么来的）。\n"
+        f"    先看是哪种形态再动手：\n"
+        f"      · **超容差**（切片头注带 off=±N.NNs）：ASS 里有这句，只是起点差\n"
+        f"        超出 ±0.5s。这是**轴**的问题——跑 align_audit.py 看是不是连续\n"
+        f"        漂移，或先对齐时间轴再切。放宽 TIME_TOLERANCE 是最后手段，\n"
+        f"        因为它会让相邻块互相抢行。\n"
+        f"      · **无对应行**：ASS 里没有这段内容。查是不是不同剪辑版 / 缺轨。\n"
+        f"    两类都**不要靠补译绕过**。\n"
+        f"    另可跑 structure_check.py --ass {ass_path} 查中英轨是否本身错位。")
+
+
+def archive_stale(out_dir: str) -> str:
+    """把 out_dir 里已有的切片整体归档，返回归档后的路径（没有旧文件则返回 ""）。
+
+    为什么归档而不是删（issue v1.15 决定）：旧切片是**上次判定的依据**。
+    报告里说「R7 p2 读了 slices_v2」，事后要回答「它当时到底看到什么」，
+    靠的就是那份旧文件。删掉就等于把证据也删了。
+    但也不能留在原路径——同一目录两套切片并存，是 A2 描述的那个事故：
+    同一次审计里两个片的事实基准不同。
+
+    所以：改名到 <out>_stale_<YYYYmmdd_HHMMSS>/，原位留空。
+    """
+    if not os.path.isdir(out_dir):
+        return ""
+    old = [f for f in os.listdir(out_dir) if f.endswith(".txt")]
+    if not old:
+        return ""
+    import time
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    # 用 normpath 抹掉尾部斜杠，拼出来的名字才不会带 `//`。
+    # 相对路径（如 `.subtitle-polish/slices`）时 dirname 非空；只有 out_dir 本身
+    # 就在当前目录（`slices`）时 dirname 才是 ""，那时不需要 makedirs。
+    base = os.path.normpath(out_dir)
+    dst = f"{base}{STALE_SUFFIX}_{stamp}"
+    n = 1
+    while os.path.exists(dst):
+        dst = f"{base}{STALE_SUFFIX}_{stamp}_{n}"
+        n += 1
+    parent = os.path.dirname(dst)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    os.rename(out_dir, dst)
+    print(f"[*] 旧切片 {len(old)} 份已归档 -> {dst}")
+    print(f"    （不是删除：旧切片是上次判定的依据，事后取证要用）")
+    return dst
+
 
 def nonempty_rate(paired) -> tuple:
     """(非空块数, 总块数, 比率)。「非空」= 英文或中文至少一侧有内容。"""
@@ -140,6 +272,22 @@ def run(ass_path: str, srt_path: str, out_dir: str,
     print(f"    nonempty: {ne}/{total}（{rate:.0%}）")
     assert_not_empty(paired, ass_path, srt_path,
                      label=os.path.basename(ass_path))
+
+    # A1（issue v1.15）：配对失败率也是门禁，同样必须在写之前。
+    # 顺序有讲究：先查「整份是不是空的」，再查「零星配不上多少条」。
+    # 反过来会让一份全空的切片先报「配对失败 100%」，把人引去查错方向。
+    bad_ids = pairing_failed_ids(paired)
+    if bad_ids:
+        print(f"    pairing_failed: {len(bad_ids)}/{total}"
+              f"（{len(bad_ids)/total:.1%}）{_pairing_breakdown(paired)}，srt_id: "
+              f"{', '.join(str(i) for i in bad_ids[:20])}"
+              f"{' …' if len(bad_ids) > 20 else ''}")
+    assert_pairing_ok(paired, ass_path, srt_path,
+                      label=os.path.basename(ass_path))
+
+    # A2（issue v1.15）：重建即归档旧切片，不留两套并存。
+    # 放在建目录之前——archive_stale 是 rename 整个目录，目录里有文件才动手。
+    archive_stale(out_dir)
 
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(ass_path))[0]

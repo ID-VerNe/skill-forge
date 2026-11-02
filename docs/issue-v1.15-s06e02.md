@@ -73,6 +73,8 @@ if not pb.english and not pb.chinese and not sb.is_sound_effect_only():
 
 **R5 p1 报出 38 条「漏译」→ 重跑后 0 条**，根因就是这里。E02 那次是脚本走的时间窗配对（现场工具），但**同一个坑在 skill 自己的 `pair()` 里也存在**——只要 SRT 与 ASS 有漂移，两边都空就会批量打这个标签。
 
+> **实施时补正（见 §7.1）**：上面这张表只有两行，实际要拆成**三行**。实测 S06E02 全片 869 块里被标「配对失败」的 47 条，**逐条回查 ASS 全部都有完整中英对照**——它们是起点差 0.50~1.92 s 的超容差，一条真缺失都没有。所以「配对彻底失败」这一格必须再分成「轴错位（有内容、超容差）」和「真缺内容（ASS 里压根没有）」，两者的处置完全相反。
+
 ---
 
 ### 1.2 E02 现场惹的（7 条）
@@ -204,6 +206,69 @@ E + G 可以一起做，成本低、收效直接。F 单独做，要先补测试
 
 ## 6. 需要你定的事
 
-1. **A5 走甲/乙/丙**？（我推荐甲）
-2. **批次 E + G 要不要先做**？（低风险，能立刻解决「标签误导」和「报告不可读」）
-3. **A2 旧切片怎么处理**：删 / 移到 `slices_stale/` / 拒读？
+1. **A5 走甲/乙/丙**？（我推荐甲）→ **已定：甲**（保留 ±0.5s 时间窗，只在候选唯一时接受；0 或多条改用 `current` 文本唯一匹配；都不成则 abort 不猜）。见 §7 批次 F。
+2. **批次 E + G 要不要先做**？（低风险，能立刻解决「标签误导」和「报告不可读」）→ **已定：先做**。已完成，见 §7。
+3. **A2 旧切片怎么处理**：删 / 移到 `slices_stale/` / 拒读？ → **已定：归档**。改名到 `<out>_stale_<YYYYmmdd_HHMMSS>/`，不删。已随 E 批次落地。
+
+---
+
+## 7. 实施记录
+
+### 7.1 批次 E（已完成）
+
+| 改动 | 文件 | 内容 |
+|---|---|---|
+| 拆标签（**三形态**） | `scripts/lib/ass_srt_pair.py` | `SRT_HAS_ASS_NONE` → `ZH_MISSING`（英文在、中文空，真漏译）/ `PAIRING_OUT_OF_TOLERANCE(off=±N.NNs)`（两边都空但 ASS 里有这句，只是起点差超容差）/ `PAIRING_FAILED(srt_id=N)`（两边都空且 30 s 内 ASS 无任何起点）。新增 `_nearest_ass_offset()` / `MAX_REPORTABLE_OFFSET = 30.0` / `TIME_TOLERANCE` 常量显式化 |
+| 配对门禁 | `scripts/extract_slice.py` | 新增 `MAX_UNPAIRED_RATE = 0.10` / `pairing_failed_ids()` / `_pairing_tag()` / `pairing_offset()` / `_pairing_breakdown()` / `assert_pairing_ok()`。分子**两种形态都算**，abort 时按形态给不同处置建议。**位置在 `os.makedirs` 之前**，与 `assert_not_empty` 同一处；顺序固定为先空后零星 |
+| 旧切片归档 | `scripts/extract_slice.py` | 新增 `archive_stale()`，`--out` 已有 `.txt` 时整目录 rename 到 `<out>_stale_<时间戳>`；碰撞自动加 `_1`/`_2` 后缀 |
+| 文档同步 | `references/pipeline-spec.md` | 异常标记表由 2 行扩到 3 行 + 三形态判别顺序 + 「只拆前两种是不够的」的教训记录 |
+| 文档同步 | `prompts/audit.tmpl` | 标记清单改三形态；每种形态单独说明「该报什么、**为什么不能补译**」（超容差补了会和 ASS 里已有的撞车；真缺失补了是凭空编） |
+| 文档同步 | `references/auto-flow.md` | 头注清单改三形态；补「两道门禁（顺序固定）」「重建即归档」两条流程纪律 |
+| 文档同步 | `references/manual-flow.md` | 补归档说明（A2 同步） |
+
+**A1 的关键教训：第一版只拆成两个名字是不够的。**
+第一版按「有英文无中文 / 两边都空」拆成 `ZH_MISSING` / `PAIRING_FAILED`，看起来已经分开漏译和配对失败了。实测 S06E02 全片 869 块，被标 `PAIRING_FAILED` 的 **47 条逐条回查 ASS，全部都有完整中英对照，一条真缺失都没有**——它们是 srt 与 ass 的起点差 **0.50~1.92 s**、超出 `TIME_TOLERANCE = 0.5s` 容差窗。
+两者的处置**完全相反**：超容差是轴的问题（该校轴或放宽容差，补译是错的）；真缺失是素材的问题（该换素材）。合成一个标签，读的人只会一律当「漏译」处理——这正是 R5 p1 报 38 条假漏译的机制，只是换了个名字还在发生。
+
+**另一个实测发现（不是 bug，写进 spec 了）**：`parse_ass:207/213` 两处 `continue` 会跳过空文本行，所以「ASS 行在但文本为空」在结构上不会进入配对——`PAIRING_FAILED` 只能由「ASS 里压根没有这段」触发。这也是为什么人为清空中文轨只会得到 `ZH_MISSING`。
+
+**门禁阈值不能靠人为平移来验证**：把一批 Dialogue 整体后移 1.5 s 想造出超容差，结果 1/5 后移 → 4.7%、1/3 后移 → 4.0%，都低于 10% 阈值——平移后相邻块的英文行落进容差窗顶替上了，配上率反而上升。所以验证门禁用注入式单元夹具（P5/P6），不靠构造坏素材。
+
+**一个实现细节**：`archive_stale` 用 `os.path.normpath()` 而非 `rstrip('/\\')`——`--out` 为相对路径且带尾斜杠时，后者会拼出 `//`，`os.path.dirname` 也可能返回 `""` 导致 `makedirs("")` 报错。`parent` 非空才 `makedirs`。
+
+### 7.2 批次 G（已完成）
+
+| 改动 | 文件 | 内容 |
+|---|---|---|
+| B4 中立化 | `prompts/verify.tmpl` | `:1` 去掉「adversarial / 尽力反驳」；`:7` 「**默认驳回**」→「逐条举证，双向可驳回」+「不对确认放水，也不对驳回放水」；`:44` 理由字段要求「无论确认还是驳回都要给原文依据，只写『感觉不对』不算理由」 |
+| B4 同步 | `references/auto-flow.md:191` | 条目改名「逐条举证，双向驳回」，明写「不得设方向性默认值（原来的 adversarial 默认驳回已废弃）」 |
+| B4 同步 | `references/prompt-injection.md` | `:7`、`:42` 去掉 adversarial 措辞；`:42` 加注说明第三轮实测的畸形确认率**是 prompt 塞答案导致的**，无论立场怎么设都会全确认，不能当「默认驳回失效」的证据 |
+| B4 同步 | `references/subagent-delegation.md:44` | 「反驳误报 ‖ adversarial」→「逐条举证、判真伪 ‖ 复核」 |
+| B4 同步 | `references/fluency-rubric.md:126` | 「adversarial 终审维度」→「终审维度，需逐条举证」 |
+| C4 剔除清单 | `scripts/lib/align_core.py` | `robust_reject` 的 info 新增 `thr_mode`（`floor`/`k_mad`）、`k_mad`、`floor`、`drop_idx`、`rejected`（含 idx/start/delta/dev，按偏差绝对值降序）、`max_abs_dev`。新增 `format_reject_table()` |
+| C4 输出 | `scripts/align_audit.py` | `print_summary` 打印清单（控制台前 20 条）；`build_report` 新增「离群剔除明细」小节，Markdown 表格给全量；`--json` 的 payload 加 `reject` 字段（原来 `keep, _ =` 直接丢弃 info） |
+| D1 去截断 | `scripts/round_orchestrator.py` | 新增 `_md_cell()`（转义 `\|`、换行转 `<br>`、先转义反斜杠），替换四处 `[:16]/[:18]/[:20]`。`limit` 默认 0=不限 |
+
+**C4 的 `thr_mode` 为什么要单独给**：`thr = max(floor, k_mad*mad)`，E02 实测 MAD 很小，实际生效的永远是 `floor=1.5`，`k_mad=6.0` 完全没参与。不点明这一点，看到「剔了 43 条」的人第一反应是调 `k_mad`，改了毫无变化。
+
+**D1 为什么是去截断而不是换更聪明的截断**：改动总账里「原译」「终译」两列就是整份报告的存在理由。截到 20 字后，「He was going to say」和「He was going to say something」在表里长得一模一样，两条不同改动视觉上无法区分。要短得由调用方显式传 `limit`。
+
+### 7.3 回归结果
+
+`tests/` 下 16 个 subtitle-polish 相关文件 **251 项全绿**（原 15 文件 245 项 + 本轮新增 `pairing_tags` 6 项）：
+
+```
+axis_l0 17 / bugs 8 / cross_chunk 25 / curve_fit 12 / delete_identity 5 /
+fluency 8 / inclusive 23 / manual_log_check 6 / pairing_tags 6 / plan_chunk 19 /
+regression 41 / retime 10 / rounds 19 / seed 32 / timeline_credential 14 / verify_blindspot 6
+```
+
+新增的 `test_subtitle_polish_pairing_tags.py` 用最小夹具锁三形态判别与门禁（不依赖真实字幕）：
+先造三块 srt —— 一块正常、一块删掉中文行、一块 ass 起点偏 +1.20 s —— 再补一块附近 5 分钟什么都没有的，分别断言命中 `ZH_MISSING` / `PAIRING_OUT_OF_TOLERANCE(off≈+1.20s)` / `PAIRING_FAILED`；P4 断言音效块不打配对标记；P5 断言门禁分子含两种形态（3/10=30% → abort）；P6 断言 abort 发生在写盘前（目录不存在）。
+
+`test_green_bugs.py` 4 passed / 2 failed 与 `test_red_bugs.py` 6 failed 均为**历史遗留**：两个文件的 `SKILL_ROOT` 指向 `glue-engineer`，测的不是本 skill。
+
+### 7.4 剩下没做的
+
+- **批次 F（A5 方案甲）**：`_find_dialogue` 现在返回 `Event | None`，改成三态要连带改 `apply_fixes` / `verify_fixes` / `cross_check` 三个调用方。**先补测试锁住现有行为再动**。方案甲的取舍已定（保留 ±0.5s 窗但只在候选唯一时接受；0 或多条改用 `current` 唯一文本匹配；都不成 abort 不猜），但**它和 A1 是同一类病**：现在的标签只说明「没配上」，说明不了「为什么没配上」，所以 F 落地时 `_find_dialogue` 的三态应当带上「候选 0 / 候选多条 / 时间窗命中但文本不符」这三种成因，否则又会重演 A1 的教训。
+- **H 的路径引用同步**：`manual-flow.md` 已加归档说明；各脚本 `--help` 里若提到 `slices/` 固定路径需再核（当前未发现冲突引用）。
