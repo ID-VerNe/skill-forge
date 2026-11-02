@@ -30,10 +30,51 @@ from lib.ass_srt_pair import (
     style_to_track, clean_ass_text,
 )
 from lib.time_fmt import seconds_to_ass
-from lib.log import append_log, read_log, filter_log, make_batch_id
-from lib.paths import resolve_work_dir
+from lib.log import append_log, append_raw, read_log, filter_log, make_batch_id
+from lib.paths import resolve_work_dir, assert_no_orphan_log
+from lib.current import read_current_strict, alignment_profile
+from lib import guard
 
 WORK_DIR = ".subtitle-polish"
+
+
+def _apply_guard(fixes: list) -> list:
+    """给每条 fix 打语义护栏标记（issue #24 的 A3）。
+
+    护栏判据见 lib/guard.py：否定词增删 / 短句整体重写 / 数字专名增删。
+    命中的条目带 `requires_confirm: true`——**不是拒写**，是要求调用方显式
+    带上 `--confirm` 才落盘。默认行为是 abort 并列出待确认条目，避免
+    「跑完了，改错了，没人知道」。
+    """
+    return [guard.annotate(dict(fx)) for fx in fixes]
+
+
+def _block_on_guard(fixes: list, confirm: bool) -> None:
+    """有 requires_confirm 且未显式 --confirm 时，列出并退出。
+
+    只对**结构上可定位**的条目报（srt_id 合法、current 非空）。srt_id 越界或
+    current 为空的条目会先被回读校验 reject，不该在这里重复报——否则人看到的
+    第一条理由是「短句重写」，而真正的问题是「这条根本定位不到」。
+    """
+    hits = [f for f in fixes
+            if f.get("requires_confirm") and f.get("enabled", True)
+            and isinstance(f.get("srt_id"), int) and f.get("srt_id") > 0
+            and (f.get("current") or "").strip()]
+    if not hits or confirm:
+        return
+    print("[!] 以下改动通过语义护栏时会改变原意，需显式确认（--confirm）：",
+          file=sys.stderr)
+    for f in hits:
+        print("    %s  srt_id=%s  「%s」→「%s」" % (
+            f.get("id") or f.get("audit_id", ""), f.get("srt_id"),
+            (f.get("current") or f.get("old_text") or "")[:24],
+            (f.get("final_new") or f.get("suggested_new") or "")[:24]),
+            file=sys.stderr)
+        for r in f.get("guard", []):
+            print("        · " + r, file=sys.stderr)
+    print("    确认无误后加 --confirm 重跑；或把这些条目标为 enabled=false。",
+          file=sys.stderr)
+    raise SystemExit(1)
 
 
 def load_fixes(path: str) -> list:
@@ -104,6 +145,30 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
             if e_body == fb_body:
                 return e
     return None
+
+
+def _row_group_texts(subs, srt_blocks_indexed, srt_id: int, track: str) -> set:
+    """返回某个 srt_id + track 下**全部**候选行的可见文本集合。
+
+    存在的理由：`read_current_strict` 只能回答「这组行里有一条看起来像这样」，
+    回答不了「fix 指的是这组里的哪一条」。而碎片行场景下（同 start/end 的 2~3
+    条中文行）恰恰要逐条指定：1 条 replace 合并 + N 条 delete 删碎片，全靠
+    `current` 区分。拿回读值一律覆盖，N 条 delete 的 current 就全变成同一条，
+    撞车预检会判定它们抢同一行并整批拒写（issue #2 的 bug H/I/J）。
+
+    时间窗与 `_find_dialogue` 保持同一个 0.5s，不要各写一份——两处口径不一致时，
+    「回读说存在」而「定位找不到」，报出来的错会是撞车或定位失败，查起来很远。
+    """
+    sb = srt_blocks_indexed.get(srt_id)
+    if sb is None:
+        return set()
+    out = set()
+    for e in subs.events:
+        if style_to_track(e.style or "") != track:
+            continue
+        if abs(e.start / 1000.0 - sb.start) <= 0.5:
+            out.add(clean_ass_text(e.text or ""))
+    return out
 
 
 def _remove_event(subs, e) -> bool:
@@ -295,11 +360,26 @@ def run_manual_log(work_dir: str, batch_id: str, file: str, srt_id: int,
                              "。确认无误后加 --force 强制写入。")
     append_log(work_dir, batch_id, "manual_edit", file, srt_id, track,
                old_text, new_text, category, reason)
+    # B2：手工 Edit 一律视为结构性改动（它绕过了 fixes.json 的校验与撞车预检）。
+    # 记一条结构化标记，供报告单列与回归检查识别。
+    append_raw(work_dir, {
+        "batch_id": batch_id,
+        "action": "structural_change",
+        "kind": "manual_edit",
+        "file": file,
+        "srt_id": srt_id,
+        "track": track,
+        "old_text": old_text,
+        "new_text": new_text,
+        "category": category,
+        "reason": reason or "因 Edit 兜底",
+    })
     print(f"[*] 补记 manual_edit: batch={batch_id} srt_id={srt_id} track={track}")
     print(f"    file={file}")
     print(f"    old={old_text!r}")
     print(f"    new={new_text!r}")
     print(f"    rollback: --rollback batch={batch_id}")
+    print(f"    已标记为结构性改动（structural_change/manual_edit），报告中单列。")
 
 
 def run_dry_run(fixes: list, work_dir: str) -> str:
@@ -534,6 +614,70 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
             print(f"    在 fixes.json 里给每条加 \"srt_path\" 字段可显式指定", file=sys.stderr)
         srt_index = _build_srt_index(srt_blocks)
 
+        # A2（issue #24 的 H2）：current 以 ASS 回读为准，不信 fixes.json 里抄来的。
+        # 审计 JSON 的「原文」是审计员看到并可能已改写的镜像文本，抄它会让
+        # current 与 ASS 实际内容不一致 → 精确匹配失败，或更糟：匹配到另一行。
+        # 这里做三件事：
+        #   ① srt_id 越界直接 reject（计入 bad_id），不静默跳过；
+        #   ② 回读成功后**先看声明值在该行组里是否真的存在**：
+        #      存在 → 保留声明值。这一步不能省：同一 srt_id 有多条同轨行（碎片行）
+        #        时，`read_current_strict` 取的是「时间戳最近、时长最长」的那一条，
+        #        它只能确定**一组**候选行，不能确定**具体哪一条**。无条件覆盖会把
+        #        「1 replace + N delete 合并碎片行」里 N 条 delete 的 current 全改成
+        #        同一个值，撞车预检随即认为两条 fix 抢同一行而整批拒写（本文件
+        #        issue #2 的 bug H/I/J 就是这么复现的）。
+        #      不存在 → 声明值被污染（H2 的 #369 形态），改用回读值并告警。
+        #   ③ 两者都拿不到时保持声明值，交给下游撞车预检报错，不在这里猜。
+        bad_ids = 0
+        prof_zh = alignment_profile(subs, srt_blocks, TRACK_ZH) if srt_blocks else {"tol": 3.0}
+        prof_en = alignment_profile(subs, srt_blocks, TRACK_EN) if srt_blocks else {"tol": 3.0}
+        for fx in fxs:
+            action = fx.get("action", "replace")
+            if action in ("insert",):
+                continue
+            sid = fx.get("srt_id")
+            trk = fx.get("track", TRACK_ZH)
+            rb, why = read_current_strict(
+                subs, srt_blocks, sid, trk,
+                tol=(prof_en if trk == TRACK_EN else prof_zh)["tol"])
+            if rb is None:
+                if why == "id_out_of_range":
+                    bad_ids += 1
+                    print(f"[!] {fx.get('id') or fx.get('audit_id','')}: srt_id={sid} "
+                          f"超出 SRT 范围（共 {len(srt_blocks)} 条），reject",
+                          file=sys.stderr)
+                elif why == "no_event":
+                    print(f"[!] {fx.get('id') or fx.get('audit_id','')}: srt_id={sid} "
+                          f"track={trk} 在 ASS 里无对应行（时间戳无覆盖）", file=sys.stderr)
+                elif why == "bad_id":
+                    bad_ids += 1
+                    print(f"[!] {fx.get('id') or fx.get('audit_id','')}: srt_id 非法 "
+                          f"({sid!r})，reject", file=sys.stderr)
+                fx["enabled"] = False
+                continue
+            declared = clean_ass_text(fx.get("current", "") or "")
+            if not declared:
+                fx["current"] = rb          # 没声明 → 只能用回读值
+            elif clean_ass_text(rb) == declared:
+                pass                         # 一致，用哪个都一样
+            elif declared in _row_group_texts(subs, srt_index, sid, trk):
+                # 声明值确实存在于该 srt_id 的同轨行中，只是不是「最近最长」那条。
+                # 保留声明值——它是 fix 用来指定**具体哪一条碎片行**的唯一手段。
+                pass
+            else:
+                print(f"[?] {fx.get('id') or fx.get('audit_id','')}: 声明 current 在 "
+                      f"srt_id={sid} track={trk} 的行组里找不到，改用 ASS 实读值\n"
+                      f"      声明：{declared[:50]!r}\n"
+                      f"      实读：{clean_ass_text(rb)[:50]!r}", file=sys.stderr)
+                fx["current"] = rb
+        if bad_ids:
+            print(f"[!] {bad_ids} 条 srt_id 越界，已 reject（未计入本次写入）",
+                  file=sys.stderr)
+        fxs = [f for f in fxs if f.get("enabled", True)]
+        if not fxs:
+            print(f"[!] {file}: 回读校验后无可用 fix，跳过", file=sys.stderr)
+            continue
+
         # accept 前的撞车预检（issue #2）：同一物理行被两条 fix 命中说明 fix
         # 文件本身有歧义，写下去只会产生半合并残骸。默认拒写，需显式 --force-collision。
         # 预检模拟的是「没有 current 时」的退化行为：只要某条 fix 缺 current 且它
@@ -661,6 +805,125 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
         print(f"[*] 写入 {file} (batch {batch_id}, {len(fxs)} 条)")
 
 
+def run_apply_batch(work_dir: str, batch_id: str, confirm: bool = False) -> int:
+    """把台账里 `applied=false` 的 optional_promote 条目真正写进 ASS。
+
+    ## 为什么是两步（A1 的设计）
+
+        optional-fixes.json --promote--> log.jsonl(applied=false) --apply-batch--> ASS
+
+    `--promote` 只在台账里声明「我采纳这条」，不碰文件——这样采纳的意图和
+    执行分开了：可以先 promote 一批、人看一遍台账、再统一落盘。落盘时
+    同样走 current 回读（不抄台账里的 old_text，那是 promote 时快照）。
+
+    ## 幂等
+
+    落盘后把该条标 `applied=true` 并追加一条 `replace` 记录。重复跑会跳过
+    已 applied 的条目，不会二次改动。
+    """
+    entries = read_log(work_dir)
+    targets = [e for e in entries
+               if e.get("action") == "optional_promote"
+               and e.get("batch_id") == batch_id
+               and not e.get("applied")]
+    if not targets:
+        print(f"[!] batch={batch_id} 没有待落盘的 optional_promote 条目")
+        return 0
+
+    by_file = {}
+    for e in targets:
+        if not e.get("file"):
+            print(f"[!] srt_id={e.get('srt_id')} 缺 file 字段，跳过（promote 时应写入）",
+                  file=sys.stderr)
+            continue
+        by_file.setdefault(e["file"], []).append(e)
+
+    applied_keys = set()
+    total = 0
+    for file, ents in by_file.items():
+        if not os.path.exists(file):
+            print(f"[!] 文件不存在：{file}", file=sys.stderr)
+            continue
+        subs = pysubs2.load(file, encoding="utf-8-sig")
+        srt_path = _find_paired_srt(file)
+        srt_blocks = parse_srt(srt_path) if srt_path and os.path.exists(srt_path) else []
+        srt_index = _build_srt_index(srt_blocks)
+        prof = alignment_profile(subs, srt_blocks, TRACK_ZH) if srt_blocks else {"tol": 3.0}
+        for ent in ents:
+            track = ent.get("track", TRACK_ZH)
+            sid = ent.get("srt_id")
+            cur, why = read_current_strict(subs, srt_blocks, sid, track,
+                                           tol=prof["tol"])
+            if cur is None:
+                print(f"[!] srt_id={sid} track={track} 回读失败（{why}），跳过",
+                      file=sys.stderr)
+                continue
+            e = _find_dialogue(subs, srt_index, sid, track, prefer_text=cur)
+            if not e:
+                print(f"[!] srt_id={sid} 定位失败，跳过", file=sys.stderr)
+                continue
+            new_text = ent.get("new_text", "")
+            if not new_text:
+                continue
+            # 护栏：optional 条目同样要过语义护栏（A3）。默认「跳过并留待确认」，
+            # 带 --confirm 才落盘；条目不标 applied，下轮还能再试。
+            g = guard.check(cur, new_text)
+            if g["requires_confirm"] and not confirm:
+                print(f"[!] srt_id={sid} 通过语义护栏需确认，跳过："
+                      f"{'；'.join(g['reasons'])}", file=sys.stderr)
+                continue
+            old = e.text
+            _replace_text(e, new_text)
+            append_log(work_dir, batch_id, "replace", file, sid, track,
+                       old, e.text, ent.get("category", ""),
+                       (ent.get("reason", "") or "") + " [from optional]")
+            applied_keys.add((ent.get("optional_id"), sid, new_text))
+            total += 1
+        bak = file + ".bak"
+        if not os.path.exists(bak):
+            import shutil
+            shutil.copy2(file, bak)
+        subs.save(file, encoding="utf-8")
+        print(f"[*] 写入 {file}（batch {batch_id}）")
+
+    # 回写 applied 标记：重写整个 log（条目数有限，且必须原子替换）
+    if applied_keys:
+        _mark_applied(work_dir, batch_id, applied_keys)
+    print(f"[*] 落盘 {total} 条 optional 改动")
+    return total
+
+
+def _mark_applied(work_dir: str, batch_id: str, keys: set) -> None:
+    """把已落盘的 optional_promote 条目标 applied=true。
+
+    直接重写 log.jsonl：一是行数有限，二是必须整体替换才能保证半途失败时
+    不会留下「写了一半的 applied 标记」。
+    """
+    path = os.path.join(work_dir, "log.jsonl")
+    if not os.path.exists(path):
+        return
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                out.append(line)
+                continue
+            if (e.get("action") == "optional_promote"
+                    and e.get("batch_id") == batch_id
+                    and (e.get("optional_id"), e.get("srt_id"), e.get("new_text")) in keys):
+                e["applied"] = True
+            out.append(json.dumps(e, ensure_ascii=False))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, path)
+
+
 def _find_paired_srt(ass_path: str) -> str:
     """从 ass 路径推 srt 路径。
 
@@ -786,6 +1049,10 @@ def main():
     ap.add_argument("--reason", default="", help="--manual-log 用")
     ap.add_argument("--force", action="store_true",
                     help="--manual-log 校验有警告时仍强制写入（--old 找不到仍直接失败）")
+    ap.add_argument("--confirm", action="store_true",
+                    help="语义护栏命中时仍执行（默认列出待确认条目并退出）")
+    ap.add_argument("--apply-batch", default="",
+                    help="把台账里该 batch 的 optional_promote 条目落盘（applied=false → 写入 ASS）")
     args = ap.parse_args()
 
     if args.manual_log:
@@ -802,6 +1069,7 @@ def main():
 
     if args.rollback:
         wd = resolve_work_dir(args.work_dir)
+        assert_no_orphan_log(args.work_dir)
         kwargs = {}
         spec = args.rollback
         if spec.startswith("batch="):
@@ -815,11 +1083,62 @@ def main():
         run_rollback(wd, **kwargs)
         return
 
+    if args.apply_batch:
+        wd = resolve_work_dir(args.work_dir)
+        assert_no_orphan_log(args.work_dir)
+        run_apply_batch(wd, args.apply_batch, confirm=args.confirm)
+        return
+
     if not args.fixes:
         ap.error("需要 fixes.json 或 --rollback")
 
     wd = resolve_work_dir(args.work_dir)
+    assert_no_orphan_log(args.work_dir)
     fixes = load_fixes(args.fixes)
+    # 结构预检先行：srt_id 越界 / 缺字段的条目直接剔除，不让它们进入护栏报告
+    # （否则人看到的第一条理由是「短句重写」，而真正问题是「根本定位不到」）。
+    bad = []
+    # 越界检查需要 SRT 条数：从 fix 的 file/srt_path 推一个出来量。
+    # 推不出 SRT 时 **不静默放过**——没有 srt 就无法校验 srt_id 是否越界，
+    # 也无法回读 current，这时继续跑等于盲改。直接报错要求显式给 srt_path。
+    _limits = {}
+    _srt_override = {}
+    for fx in fixes:
+        f = fx.get("file", "")
+        if f and fx.get("srt_path") and f not in _srt_override:
+            _srt_override[f] = fx["srt_path"]
+    for fx in fixes:
+        f = fx.get("file", "")
+        if not f or f in _limits:
+            continue
+        sp = _srt_override.get(f) or _find_paired_srt(f)
+        if not sp or not os.path.exists(sp):
+            print(f"[!] 无法定位配对 SRT：{f}\n"
+                  f"    需要它来校验 srt_id 越界与回读 current。\n"
+                  f"    在 fixes.json 里给每条加 \"srt_path\" 字段显式指定。",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        _limits[f] = len(parse_srt(sp))
+    for fx in fixes:
+        if fx.get("action", "replace") == "insert":
+            continue
+        sid = fx.get("srt_id")
+        if not isinstance(sid, int) or sid <= 0:
+            bad.append((fx, "srt_id 非法 %r" % (sid,)))
+        elif fx.get("track") not in ("中文", "英文"):
+            bad.append((fx, "track 非法 %r" % (fx.get("track"),)))
+        elif _limits.get(fx.get("file", "")) and sid > _limits[fx.get("file", "")]:
+            bad.append((fx, "srt_id=%d 超出 SRT 范围（共 %d 条）"
+                        % (sid, _limits[fx.get("file", "")])))
+    for fx, why in bad:
+        print("[!] %s: %s，已剔除" % (fx.get("id") or fx.get("audit_id", "?"), why),
+              file=sys.stderr)
+        fx["enabled"] = False
+    fixes = [f for f in fixes if f.get("enabled", True)]
+    if not fixes:
+        raise SystemExit("[!] 剔除非法条目后没有可执行的 fix")
+    fixes = _apply_guard(fixes)
+    _block_on_guard(fixes, args.confirm)
     if args.dry_run:
         run_dry_run(fixes, wd)
     elif args.accept:

@@ -43,6 +43,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 
@@ -50,8 +51,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import verdict as V
 from lib.log import read_log
-from lib.paths import resolve_work_dir
+from lib.paths import (resolve_work_dir, orphan_logs, assert_no_orphan_log,
+                       assert_report_location)
+from lib import optional as OPT
 import regression_check
+import structure_check as SC
 
 #: 10(+1) 轮定义。顺序即依赖顺序，**不要重排**——依据见 references/rounds-spec.md §1.1
 ROUNDS = [
@@ -153,9 +157,61 @@ def save_manifest(wd: str, stamp: str, m: dict) -> None:
         json.dump(m, f, ensure_ascii=False, indent=1)
 
 
+def _structure_gate(ass: str) -> bool:
+    """跑 `structure_check`，返回是否放行（C3b）。
+
+    只在 ABORT 时拦；SUSPECT 放行但把摘要打出来——SUSPECT 是「值得看一眼」，
+    不是「不许开工」。把 SUSPECT 也做成门禁会让门禁被习惯性绕过，那就白做了。
+
+    结构检查本身崩溃时**放行并告警**，不拦：门禁工具的 bug 不应该阻断整条流水线。
+    但要把「没检成」写清楚，不能让人以为「检过了、没问题」。
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "structure_check.py")
+    if not os.path.exists(script):
+        print("[!] 找不到 structure_check.py，跳过结构门禁（不等于通过）",
+              file=sys.stderr)
+        return True
+    try:
+        p = subprocess.run([sys.executable, script, "--ass", ass, "--quiet"],
+                           capture_output=True, text=True, timeout=120)
+    except Exception as e:            # noqa: BLE001
+        print(f"[!] 结构检查未能执行（{e}），跳过门禁（不等于通过）",
+              file=sys.stderr)
+        return True
+
+    out = (p.stdout or "").strip()
+    err = (p.stderr or "").strip()
+    if p.returncode == SC.EXIT_OK:
+        print(f"[*] 结构门禁通过：{out}")
+        return True
+    if p.returncode == SC.EXIT_SUSPECT:
+        print(f"[*] 结构门禁放行（有 SUSPECT，请看一眼）：{out}")
+        return True
+    # ABORT：把完整报告打出来，不要只报第一条。
+    print(out or err, file=sys.stderr)
+    return False
+
+
 def init_run(wd: str, ass: str, srt: str, plan: list, *,
-             media: str = "", gated: bool = True, stamp: str = "") -> str:
-    """建 runs/<stamp>：manifest + round-plan.json + r00 快照 + logs/r00.jsonl。"""
+             media: str = "", gated: bool = True, stamp: str = "",
+             skip_structure_check: bool = False) -> str:
+    """建 runs/<stamp>：manifest + round-plan.json + r00 快照 + logs/r00.jsonl。
+
+    ## R0 之前先过结构门禁（C3b）
+
+    这一条**必须在建任何轮次之前**跑。理由：轨坏了之后，所有需要中英对照的判据
+    （长度比、漏译、语气词还原）都会拿错位的数据比对，跑完 10 轮得到的是一份
+    「看起来正常、结论全错」的报告。E03 的中文轨从第 149 行起错位 39.84 秒，
+    单看任何一行都正常——这是最贵的一类缺陷，因为它不报错。
+    """
+    if gated and not skip_structure_check and not _structure_gate(ass):
+        raise SystemExit(
+            "[x] 结构门禁未通过，未建 run。\n"
+            "    轨是坏的，跑轮次只会得到「看起来正常、结论全错」的报告。\n"
+            "    修完轨后重跑；若确认是误报，加 --skip-structure-check 放行"
+            "（放行决定请写进报告）。")
+
     stamp = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     d = run_dir(wd, stamp)
     if os.path.isdir(d):
@@ -238,11 +294,19 @@ def record_round(wd: str, stamp: str, rid: str, *,
     target["note"] = note
 
     if verdict in ("keep", "no_finding"):
+        # B1：先把 working 台账归并回主台账，再拷快照。顺序不能反——先拷快照
+        # 会把「还没归并」的 working 当成唯一证据，主台账依旧是空的。
+        _merge_working_log(wd, d)
         snap = f"{rid}.ass"
         shutil.copy2(m["ass"], os.path.join(d, snap))
         target["snapshot"] = snap
         # log 快照：working/log.jsonl 是本轮执行后的台账（--auto 隔离模式），
         # 没有 working 副本时（逐步模式）直接整本拷主 log。
+        #
+        # B1（issue #24）：`--auto` 隔离模式下 working/log.jsonl 必须**归并回**
+        # 主 log.jsonl，否则主台账永远停留在 r00 的状态——74 条改动最后在报告
+        # 里只剩 2 条，就是这么来的。归并在 `_merge_working_log()` 里做，
+        # 这里只读归并后的主 log。
         working = os.path.join(d, "working", "log.jsonl")
         src = working if os.path.exists(working) else os.path.join(wd, "log.jsonl")
         dst = os.path.join(d, "logs", f"{rid}.jsonl")
@@ -344,6 +408,73 @@ def _sync_working(d: str, stem: str) -> None:
         shutil.copy2(src, dst)
 
 
+def _merge_working_log(wd: str, d: str) -> int:
+    """把 working/log.jsonl 归并回主 `<wd>/log.jsonl`，返回新增条数（B1）。
+
+    ## 为什么必须有这一步
+
+    `--auto` 为了「一轮失败能干净重来」，把 apply_fixes 的 `--work-dir` 指到
+    `runs/<stamp>/working/`，改动先记在那本台账上。跑完如果不归并，主台账
+    永远停在 r00——报告读主台账，于是 74 条改动在报告里只剩 2 条。
+
+    归并按条目去重（同 file/srt_id/track/old/new/ts 视为同一条），归并后
+    主台账行数必须 ≥ 归并前 + 归并前 working 里的新增数，否则说明有记录被
+    覆盖了，直接报错。
+
+    `_restore()` 走的是整本还原，不经过这里——回滚语义就是「退回某个时刻」，
+    不能把后来的记录合并进去。
+    """
+    working = os.path.join(d, "working", "log.jsonl")
+    canon = os.path.join(wd, "log.jsonl")
+    if not os.path.exists(working):
+        return 0
+
+    def _read(p):
+        out = []
+        if not os.path.exists(p):
+            return out
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return out
+
+    def _key(e):
+        return (e.get("file", ""), e.get("srt_id"), e.get("track", ""),
+                e.get("old_text", ""), e.get("new_text", ""), e.get("ts", ""))
+
+    main = _read(canon)
+    wk = _read(working)
+    before_main, before_wk = len(main), len(wk)
+    seen = {_key(e) for e in main}
+    added = [e for e in wk if _key(e) not in seen]
+
+    if not added:
+        return 0
+    allrows = main + added
+    allrows.sort(key=lambda e: e.get("ts", ""))
+    tmp = canon + ".tmp"
+    os.makedirs(os.path.dirname(canon) or ".", exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        for e in allrows:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    os.replace(tmp, canon)
+
+    # 断言：主台账行数 ≥ 原有 + 新增。写坏了就立刻停，不带着脏台账继续跑。
+    if len(allrows) < before_main + min(len(added), before_wk):
+        raise SystemExit(
+            f"[!] log 归并异常：主台账 {before_main} 条 → {len(allrows)} 条，"
+            f"working {before_wk} 条中应有 {len(added)} 条新增。停下核对。")
+    print(f"[*] 归并 working/log.jsonl → 主台账：+{len(added)} 条"
+          f"（{before_main} → {len(allrows)}）")
+    return len(added)
+
+
 # ── 报告 ────────────────────────────────────────────────────────────────────
 
 def _churn_by_batch(wd: str) -> dict:
@@ -401,12 +532,74 @@ def _parse_ledger(entries: list) -> list:
     return sorted(rows.values(), key=lambda r: (r["file"], r["srt_id"]))
 
 
-def _rollback_cmd(ass: str, chat_id: str) -> str:
-    return ("python <skill>/scripts/apply_fixes.py --rollback id=%s --file \"%s\""
-            % (chat_id, ass))
+def _rollback_cmd(ass: str, batch_id: str = "", srt_id=None) -> str:
+    """生成回滚命令。**两个粒度不能混用**（B3）。
+
+    以前这里写的是 `--rollback id=<batch_id> --file <ass>`：把批次标识填进了
+    `id=`（那是 srt_id 的位置），生成的命令必然回滚错行——而且看起来还很正常，
+    因为 `id=` 确实存在，只是语义错了。
+
+    现在按粒度分开：
+      - 整批：`--rollback batch=<batch_id>`（一次回滚这一轮的全部改动）
+      - 单条：`--rollback id=<srt_id> --file <ass>`（精确到行，需限定文件）
+    """
+    if batch_id:
+        return ("python <skill>/scripts/apply_fixes.py --rollback batch=%s"
+                % batch_id)
+    if srt_id is not None:
+        return ("python <skill>/scripts/apply_fixes.py --rollback id=%s --file \"%s\""
+                % (srt_id, ass))
+    return "# 无可用回滚标识"
 
 
-def render_report(wd: str, stamp: str) -> str:
+def render_report(wd: str, stamp, extra_stamps=None) -> str:
+    """出总账。`stamp` 可传单个 run 名，也可传列表（D3：`--runs a,b`）。
+
+    多 run 时的口径**固定**为：逐轮摘要与改动总账按「合并去重」呈现，
+    并在最前面加一张横向对比表 + 不可比提示。不做两次报告再拼一起——
+    那样读的人要自己算差异，而这个 skill 的难点从来不是算数。
+    """
+    if isinstance(stamp, (list, tuple)):
+        stamps = list(stamp)
+    else:
+        stamps = _norm_merge_stamps(extra_stamps, stamp)
+    stamps = [s for s in stamps if s]
+    if not stamps:
+        raise SystemExit("[!] 没有指定 run")
+    if len(stamps) > 1:
+        return _render_multi_report(wd, stamps)
+    return _render_single_report(wd, stamps[0])
+
+
+def _render_multi_report(wd: str, stamps) -> str:
+    """多次跑测合并成一份。见 `render_report` 的口径说明。"""
+    missing = [s for s in stamps if not os.path.exists(os.path.join(run_dir(wd, s),
+                                                                   "manifest.json"))]
+    if missing:
+        raise SystemExit(f"[!] 这些 run 不存在：{', '.join(missing)}"
+                         f"（看 {os.path.join(wd, 'runs')}）")
+    sums = []
+    for s in stamps:
+        m = load_manifest(wd, s)
+        m["stamp"] = s
+        sums.append(m)
+
+    L = [f"# 合并报告 — {len(stamps)} 次跑测", ""]
+    L += _render_cross_run(sums)
+    L += ["---", ""]
+
+    for i, s in enumerate(stamps, 1):
+        L += [f"## 跑测 {i}：`{s}`", "", "```"]
+        L += [render_report(wd, s)]
+        L += ["```", ""]
+
+    L += ["> 合并报告只做并排呈现，**不做跨 run 的自动裁决**。"
+          "两次跑测该以哪次为准，要看片源与开关是否一致——"
+          "这属于判断，不是汇总。", ""]
+    return "\n".join(L)
+
+
+def _render_single_report(wd: str, stamp: str) -> str:
     m = load_manifest(wd, stamp)
     d = run_dir(wd, stamp)
     rounds = m["rounds"]
@@ -452,8 +645,12 @@ def render_report(wd: str, stamp: str) -> str:
             sid = c["key"][1]
             trail = " → ".join(
                 "「%s」" % (t.get("new", "")[:16] or "—") for t in c["trail"])
-            L.append("| %s | %s | %s | %s | `--rollback id=%s` |" % (
-                sid, c["key"][2], c["n_rounds"], trail, sid))
+            # B3：这一列以前硬写着 `--rollback id=N`，但只有 srt_id 没有 file，
+            # 照着抄会回滚到**同号的所有文件**。走 _rollback_cmd() 统一生成，
+            # 顺带把 file 带上。
+            cmd = _rollback_cmd(c.get("file") or m["ass"], srt_id=sid)
+            L.append("| %s | %s | %s | %s | `%s` |" % (
+                sid, c["key"][2], c["n_rounds"], trail, cmd))
         L += ["", "> 这一节是给人裁的，不是结论。改回去有时是对的（上一轮确实改错了）。", ""]
     else:
         L += ["没有。", ""]
@@ -462,21 +659,56 @@ def render_report(wd: str, stamp: str) -> str:
         L += ["## 冻结行（连续 %d 轮被改，后续轮次已禁改）" % FREEZE_AFTER, ""]
         L += ["- srt_id: " + ", ".join(str(x) for x in m["frozen_rows"]), ""]
 
+    # 结构性改动（B2）：手工 Edit / 曲线重建 / 删行这类不走 fixes.json 的动作，
+    # 必须单列。它们绕过了 fixes 的撞车预检，是「为什么这一行和上一轮不一样」
+    # 最常见的解释来源。
+    struct = [e for e in read_log(wd) if e.get("action") == "structural_change"]
+    if struct:
+        L += ["## 结构性改动（绕过 fixes.json 的动作）", ""]
+        L += ["| 类型 | srt_id | 轨道 | 原 → 新 | 原因 |", "|---|---|---|---|---|"]
+        for s in struct[:40]:
+            L.append("| %s | %s | %s | %s → %s | %s |" % (
+                s.get("kind", "?"), s.get("srt_id", ""), s.get("track", ""),
+                (s.get("old_text") or "")[:18], (s.get("new_text") or "")[:18],
+                (s.get("reason") or "")[:20]))
+        if len(struct) > 40:
+            L.append("| … | | | 其余 %d 条见 log.jsonl | |" % (len(struct) - 40))
+        L += ["", "> 这些改动没有走 fixes.json 的撞车预检，冲突排查时优先看这里。", ""]
+
     L += ["## 改动总账", ""]
     if ledger:
         L += ["| srt_id | 轨道 | 原译 | 终译 | 类别 | 轮次 | 回滚 |",
               "|---|---|---|---|---|---|---|"]
         for r in ledger:
-            L.append("| %s | %s | %s | %s | %s | %s | `--rollback id=%s` |" % (
+            cmd = _rollback_cmd(r.get("file") or m["ass"], srt_id=r["srt_id"])
+            L.append("| %s | %s | %s | %s | %s | %s | `%s` |" % (
                 r["srt_id"], r["track"], r["old"][:20] or "—", r["new"][:20] or "—",
-                r["category"] or "—", len(r["batches"]), r["srt_id"]))
+                r["category"] or "—", len(r["batches"]), cmd))
         L.append("")
-        L += ["整轮回退：",
-              f"```bash",
+        # B3：整批回滚给的是 batch_id，不是轮 id——两者长得像（都在 --run 上下文里），
+        # 混用会回滚错一整轮。这里按「每轮一行」列出来，抄一行就是一轮。
+        bt = [r for r in kept if r["batch_id"]]
+        if bt:
+            L += ["按批回滚（一次撤销一整轮的改动）：", "", "```bash"]
+            seen_b = set()
+            for r in bt:
+                if r["batch_id"] in seen_b:
+                    continue
+                seen_b.add(r["batch_id"])
+                L.append("%s  # %s %s，%d 条" % (
+                    _rollback_cmd(m["ass"], batch_id=r["batch_id"]),
+                    r["id"], r["name"], r["n_fixes"]))
+            L += ["```", ""]
+        L += ["整轮回退（ASS 与 log 一起退回某轮末，需 `--yes` 确认）：",
+              "```bash",
               f"python <skill>/scripts/round_orchestrator.py --run {stamp} --rollback-to r03",
-              f"```", ""]
+              "```", ""]
     else:
         L += ["台账为空（本次没有改动）。", ""]
+
+    # 建议改动（A1）：必须单列，且必须说明「不在净改动里」。以前建议和被执行的
+    # 改动混在一起，报告写「净改动 21 条」而 ASS 只改了 3 条。
+    L += OPT.render_md_section(wd)
 
     wl_json = os.path.join(wd, "reports", "inclusive.json")
     L += ["## 白名单（第 8 类命中但未改）", ""]
@@ -516,11 +748,157 @@ def render_report(wd: str, stamp: str) -> str:
     return "\n".join(L)
 
 
-def write_report(wd: str, stamp: str) -> str:
-    out = os.path.join(run_dir(wd, stamp), "final-report.md")
+def _adopt_orphan_logs(work_dir: str) -> int:
+    """把孤儿 log.jsonl 合并进 `<work_dir>/log.jsonl`（A4 / M1）。
+
+    ## 孤儿是怎么来的
+
+    历史上 `round_orchestrator --auto` 在 cwd 直接跑 `apply_fixes`，而
+    `apply_fixes` 的 `--work-dir` 默认是相对路径 `.subtitle-polish`——子进程的
+    cwd 若与主流程不同，就会在**另一个目录**建一本 log.jsonl。结果：报告读
+    A 本、脚本写 B 本，74 条改动在报告里只剩 2 条。
+
+    ## 合并规则
+
+    规范台账在前、孤儿台账在后（孤儿记录必然更晚，或本来就是漏记的），按
+    `(file, srt_id, track, old_text, new_text)` 去重。合并后把孤儿文件改名成
+    `.adopted` 而不是删除——它是唯一的历史证据，删掉就再也说不清发生了什么。
+    """
+    orp = orphan_logs(work_dir)
+    wd = resolve_work_dir(work_dir)
+    canon = os.path.join(wd, "log.jsonl")
+    if not orp:
+        print("[=] 没有孤儿 log.jsonl，无需处理")
+        return 0
+
+    def _key(e):
+        return (e.get("file", ""), e.get("srt_id"), e.get("track", ""),
+                e.get("old_text", ""), e.get("new_text", ""), e.get("ts", ""))
+
+    merged = []
+    seen = set()
+    for p in [canon] + orp:
+        if not os.path.exists(p):
+            continue
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                k = _key(e)
+                if k in seen:
+                    continue
+                seen.add(k)
+                merged.append(e)
+    merged.sort(key=lambda e: e.get("ts", ""))
+
+    os.makedirs(os.path.dirname(canon), exist_ok=True)
+    with open(canon, "w", encoding="utf-8") as f:
+        for e in merged:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    for p in orp:
+        dst = p + ".adopted"
+        # 不能直接 os.replace：第二次 --adopt 会把第一次的证据覆盖掉，
+        # 而「谁什么时候并进来的」恰恰是最该留下的信息。重名就加序号。
+        if os.path.exists(dst):
+            n = 2
+            while os.path.exists(f"{p}.adopted.{n}"):
+                n += 1
+            dst = f"{p}.adopted.{n}"
+        os.replace(p, dst)
+        print(f"    孤儿已改名保留：{dst}（未删除，作为历史证据）")
+    print(f"[*] 合并完成：{len(merged)} 条 → {canon}")
+    return 0
+
+
+def write_report(wd: str, stamp, extra_stamps=None) -> str:
+    """写 final-report.md。
+
+    单 run → 写进该 run 目录；多 run → 写进 `runs/_merged/<a>+<b>/final-report.md`。
+    **多 run 报告不写进任何单个 run 目录**：写进去之后，那个 run 的
+    「这是一次独立跑测的结论」就被污染了，下次有人 `--run a --report` 会读到
+    一份包含 b 的报告。
+    """
+    stamps = ([s for s in stamp if s] if isinstance(stamp, (list, tuple))
+              else _norm_merge_stamps(extra_stamps, stamp))
+    if len(stamps) > 1:
+        if not os.path.isdir(run_dir(wd, stamps[0])):
+            raise SystemExit(f"[!] run 不存在：{stamps[0]}")
+        d = os.path.join(wd, "runs", "_merged", "+".join(stamps))
+        os.makedirs(d, exist_ok=True)
+        out = os.path.join(d, "final-report.md")
+        text = render_report(wd, stamps)
+    else:
+        out = os.path.join(run_dir(wd, stamps[0]), "final-report.md")
+        text = render_report(wd, stamps[0])
+    # D4：落点校验。加了 --runs 之后合并报告会写到 runs/_merged/…，
+    # 那是个新目录，不校验的话下次很容易顺手加出第三个落点。
+    assert_report_location(out, wd)
     with open(out, "w", encoding="utf-8") as f:
-        f.write(render_report(wd, stamp))
+        f.write(text)
     return out
+
+
+def _norm_merge_stamps(stamps, run: str) -> list:
+    """把 `--runs a,b` 与 `--run x` 合成一个有序去重列表。
+
+    允许 `--runs r1,r2` 独立使用，也允许 `--run a --runs a,b`（此时 a 排最前）。
+    顺序**保留用户给的顺序**，不排序：批次是有时间先后的，重排会让「a 覆盖了 b」
+    还是「b 覆盖了 a」读反。
+    """
+    out = []
+    for s in ([run] if run else []) + [x.strip() for x in (stamps or "").split(",")]:
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _render_cross_run(sums) -> list:
+    """多 run 合并报告头：把几次跑测放在一张表里横向比。
+
+    为什么值得单独写：单 run 报告回答不了「这一版比上一版好还是差」。
+    而比大小之前必须先把**可比性**说清楚——两次跑测的轮次表不同（开关不同）、
+    片源有没有给不同、台账是不是同一份，这些不一样的时候，净改动条数不可比。
+    所以这张表把「不可比」先摆在最前面，而不是让人自己发现。
+    """
+    L = ["## 本次合并了 %d 次跑测" % len(sums), "",
+         "| run | ASS | 片源 | 轮次 | 已跑 | 回滚 | skip | 净改动 | 定格 |",
+         "|---|---|---|---|---|---|---|---|---|"]
+    for m in sums:
+        rounds = m["rounds"]
+        done = [r for r in rounds if r["verdict"] != "pending"]
+        L.append("| %s | %s | %s | %d | %d | %d | %d | %d | %s |" % (
+            m["stamp"], os.path.basename(m.get("ass") or ""),
+            "有" if m.get("media") else "**无（UNVERIFIED）**",
+            len(rounds), len(done),
+            sum(1 for r in rounds if r["verdict"] == "rollback"),
+            sum(1 for r in rounds if r["verdict"] == "skip"),
+            sum(r["n_fixes"] for r in rounds
+                if r["verdict"] in ("keep", "no_finding")),
+            "是" if m.get("frozen") else "—"))
+    L += [""]
+
+    warn = []
+    if len({os.path.normcase(os.path.abspath(m.get("ass") or "")) for m in sums}) > 1:
+        warn.append("各 run 的 ASS 不是同一个文件——净改动条数**不可直接相加**，"
+                    "它们是不同输入上的改动，合并后只会得到没有意义的和。")
+    if len({m.get("media") and os.path.normcase(os.path.abspath(m["media"])) or ""
+            for m in sums}) > 1:
+        warn.append("片源不一致（含「有的有、有的无」）——时间轴结论不可比，"
+                    "UNVERIFIED 的那次没有被检查过，不等于通过。")
+    plans = {tuple(r["id"] for r in m["rounds"]) for m in sums}
+    if len(plans) > 1:
+        warn.append("轮次表不同（`--with-low/--with-inclusive/--with-spelling` 开关不一致）"
+                    "——两次跑的覆盖面不一样，「跑了几轮」不能直接比。")
+    if warn:
+        L += ["### 合并前须知（这几条不成立时，下面的数字不可比）", ""]
+        L += [f"- {w}" for w in warn]
+        L += [""]
+    return L
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -548,11 +926,44 @@ def main():
     ap.add_argument("--freeze-rows", default="", help="冻结的 srt_id，逗号分隔")
     ap.add_argument("--freeze", action="store_true", help="整体定格（--record 时生效）")
     ap.add_argument("--report", action="store_true", help="写 final-report.md")
+    ap.add_argument("--runs", default="",
+                    help="D3：合并多个 run 出报告，逗号分隔（--report 时生效）。"
+                         "可与 --run 并用，--run 那个排最前。多 run 报告写到 "
+                         "runs/_merged/<a>+<b>/final-report.md，不污染单个 run 目录")
     ap.add_argument("--rollback-to", default="", help="整轮回退到某轮末，如 r03")
     ap.add_argument("--show-plan", action="store_true", help="打印已有 run 的轮次状态")
+    ap.add_argument("--promote", default="",
+                    help="采纳建议：把 optional-fixes 里指定 id 提升进台账（不写 ASS）")
+    ap.add_argument("--promote-all", action="store_true",
+                    help="采纳全部建议（慎用，通常应逐条看）")
+    ap.add_argument("--adopt", action="store_true",
+                    help="把孤儿 log.jsonl 合并进规范台账（M1 修复）")
+    ap.add_argument("--yes", action="store_true", help="跳过确认（--rollback-to 用）")
+    ap.add_argument("--skip-structure-check", action="store_true",
+                    help="放行结构门禁（C3b）。仅在确认 ABORT 是误报时用，"
+                         "放行理由写进报告")
     args = ap.parse_args()
 
     wd = resolve_work_dir(args.work_dir)
+
+    if args.adopt:
+        return _adopt_orphan_logs(args.work_dir)
+
+    if args.promote or args.promote_all:
+        ids = ([x.strip() for x in args.promote.split(",") if x.strip()]
+               if args.promote else [str(x.get("id")) for x in OPT.load_optional(wd)])
+        if not ids:
+            print("[!] 没有可提升的建议", file=sys.stderr)
+            return 1
+        assert_no_orphan_log(args.work_dir)
+        OPT.promote(wd, ids, args.batch_id)
+        return 0
+
+    # A4：**记账和出报告的路径统统先过孤儿检测**。以前只在 --promote 上查，
+    # 于是 --report 能在一本孤儿台账并存的情况下照常出报告——报告里的数字
+    # 究竟来自哪本账，谁也说不清。两本账并存不是警告，是必须停下。
+    if args.report or args.record or args.rollback_to or args.show_plan or args.freeze:
+        assert_no_orphan_log(args.work_dir)
 
     if args.plan or args.init:
         if not args.ass:
@@ -567,13 +978,17 @@ def main():
             print(f"[!] ASS 不存在：{args.ass}", file=sys.stderr)
             return 1
         stamp = init_run(wd, args.ass, args.srt, plan, media=args.media,
-                         stamp=args.stamp)
+                         stamp=args.stamp,
+                         skip_structure_check=args.skip_structure_check)
         print(f"[*] run {stamp} → {run_dir(wd, stamp)}")
         print(render_plan(plan, args.ass))
         return 0
 
-    if not args.run:
-        ap.error("需要 --plan / --init / --run")
+    # D3：`--report --runs a,b` 不需要 --run，所以这里要把 --runs 也算进「有 run」。
+    # 只看 args.run 会把合法的纯 --runs 用法挡在门外，而那正是「合并两次跑测」的
+    # 主要写法（两次跑测本来就各有自己的 run 名）。
+    if not args.run and not (args.report and args.runs.strip()):
+        ap.error("需要 --plan / --init / --run（或 --report --runs a,b）")
 
     if args.record:
         rows = [x.strip() for x in args.freeze_rows.split(",") if x.strip()]
@@ -598,12 +1013,29 @@ def main():
         return V.FAIL
 
     if args.rollback_to:
+        # B4：整轮回退是不可逆的（ASS 与 log 一起被覆盖），先打印影响面再要 --yes。
+        m = load_manifest(wd, args.run)
+        eff = [r for r in m["rounds"]
+               if r["verdict"] in ("keep", "no_finding")
+               and r["id"] > args.rollback_to]
+        n_fix = sum(r["n_fixes"] for r in eff)
+        print(f"[!] 将回滚到 {args.rollback_to}，以下 {len(eff)} 轮的改动会被撤销"
+              f"（合计 {n_fix} 条）：")
+        for r in eff:
+            print(f"      {r['id']} {r['name']}  {r['n_fixes']} 条  batch={r['batch_id'] or '—'}")
+        if not args.yes:
+            print("    这是不可逆操作（ASS 与 log.jsonl 会一起被覆盖）。确认加 --yes。")
+            return 1
         m = rollback_to(wd, args.run, args.rollback_to)
         print(f"[*] 已回滚到 {m['rolled_back_to']['at']}（ASS + log.jsonl 均还原）")
         return 0
 
     if args.report:
-        out = write_report(wd, args.run)
+        # D3：--runs a,b 可独立用（不需要 --run），也可与 --run 并用。
+        stamps = _norm_merge_stamps(args.runs, args.run)
+        if not stamps:
+            ap.error("--report 需要 --run 或 --runs")
+        out = write_report(wd, stamps)
         print(f"[*] 报告 {out}")
         return 0
 

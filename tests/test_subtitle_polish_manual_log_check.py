@@ -89,11 +89,29 @@ def _fixture(d):
     return ass, srt
 
 
-def _log_lines(wd):
+def _log_lines(wd, action=None):
+    """读台账行。`action` 给了就只数该 action 的记录。
+
+    为什么要这个参数（issue #24 的 B2）：`--manual-log` 现在写**两条**——
+    一条 `manual_edit`（逐条改动，供 rollback）+ 一条 `structural_change`
+    （批次级标记，供报告单列与回归检查识别）。原来这里数的是总行数，
+    B2 一上线就变成「应写 1 条、实际 2 条」。数总行数本来也不是这些用例的
+    意思：它们要验的是「补记发生了几次」，次数=日志条数，不是文件行数。
+    """
     p = os.path.join(wd, "log.jsonl")
     if not os.path.exists(p):
         return []
-    return [l for l in open(p, encoding="utf-8") if l.strip()]
+    lines = [l for l in open(p, encoding="utf-8") if l.strip()]
+    if action is None:
+        return lines
+    out = []
+    for l in lines:
+        try:
+            if json.loads(l).get("action") == action:
+                out.append(l)
+        except ValueError:
+            pass
+    return out
 
 
 def _run(ass, wd, **kw):
@@ -158,13 +176,17 @@ def test_accepts_valid_entry():
         # srt 2 有两条同时间戳中文行, 会多一条「多条同时间戳行」警告 → 需 --force
         _run(ass, wd, srt_id=2, old_text="{\\be3}很多次了",
              new_text="{\\be3}来过好几次", force=True)
-        lines = _log_lines(wd)
-        assert len(lines) == 1, f"应写入 1 条, 实际 {len(lines)}"
+        lines = _log_lines(wd, action="manual_edit")
+        assert len(lines) == 1, f"应写入 1 条 manual_edit, 实际 {len(lines)}"
         rec = json.loads(lines[0])
         assert rec["action"] == "manual_edit"
         assert rec["srt_id"] == 2
         assert rec["old_text"] == "{\\be3}很多次了"
         assert rec["new_text"] == "{\\be3}来过好几次"
+        # B2：同时必须落下一条 structural_change 标记，供报告单列
+        marks = _log_lines(wd, action="structural_change")
+        assert len(marks) == 1, f"应写入 1 条 structural_change, 实际 {len(marks)}"
+        assert json.loads(marks[0])["kind"] == "manual_edit"
     finally:
         shutil.rmtree(d)
 
@@ -187,7 +209,7 @@ def test_warns_on_duplicate_or_unlanded():
 
         # --force 才允许写入
         _run(ass, wd, old_text="{\\be3}早先的旧文本", new_text="{\\be3}MX-5 是的", force=True)
-        assert len(_log_lines(wd)) == 1
+        assert len(_log_lines(wd, action="manual_edit")) == 1
     finally:
         shutil.rmtree(d)
 

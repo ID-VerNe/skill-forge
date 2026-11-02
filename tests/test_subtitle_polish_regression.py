@@ -125,12 +125,24 @@ def flipflop_trail():
 
 
 class WorkDir:
-    """临时 .subtitle-polish 工作目录 + 一个可配的 log.jsonl。"""
+    """临时 `.subtitle-polish` 工作目录 + 一个可配的 log.jsonl。
+
+    目录名必须是 `.subtitle-polish`，不能图省事直接用 `mkdtemp()` 的随机名
+    （issue #24 的 A4/M1）：`resolve_work_dir` 现在只认这个固定的目录名，
+    传 `<tmp>/sp-regress-xxxx` 会直接 `WorkDirError` 退出。这不是测试麻烦，
+    而是要验的真正约束——以前随便传都接受，同一次审校里就会冒出两本并存
+    的 log.jsonl，报告读 A、脚本写 B。
+
+    ASS / SRT 放在它的**父目录**里：真实布局也是 `<项目>/.subtitle-polish/`
+    与 `<项目>/xxx.ass` 相邻，而不是把片源塞进工作目录。
+    """
 
     def __init__(self, entries=None):
-        self.dir = tempfile.mkdtemp(prefix="sp-regress-")
-        self.ass = os.path.join(self.dir, "e04.ass")
-        self.srt = os.path.join(self.dir, "e04.srt")
+        self.base = tempfile.mkdtemp(prefix="sp-regress-")
+        self.dir = os.path.join(self.base, ".subtitle-polish")
+        os.makedirs(self.dir, exist_ok=True)
+        self.ass = os.path.join(self.base, "e04.ass")
+        self.srt = os.path.join(self.base, "e04.srt")
         with open(self.ass, "w", encoding="utf-8") as f:
             f.write(ASS_HEADER + ASS_BODY)
         with open(self.srt, "w", encoding="utf-8") as f:
@@ -146,7 +158,9 @@ class WorkDir:
                 f.write(json.dumps(e, ensure_ascii=False) + "\n")
 
     def close(self):
-        shutil.rmtree(self.dir, ignore_errors=True)
+        # 删的是 base（临时根），不是 self.dir——片源在 base 下，只删 .subtitle-polish
+        # 会把 mtkdtemp 的临时目录留在磁盘上。
+        shutil.rmtree(self.base, ignore_errors=True)
 
 
 def _run(script, args, cwd=None):

@@ -324,9 +324,15 @@ def test_manual_log_appends():
         stderr = r.stderr.decode("utf-8", errors="replace")
         stdout = r.stdout.decode("utf-8", errors="replace")
         assert r.returncode == 0, f"--manual-log 失败:stderr={stderr}"
-        entries = read_log(work_dir)
-        assert len(entries) == 1, f"应补记 1 条,实际 {len(entries)}"
-        e = entries[0]
+        # B2 起 --manual-log 写两条：manual_edit（逐条，供 rollback）+
+        # structural_change（批次标记，供报告单列）。所以要按 action 分别数，
+        # 数总行数会把标记也算成一次补记。
+        edits = [e for e in read_log(work_dir) if e.get("action") == "manual_edit"]
+        marks = [e for e in read_log(work_dir) if e.get("action") == "structural_change"]
+        assert len(edits) == 1, f"应补记 1 条 manual_edit,实际 {len(edits)}"
+        assert len(marks) == 1, f"应写 1 条 structural_change,实际 {len(marks)}"
+        assert marks[0].get("kind") == "manual_edit", marks[0]
+        e = edits[0]
         assert e["action"] == "manual_edit", f"action 应是 manual_edit,实际 {e.get('action')}"
         assert e["batch_id"] == "20261002_111500_manual"
         assert e["srt_id"] == 1

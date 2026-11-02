@@ -397,8 +397,20 @@ def t_cli_end_to_end():
         assert p.returncode == 0, p.stderr
         assert os.path.exists(os.path.join(ro.run_dir(r.wd, "CLI"), "final-report.md"))
 
+        # B4：整轮回退是**不可逆**的（ASS 与 log.jsonl 一起被覆盖），不带 --yes 必须拒绝。
+        # 先锁住这个负例，再跑正例——否则哪天有人把确认删了，这条用例只验「能回滚」，
+        # 验不到「该拦的时候拦得住」。
         p = subprocess.run([PY, os.path.join(SCRIPTS, "round_orchestrator.py"),
                             "--run", "CLI", "--work-dir", r.wd, "--rollback-to", "r00"],
+                           capture_output=True, text=True, encoding="utf-8")
+        assert p.returncode != 0, "整轮回退不带 --yes 竟然成功了"
+        assert "--yes" in (p.stdout + p.stderr), \
+            f"拒绝理由里应提示 --yes：{p.stdout!r} {p.stderr!r}"
+        assert sha(r.ass) != origin, "被拒绝的回滚不该动 ASS"
+
+        p = subprocess.run([PY, os.path.join(SCRIPTS, "round_orchestrator.py"),
+                            "--run", "CLI", "--work-dir", r.wd,
+                            "--rollback-to", "r00", "--yes"],
                            capture_output=True, text=True, encoding="utf-8")
         assert p.returncode == 0, p.stderr
         assert sha(r.ass) == origin, "CLI 回滚没回到起点"

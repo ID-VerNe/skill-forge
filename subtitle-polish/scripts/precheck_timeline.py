@@ -202,6 +202,30 @@ def render(name, res):
     return "\n".join(L)
 
 
+#: D2 固定尾注：**每次出结果都印**，包括 PASS。
+#:
+#: 为什么必须固定印而不是写在 --help 里：PASS 是最容易被当成"检查过了、没问题"的输出。
+#: 实测的坏例子——L0 判 PASS、条数相等、时间单调、包络合理，而中文轨从第 149 行起
+#: 整体错位 39.84 秒。L0 没说谎，它只是**不管这件事**，而没人告诉读报告的人这一点。
+#: 把边界印在结果旁边，是唯一能跟住结论位置的办法。
+_SCOPE_NOTE = [
+    "[L0] ── 本检查的边界 ─────────────────────────────────────",
+    "[L0] 只管 4 件事：条数、重复、时间单调、时长包络。",
+    "[L0] **以下它看不见**：",
+    "[L0]   · 轨错位（中英内容配错行，即使每条时间都对）",
+    "[L0]   · 累计漂移（逐条偏差都很小，末条差出一大截）",
+    "[L0]   · 重复残片（同一句被切成两行，各自时间都正常）",
+    "[L0] 要查这三类跑：python scripts/structure_check.py --ass <ass>",
+    "[L0] （自动审校模式下它已是开工前置门禁；手动/对轴请自行跑一次。）",
+    "[L0] ──────────────────────────────────────────────────────",
+]
+
+
+def scope_note():
+    """返回固定尾注的行列表，供 render/main 与测试共用。"""
+    return list(_SCOPE_NOTE)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="L0 结构哨兵：秒级时间轴体检（不加载模型）",
@@ -254,6 +278,11 @@ def main():
         print("[L0] UNVERIFIED —— 拿不到片长，只能做部分检查。加 --media 或 --duration。")
     else:
         print("[L0] SUSPECT —— 先按上面的提示修结构问题，再花十分钟跑 L1。")
+
+    # D2：尾注无条件印，包括 PASS。见 _SCOPE_NOTE 上方注释。
+    print()
+    for ln in scope_note():
+        print(ln)
 
     if args.json:
         os.makedirs(os.path.dirname(os.path.abspath(args.json)) or ".", exist_ok=True)

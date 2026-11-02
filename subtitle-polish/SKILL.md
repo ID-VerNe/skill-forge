@@ -186,6 +186,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 │   ├── align-audit.md          # 对音频的时间轴审计与修复
 │   ├── timeline-credential.md  # 时间轴凭据(sidecar)与阶段 0 闸门
 │   ├── build-timeline.md       # 翻译前先从片源建立可信时间轴
+│   ├── pitfalls.md             # 踩坑清单:厘秒精度/track 中文串/bash 吃反斜杠/大文件分片/结构先于语义
 │   └── prompt-injection.md     # prompt 构造约束
 ├── prompts/                    # audit/verify/synthesize 模板
 └── scripts/                    # extract_slice / apply_fixes / global_replace
@@ -194,6 +195,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
                                 #   / extract_subs / align_audit / align_patch
                                 #   / timeline_gate / precheck_timeline
                                 #   / scan_seed(出锚点) / scan_inclusive(词表判定)
+                                #   / structure_check(结构前置门禁) / show_ids(对照表)
                                 #   / round_orchestrator + lib/
 ```
 
@@ -205,7 +207,9 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 | `precheck_punct.py` | 中文行标点归一(默认 dry-run) | 自动审校 |
 | `pre_audit.py` | 三轨预审(需显式开启) | 自动审校 |
 | `scan_seed.py` | 出锚点（命中词/白名单候选/感叹·贬义·主权形态 + 上下文段），贴进审计 prompt。**只定位，不判断** | 自动审校(R11, 也用于 1–7 类查漏) |
-| `scan_inclusive.py` | 第 8 类词表判定:按子域 A/B/C/D 分段出命中;C 子域只 flag 不改,L4 白名单优先丢弃。**词表 0 命中 ≠ 干净** | 自动审校(R11) |
+| `scan_inclusive.py` | 第 8 类词表判定:按子域 A/B/C/D 分段出命中;C 子域只 flag 不改,L4 白名单优先丢弃。**首列是 srt_id**,可直接进 fixes.json。**词表 0 命中 ≠ 干净** | 自动审校(R11) |
+| `structure_check.py` | 结构前置门禁:轨道枚举/起点重合/时长异常/索引偏差画像/残片重复。ABORT(20) 不许开工、SUSPECT(21) 放行待看。**偏差小 ≠ 配对了** | 自动审校(开工前) |
+| `show_ids.py` | `srt_id → 英文/中文/时间` 对照表,`--ids/--range/--grep/--empty` 过滤。裁决时逐条核对位置用 | 三模式 |
 | `round_orchestrator.py` | 轮次编排:排轮次表/记轮次/整轮快照回滚/定格/出 final-report | 自动审校 |
 | `apply_fixes.py` | 执行 fixes.json / 回滚 / `--manual-log` | 三模式 |
 | `global_replace.py` | 跨文件纯文本替换 | 三模式 |

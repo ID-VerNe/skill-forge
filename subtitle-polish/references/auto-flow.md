@@ -140,7 +140,11 @@ R4 只写「只看第 1 类」，R7 只写「只看第 4 类」，R10 写「全 
 
 - 每文件份数 = `max(1, round(块数/700))`。
 - **小文件短路**：单文件块数 ≤ 200 时，主 agent 可直接审计该切片，不必另起子 agent（省成本）。> 200 必须起子 agent。边界明确，不要因"已读完整切片"自行放宽阈值。
-- 每份起一个子 agent，prompt 用 `prompts/audit.tmpl`，填入 `{slice_path}`、`{start_block}`、`{end_block}`、`{project_context}`、`{round_scope}`、`{ledger}`、`{seeds}`、`{inclusive_list}`。
+- 每份起一个子 agent，prompt 用 `prompts/audit.tmpl`，填入 `{slice_path}`、`{start_block}`、`{end_block}`、`{n_rows}`、`{project_context}`、`{round_scope}`、`{ledger}`、`{seeds}`、`{inclusive_list}`。
+  **`{n_rows}` 是必填项，不是可选装饰**：模板用它写出 srt_id 的合法值域 `1..{n_rows}`
+  与「越界候选」的判据。漏填会让 prompt 里留下一个花括号，agent 只能自己猜片长——而这正是
+  M2（审计员越界编造 15 次）的成因之一。`{n_rows}` = 该切片对应的 SRT 总块数（全片口径，
+  不是切片内的行数），与 `{end_block}` 的上界同源。
 - **按切片切，不按类别切**：一个子 agent 在自己的 `[start_block, end_block]` 里把这轮范围内的
   所有类别一起过。理由见 `subagent-delegation.md`「切分单位」。
 - project_context 来源（按优先级）：① 用户 prompt 里写的背景；② `.subtitle-polish/context.md`；③ **两者都没有时，主 agent 读 SRT 前 50 块 + ASS 样式自动合成一段项目背景**（领域、话题、疑似专名列表）。

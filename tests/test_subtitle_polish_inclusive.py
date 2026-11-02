@@ -363,12 +363,20 @@ def t_single_file_not_collected_thrice():
             md = f.read()
         assert "扫描对象：1 个文件" in md, f"单个文件被重复收集：\n{md[:800]}"
         # 候选表里 `处女航` 只该有一行（同一行内会因「命中词 + 现译文本」出现两次，
-        # 所以按行数而不是按字符串次数算）
-        rows = [ln for ln in md.splitlines()
-                if ln.startswith("| L1 |") and "处女航" in ln]
+        # 所以按行数而不是按字符串次数算）。
+        # C3 起报表首列是 `srt_id`（不再是「层」），所以判「是表格行」不能靠
+        # startswith("| L1 |")——那会在加列那天静默失效：行数永远是 0，
+        # 而断言写的是「只该有一行」，等于这条防重复用例从此什么都不验。
+        def is_data_row(ln):
+            return ln.startswith("| ") and "处女航" in ln and "---" not in ln
+
+        rows = [ln for ln in md.splitlines() if is_data_row(ln)]
         assert len(rows) == 1, f"处女航 候选行出现 {len(rows)} 行，疑似重复：\n{rows}"
+        # 顺便锁住 C3 的产物：首列确实是整数 srt_id
+        assert rows[0].split("|")[1].strip().isdigit(), \
+            f"报表首列应是 srt_id，实际：{rows[0]!r}"
         wl_rows = [ln for ln in md.splitlines()
-                   if ln.startswith("| `母头`")]
+                   if ln.startswith("| ") and "`母头`" in ln and "---" not in ln]
         assert len(wl_rows) == 1, f"白名单 母头 出现 {len(wl_rows)} 行：\n{wl_rows}"
     finally:
         fx.close()

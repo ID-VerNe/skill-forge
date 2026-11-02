@@ -345,7 +345,10 @@ def scan_ass(ass_path: str, srt_path: str = "", layers=("L1", "L2", "L3"),
                 (TRACK_ZH, TRACK_EN, TRACK_NOTE))
     fallback = bool(events) and known == 0
 
-    for e in events:
+    # C3：**必须带 srt_id**。以前报表只有「时间」列，下游 `make_fixes` 照着
+    # 128.92 当索引去取第 128 行，直接 IndexError；就算不崩，也是靠秒数猜行号，
+    # 一旦有同起点/同秒的相邻行就指到别的句子上去。行号在 ASS 里是唯一稳定的定位。
+    for idx, e in enumerate(events, 1):
         body = clean_ass_text(e.text or "")
         if fallback:
             if not _is_cjk(body):
@@ -360,11 +363,12 @@ def scan_ass(ass_path: str, srt_path: str = "", layers=("L1", "L2", "L3"),
         sec = (e.start or 0) / 1000.0
         for h in r["hits"]:
             hits.append(dict(h, file=os.path.abspath(ass_path), track=track,
+                             srt_id=idx,
                              start=round(sec, 2), end=round((e.end or 0) / 1000.0, 2),
                              text=body, en=_nearest_en(blocks, sec)))
         for h in r["whitelisted"]:
             wl.append(dict(h, file=os.path.abspath(ass_path), track=track,
-                           start=round(sec, 2), text=body))
+                           srt_id=idx, start=round(sec, 2), text=body))
     return {"hits": hits, "whitelisted": wl, "track_fallback": fallback}
 
 
@@ -372,16 +376,18 @@ def scan_srt(srt_path: str, layers=("L1", "L2", "L3"),
              domains=("A", "B", "C", "D"), allow_politics: bool = False) -> dict:
     """扫 SRT 也用得上：`处女航` 可能出现在还没翻译的英文译稿里。"""
     hits, wl = [], []
-    for b in _srt_blocks(srt_path):
+    for idx, b in enumerate(_srt_blocks(srt_path), 1):
         text = (getattr(b, "text", "") or "").replace("\n", " ")
         r = scan_text(text, layers=layers, domains=domains,
                       allow_politics=allow_politics)
         for h in r["hits"]:
             hits.append(dict(h, file=os.path.abspath(srt_path), track="srt",
+                             srt_id=idx,
                              start=round(float(getattr(b, "start", 0)), 2),
                              text=text, en=text))
         for h in r["whitelisted"]:
             wl.append(dict(h, file=os.path.abspath(srt_path), track="srt",
+                           srt_id=idx,
                            start=round(float(getattr(b, "start", 0)), 2), text=text))
     return {"hits": hits, "whitelisted": wl}
 
@@ -442,31 +448,39 @@ def render_md(result: dict, targets: list, allow_politics: bool = False) -> str:
                 L += ["> 政治内容属判断问题而非词语问题：脚本只负责**发现并标出**，",
                       "> 不提供改法，也不落盘。要改请人工处理，或在门 2 逐条确认。",
                       "> 本 skill 不承担时政立场判定。", ""]
-                rows = ["| %s | `%s` | %.2fs | %s | %s |" % (
-                    h.get("layer") or "—", h["term"], h["start"], h["text"][:26],
+                # C3：首列必须是 srt_id。下游拿「时间」当索引会 IndexError；
+                # 且同秒相邻行靠秒数根本分不开。
+                rows = ["| %s | %s | `%s` | %.2fs | %s | %s |" % (
+                    h.get("srt_id", "—"), h.get("layer") or "—", h["term"],
+                    h["start"], h["text"][:26],
                     os.path.basename(h["file"])) for h in
-                    sorted(sub, key=lambda x: (x["file"], x["start"]))]
-                L += _md_table(rows, ["层", "命中", "时间", "现译", "文件"])
+                    sorted(sub, key=lambda x: (x["file"], x.get("srt_id") or 0))]
+                L += _md_table(rows, ["srt_id", "层", "命中", "时间(秒)", "现译", "文件"])
             else:
                 if dom == POLITICAL:
                     L += ["> `--politics` 只放开 L1 的替换建议；L2 仍需语境判断，保持只标注。",
                           "> 落盘前仍须在门 2 逐条确认——C 子域不走批量 accept。", ""]
                 rows = []
-                for h in sorted(sub, key=lambda x: (x.get("layer"), x["file"], x["start"])):
-                    rows.append("| %s | `%s` | %s | %.2fs | %s | %s | %s |" % (
-                        h["layer"], h["term"], h.get("suggestion") or "—",
+                for h in sorted(sub, key=lambda x: (x.get("layer"),
+                                                    x["file"],
+                                                    x.get("srt_id") or 0)):
+                    rows.append("| %s | %s | `%s` | %s | %.2fs | %s | %s | %s |" % (
+                        h.get("srt_id", "—"), h["layer"], h["term"],
+                        h.get("suggestion") or "—",
                         h["start"], h["text"][:22], (h.get("en") or "")[:28],
                         os.path.basename(h["file"])))
-                L += _md_table(rows, ["层", "命中", "建议", "时间", "现译", "英文", "文件"])
+                L += _md_table(rows, ["srt_id", "层", "命中", "建议", "时间(秒)",
+                                      "现译", "英文", "文件"])
 
         L += ["> L3 层（只标注）与 C 子域 **不进** `fixes.json`。L1/L2 进之前须过白名单与语义检查。", ""]
 
     L += ["## 白名单命中（已白名单，未改）", ""]
     if wl:
-        rows = ["| `%s` | %.2fs | %s | 行业标准词/专名/正常用法，改动即错 |"
-                % (h["term"], h["start"], h["text"][:26]) for h in
-                sorted(wl, key=lambda x: (x["file"], x["start"]))]
-        L += _md_table(rows, ["命中", "时间", "现译", "说明"])
+        rows = ["| %s | `%s` | %.2fs | %s | 行业标准词/专名/正常用法，改动即错 |"
+                % (h.get("srt_id", "—"), h["term"], h["start"],
+                   h["text"][:26]) for h in
+                sorted(wl, key=lambda x: (x["file"], x.get("srt_id") or 0))]
+        L += _md_table(rows, ["srt_id", "命中", "时间(秒)", "现译", "说明"])
         L += ["> 这一节存在的意义：防止把「白名单拦住」误读成「漏改」。", ""]
     else:
         L += ["没有。", ""]

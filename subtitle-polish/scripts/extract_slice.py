@@ -28,6 +28,46 @@ from lib.time_fmt import seconds_to_ass
 DEFAULT_BLOCKS = 700
 DEFAULT_OVERLAP = 100
 
+# C2（M4）：非空率下限。低于它直接 abort，不写切片。
+#
+# 起因：R1 曾因切片全空作废重跑 11 次审计。全空的切片**不会报错**——它只是
+# 一堆 `<id> | <time> |  |  | ` 的空行，subagent 读到的是「这段没有对白」，
+# 于是整轮审计基于空气做出结论，报告上还写着「本轮已审」。
+MIN_NONEMPTY_RATE = 0.5
+
+
+def nonempty_rate(paired) -> tuple:
+    """(非空块数, 总块数, 比率)。「非空」= 英文或中文至少一侧有内容。"""
+    total = len(paired)
+    if total == 0:
+        return 0, 0, 0.0
+    n = sum(1 for pb in paired
+            if (pb.english or "").strip() or (pb.chinese or "").strip())
+    return n, total, n / total
+
+
+def assert_not_empty(paired, ass_path: str, srt_path: str,
+                     label: str = "") -> None:
+    """空切片门禁：全空或非空率过低时 abort（C2 / M4）。
+
+    **必须在写任何切片之前调**。写出来再检查，等于已经把空切片留给下一道工序了。
+    """
+    n, total, rate = nonempty_rate(paired)
+    if total == 0:
+        raise SystemExit(
+            f"[!] {label} 配对结果为 0 块（srt={srt_path}）\n"
+            f"    这不是「提词器段落」，是根本没配上。")
+    if n == 0 or rate < MIN_NONEMPTY_RATE:
+        raise SystemExit(
+            f"[!] {label} nonempty={n}（{total} 块里 {n} 块匹配到英文，"
+            f"非空率 {rate:.0%} < {MIN_NONEMPTY_RATE:.0%}）\n"
+            f"    这通常不是「提词器段落」，先查三件事：\n"
+            f"      1. 时间轴容差（默认 TIME_TOLERANCE=0.5s）是否小于实际漂移\n"
+            f"      2. 中英轨是否错位（跑 structure_check.py --ass {ass_path}）\n"
+            f"      3. 该段是否真的无对白（抽 3 个块人工对照视频）\n"
+            f"    **不要在此基础上继续审计**：空切片会让整轮结论基于空气，"
+            f"而报告上看不出异常。")
+
 
 def slice_blocks(paired, total_blocks: int, blocks_per: int, overlap: int):
     """按 srt_id 切片，返回 [(start, end, [blocks]), ...]。"""
@@ -94,6 +134,12 @@ def run(ass_path: str, srt_path: str, out_dir: str,
     total = len(paired)
     print(f"[*] {ass_path}")
     print(f"    srt blocks: {total}, ass dialogues: {len(ass_blocks)}, ass_only: {len(ass_only)}")
+
+    # C2：门禁在建目录、写文件之前。先写再查，空切片就已经交到下一道工序手上了。
+    ne, _, rate = nonempty_rate(paired)
+    print(f"    nonempty: {ne}/{total}（{rate:.0%}）")
+    assert_not_empty(paired, ass_path, srt_path,
+                     label=os.path.basename(ass_path))
 
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(ass_path))[0]
