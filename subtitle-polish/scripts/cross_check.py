@@ -42,6 +42,46 @@ from lib.tags import extract_leading_tags
 TAG = re.compile(r"\{[^}]*\}")
 CJK = re.compile(r"[\u4e00-\u9fff]")
 
+# 撞车预警的**时间距离**门槛（秒）。
+#
+# ## 「相邻」不等于「同一处」
+#
+# 撞车预警的语义是「新译文像是把邻块的译文抄了过来」。这要求两块说的是
+# **同一处画面里紧挨着的两句**。原来的实现只按块序号取 ±window，不看时间——
+# 在快节奏对白里这没问题，但长镜头下「相邻两块」的起点可以差 20 秒：
+# `[长镜头，十几秒无人说话]` 前后各一句，序号相邻、内容无关。
+#
+# 两份不相干的译文相似度高，只可能是「句式巧合」（比如都是「我知道了」
+# 「好的，谢谢」这类高频短句），不是抄错。报出来是纯噪声，而且这类噪声
+# 会挤掉真撞车——一份报告里 15 条有一条真，人就开始整份跳过。
+#
+# 取 10 s 的理由：正常对白节奏下相邻两句的起点差中位数在 2~4 s 量级
+# （S06E02 实测 ±3 邻块相似度命中的间隔全部落在 1~10 s，没有一条 ≥10 s）。
+# 10 s 足以覆盖正常节奏，又能挡住长镜头跨场景的伪相邻。
+COLLISION_MAX_GAP = 10.0
+
+
+def _shortname(path):
+    """从素材文件名取短名，用于「<shortname>#<srt_id>」形式的报告标题。
+
+    `manual-flow.md` 已经把这条约定写死了：`id = audit_id = <shortname>#<srt_id>`，
+    短名从文件名取（如 `e04#16`）。但本脚本上一版把 `e04` 硬编码在三个 f-string
+    里，于是**任何素材**跑出来都叫 `e04#`——审计报告里全是错的素材代号，
+    而报告要进 log、要跨批次对账，代号错了就对不上。
+
+    兜底返回 `"sub"` 而不是空串：空短名会产出 `#343` 这种没有主体的标题，
+    比带个中性前缀更难读。也不回退到 `e04`——那是把 bug 伪装成默认值。
+    """
+    stem = os.path.splitext(os.path.basename(path or ""))[0]
+    # 去掉尾部语言/成品标记：S06E02.eng / show_chs / foo.zh 之类。
+    # 最多剥两层——`S06E02.eng.fin` 这种双标记也要清干净，但别把
+    # `ep.01` 这类真实标题的末段当标记剥掉，所以不用 while。
+    stem = re.sub(r"[._-](zh|chs|cht|cn|en|eng|ass|srt|fin|final)$", "", stem,
+                  flags=re.IGNORECASE)
+    stem = re.sub(r"[._-](zh|chs|cht|cn|en|eng|ass|srt|fin|final)$", "", stem,
+                  flags=re.IGNORECASE)
+    return stem or "sub"
+
 
 def _cjk(s):
     return "".join(CJK.findall(s or ""))
@@ -87,8 +127,12 @@ def load_pairs(ass_path, srt_path):
     return out
 
 
-def collision_score(rows, idx, window=3, floor=0.55):
-    """新译文与 ±window 邻块现有中文的最高相似度。"""
+def collision_score(rows, idx, window=3, floor=0.55, max_gap=COLLISION_MAX_GAP):
+    """新译文与 ±window 邻块现有中文的最高相似度。
+
+    `max_gap` 是起点差上限（秒）。序号相邻但时间上隔了很远的块不算撞车候选——
+    详见 `COLLISION_MAX_GAP` 的注释。传 None 关闭时间过滤（保留旧行为）。
+    """
     me = rows[idx]
     n = _cjk(me["zh"])
     if not n:
@@ -100,6 +144,10 @@ def collision_score(rows, idx, window=3, floor=0.55):
         j = idx + d
         if not (0 <= j < len(rows)):
             continue
+        if max_gap is not None:
+            gap = abs(rows[j]["start"] - me["start"])
+            if gap > max_gap:
+                continue
         o = _cjk(rows[j]["zh"])
         if not o:
             continue
@@ -124,6 +172,8 @@ def main():
     ap.add_argument("--collision-only", action="store_true", help="只输出撞车预警")
     ap.add_argument("--window", type=int, default=3, help="邻块窗口，默认 3")
     ap.add_argument("--floor", type=float, default=0.55, help="撞车阈值，默认 0.55")
+    ap.add_argument("--collision-max-gap", type=float, default=COLLISION_MAX_GAP,
+                    help="撞车候选的起点差上限（秒），默认 10；传 0 关闭时间过滤")
     ap.add_argument("--regression-window", type=int, default=0,
                     help="只比对更早的最近 N 个 batch（0=全部，默认；负数=关闭）")
     ap.add_argument("--work-dir", default=".subtitle-polish")
@@ -184,23 +234,30 @@ def main():
              f"- 复核块数: {len(want)}",
              ""]
 
+    # 报告标题里的素材代号从成品文件名推导，不写死。详见 _shortname()。
+    ep = _shortname(ass_path)
+
     collisions = []
     for sid in sorted(want):
         if sid not in by_sid:
-            lines.append(f"## e04#{sid} — ⚠ 该 srt_id 在源里不存在")
+            lines.append(f"## {ep}#{sid} — ⚠ 该 srt_id 在源里不存在")
             lines.append("")
             continue
         r = rows[by_sid[sid]]
-        score, nbr = collision_score(rows, by_sid[sid], args.window, args.floor)
+        score, nbr = collision_score(rows, by_sid[sid], args.window, args.floor,
+                                     max_gap=(args.collision_max_gap or None))
         if nbr:
             collisions.append((sid, nbr, score))
         if args.collision_only and not nbr:
             continue
-        lines.append(f"## e04#{sid}  `{fmt_tc(r['start'])}`")
+        lines.append(f"## {ep}#{sid}  `{fmt_tc(r['start'])}`")
         lines.append(f"- 英文: {r['en']}")
         lines.append(f"- 中文: {r['zh']}")
         if nbr:
-            lines.append(f"- ⚠ 撞车预警: 与 e04#{nbr} 相似度 {score:.2f}")
+            gap = abs(rows[by_sid[nbr]]["start"] - r["start"])
+            # 报出距离：读的人要能自己判断「这算不算同一处」
+            lines.append(f"- ⚠ 撞车预警: 与 {ep}#{nbr} 相似度 {score:.2f}"
+                         f"（起点相隔 {gap:.1f}s）")
         ops = targets.get((ass_path, sid), [])
         for o in ops:
             lines.append(f"- 本批改动: {o.get('old_text', '')!r} → {o.get('new_text', '')!r}"
