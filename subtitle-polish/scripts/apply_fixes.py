@@ -157,18 +157,49 @@ def _build_index_alignment(ass_path, srt_blocks_indexed) -> dict:
             f"index_align 构建失败，拒绝退回 ±0.5s 窗静默定位：{exc}") from exc
     out = {}
     for pb in paired:
-        en = (pb.lines or {}).get("英文") or []
-        if not en:
+        anchor = _anchor_rows(pb)
+        if not anchor:
             continue
-        # 取该块英文行里最早的一条作为锚点：中英双轨同起点，英文行的起点即
-        # 这一句在 ASS 里的真实起点。
-        out[pb.srt_id] = min(r.start for r in en)
+        # 取该块锚点行里最早的一条作为起点：双轨同起点时两条完全一致；
+        # 只有单轨时就是这条轨自己的起点。
+        out[pb.srt_id] = min(r.start for r in anchor)
     return out
+
+
+def _anchor_rows(pb):
+    """从 `pb.lines` 里取「这句译文在 ASS 里的锚点行」。
+
+    ## 为什么不能写死 `pb.lines["英文"]`
+
+    `pb.lines` 是 `{轨道名: [行]}` 的动态字典——`ass_srt_pair.pair()` 里
+    `track_lines.setdefault(ab.track, []).append(ab)` 建出来的，**有哪条轨就
+    只有哪个 key**。上一版写死 `.get("英文")`，在纯中字素材（只有中文轨、
+    没有英文轨）上恒返回 `None` → `out` 为空 → 调用方 `RuntimeError`
+    「index_align 构建失败」→ **整批 abort，一集都跑不了**。
+
+    ## 取锚点的优先级
+
+    1. **英文轨**：SRT 通常是英文原文、ASS 的英文轨与 SRT 同源，配对结论落
+       在英文轨上最可靠。双轨同起点，取英文轨的起点就代表整句。
+    2. **中文轨**：纯中字素材没有英文轨，中文轨自己的起点就是真实起点
+       （`pair()` 已按时间窗/顺序映射把它和 srt_id 对上）。
+    3. 其它轨道（水印/注释/特效等）一律不参与：它们的行进不进配对结论，
+       拿它们当锚点会把定位引到非字幕行上。
+
+    只返回真正承载译文的轨道，不做「随便取一条」的兜底——取错锚点比取不到
+    更危险（会静默写到相邻行）。
+    """
+    lines = pb.lines or {}
+    for trk in (TRACK_EN, TRACK_ZH):
+        rows = lines.get(trk) or []
+        if rows:
+            return rows
+    return []
 
 
 def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
                    fallback_text: str = "", *, used=None, prefer_text: str = "",
-                   index_align=None):
+                   index_align=None, strict: bool = False):
     """按 srt_id + track 在 ass subs 里定位 Dialogue event。
 
     返回 pysubs2 Event 对象或 None。
@@ -180,6 +211,10 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
     index_align: {srt_id: ASS 起点秒}，来自 `_build_index_alignment`。**优先级最高**：
         有映射就按精确起点定位，不再走 ±0.5s 窗——断句点分歧的素材上那个窗会
         包住相邻句，改了错的句子。
+    strict: 严格模式。给了 `index_align` 但映射指向的起点上找不到行、或候选不唯一
+        又无文本证据时，返回 None 而不是退回 ±0.5s 窗猜。**回滚路径必须开**：
+        回滚是「把已知的 new_text 换回 old_text」，写错一行的代价是同时弄坏两行，
+        宁可报错让用户重跑一条。写入路径（apply）保持 False 以维持旧行为。
 
     为什么需要 used/prefer_text：_find_dialogue 原本的语义是「取时间戳最近的第
     一条」，无状态。生产环节把一句中文字幕拆成多条独立 Dialogue 时，同 start/end、
@@ -199,8 +234,29 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
                     return same[0]
                 # 声明文本对不上：说明映射或 current 有误。**不静默改相邻句**，
                 # 退回时间窗让调用方报错——错改比不改危害大。
+            elif len(rows) > 1:
+                # ⚠️ 这里是 bug #3 的根因所在，别改回 `return rows[0]`。
+                #
+                # `_row_at_start` 只按「start 精确 ±0.002s + 同 track」过滤。
+                # 同一起点上有 2~3 条同轨行时（碎片行、或者映射给了个稍偏的
+                # 起点恰好套住了相邻行），`rows[0]` 取的是**事件表里的先后顺序**，
+                # 而不是「哪一条是这一句」。这个顺序既不稳定也不是语义。
+                #
+                # 实测后果（测试 agent bug #1/#3，`%TEMP%/opencode/q1repro`）：
+                # srt 476 被映射到 1460.6s，窄窗套住的是 srt 477 的行，
+                # 于是 477 被写成了 476 的文本 —— 改错 1 行 + 污染 1 行。
+                #
+                # 候选不唯一又没有文本证据，就是「无证据」。按 v1.15 方案甲
+                # （已修订为「不能无证据地猜」）：**返回 None 让调用方报错**，
+                # 绝不猜。宁可 abort 一条，也不要静默写坏两行。
+                return None
             else:
                 return rows[0]
+        elif strict:
+            # 映射明确说「这一句在 X 秒」，那里却连一行都没有 —— 映射本身不可信。
+            # 静默退回 ±0.5s 窗会把这个矛盾吞掉，只能在别处以「改了错的句子」
+            # 的形式暴露出来。按严格模式直接判失败。
+            return None
     if srt_id in srt_blocks_indexed:
         sb = srt_blocks_indexed[srt_id]
         target_start = sb.start  # 秒
@@ -1092,7 +1148,21 @@ def _find_paired_srt(ass_path: str) -> str:
 
 
 def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before_ts=None) -> int:
-    """按条件回滚，反向应用 old_text。"""
+    """按条件回滚，反向应用 old_text。
+
+    ## 回滚比写入更危险，所以这里的规则比 apply 严
+
+    写入是「把这三行改成那三行」，回滚是「把已知的 current 换回 old_text」。
+    回滚一旦定位错，伤害是**双向**的：目标行没还原，相邻行被覆盖。测试 agent
+    在 `%TEMP%/opencode/q1repro` 上 1:1 复现过：`--rollback` 跑完 md5 一个字节
+    都没变，且事件 #990（srt 477）被写成了 srt 476 的文本。
+
+    所以这版加了四道闸：
+      1. 传 `prefer_text=new_text` —— 让「这条日志记的当前内容」参与判别；
+      2. `strict=True` —— 候选不唯一又无文本证据就判失败，不猜相邻行；
+      3. 回读断言 —— 写盘前确认目标行已是 old_text、邻行未被改动；
+      4. 前后 md5 显式结论 —— 回滚没生效必须说出来，不能沉默。
+    """
     entries = read_log(work_dir)
     targets = filter_log(entries, batch_id=batch_id, srt_id=srt_id,
                          file=file, before_ts=before_ts)
@@ -1105,7 +1175,10 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
     for e in targets:
         by_file.setdefault(e["file"], []).append(e)
     count = 0
+    failed = 0
+    md5_report = []
     for f, ents in by_file.items():
+        md5_before = _md5_of(f)
         subs = pysubs2.load(f, encoding="utf-8-sig")
         # 回滚也需要 srt_id -> timestamp 映射。优先用日志里的 old_text 直接按时间戳定位
         # （日志有 old_text，按 track + 时间戳找当前行）
@@ -1115,21 +1188,37 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
         # 回滚同样走精确映射。这里缺 index_align 的后果比写入更隐蔽：回滚会
         # 「定位成功」但落在隔壁句上，把一句没改过的译文改回成另一句的 old_text，
         # 而日志里记的是成功——出问题只能靠逐字节比对才发现。
-        index_align = _build_index_alignment(file, srt_index) if srt_index else {}
+        index_align = _build_index_alignment(f, srt_index) if srt_index else {}
+        # 回读断言的台账：(事件对象 id -> (应有文本, 说明))。
+        # 用 id() 而不是时间戳做键：同起点多行时时间戳根本区分不开，
+        # 而断言要问的正是「**这一条**对象改对了没有」。
+        expects = {}
+        untouched = {}          # 事件 id -> 原始文本快照，用于「邻行未被改动」
+        expected_removed = {}   # 事件 id -> (原文本, 说明)；insert 回滚的合法删除
+        touched_ids = set()     # 本批确实改动过的事件（含只改时间轴的 retime）
+        for ev in subs.events:
+            untouched[id(ev)] = ev.text
         for ent in ents:
             track = ent.get("track", TRACK_ZH)
-            # 回滚：按日志里的 new_text（当前内容）做 fallback 定位。
             # retime 条目的 new_text 是时间串，不能当文本用，改用 srt_id 定位。
             if ent.get("action") == "retime":
                 e = _find_dialogue(subs, srt_index, ent["srt_id"], track,
-                                   index_align=index_align)
+                                   index_align=index_align, strict=True)
             else:
+                # `prefer_text` 必须传，而且必须传 `new_text` 而不是 `old_text`：
+                # 回滚时 ASS 里**现在**躺着的就是 new_text，拿它当判别依据才能
+                # 认出「这一条日志说的就是这一行」。上一版只传了 fallback_text，
+                # 而 fallback_text 仅在 srt_id 推不到时才用，正常路径完全没参与
+                # 判别 —— 这就是 bug #2。
                 e = _find_dialogue(subs, srt_index, ent["srt_id"], track,
-                                   fallback_text=ent.get("new_text",""),
-                                   index_align=index_align)
+                                   fallback_text=ent.get("new_text", ""),
+                                   prefer_text=ent.get("new_text", ""),
+                                   index_align=index_align, strict=True)
             if not e:
-                print(f"[!] 回滚定位失败: srt_id={ent['srt_id']} track={track} "
-                      f"(srt_path={srt_path or '未找到'})", file=sys.stderr)
+                print(f"[!] 回滚定位失败或候选不唯一: srt_id={ent['srt_id']} "
+                      f"track={track} (srt_path={srt_path or '未找到'})",
+                      file=sys.stderr)
+                failed += 1
                 continue
             if ent["action"] == "delete":
                 print(f"[!] delete 回滚无法自动重建 srt_id={ent['srt_id']}", file=sys.stderr)
@@ -1138,12 +1227,19 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                 # insert 的逆 = 删该行（按 new_text fallback 定位插入的行）
                 if e is None:
                     print(f"[!] insert 回滚定位失败: srt_id={ent['srt_id']} track={track}", file=sys.stderr)
+                    failed += 1
                     continue
+                _removed = e.text
                 if not _remove_event(subs, e):
                     print(f"[!] insert 回滚失败: srt_id={ent['srt_id']} 未找到目标行", file=sys.stderr)
+                    failed += 1
                     continue
+                # insert 的逆是「删掉一行」，属于本批**预期**的删除。登记进
+                # expected_removed，否则断言会把这条合法删除报成「凭空少了一行」。
+                expected_removed[id(e)] = (
+                    _removed, f"srt_id={ent['srt_id']} track={track}")
                 append_log(work_dir, make_batch_id(), "rollback", f,
-                           ent["srt_id"], ent["track"], e.text, "",
+                           ent["srt_id"], ent["track"], _removed, "",
                            ent.get("category", ""), f"rollback of {ent['batch_id']}")
                 count += 1
                 continue
@@ -1157,6 +1253,11 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                 cur_spec = _format_timespec(e.start / 1000.0, e.end / 1000.0)
                 e.start = int(round(old_s * 1000))
                 e.end = int(round(old_e * 1000))
+                # retime 回滚改的是时间轴不是文本。断言表 expects 只装「文本应
+                # 该变成什么」，时间轴进不去，所以这里单独记一个「确实动过」的
+                # 标记 —— 否则「一条都没改动成功就跳过写盘」那道闸会把 retime
+                # 的回滚整批 skip 掉（tests/test_subtitle_polish_retime.py R3 实测）。
+                touched_ids.add(id(e))
                 append_log(work_dir, make_batch_id(), "rollback", f,
                            ent["srt_id"], ent["track"], cur_spec,
                            _format_timespec(old_s, old_e),
@@ -1165,13 +1266,125 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                 continue
             cur = e.text
             e.text = ent["old_text"]
+            expects[id(e)] = (ent["old_text"], f"srt_id={ent['srt_id']} track={track}")
+            touched_ids.add(id(e))
             append_log(work_dir, make_batch_id(), "rollback", f,
                        ent["srt_id"], ent["track"], cur, ent["old_text"],
                        ent.get("category",""), f"rollback of {ent['batch_id']}")
             count += 1
+        # ── 写盘前三道断言 ──────────────────────────────────────────
+        # 断言失败**拒绝写盘**。理由：回滚写错的代价是「目标行没还原 + 邻行被
+        # 污染」，比不写盘严重得多。宁可这一批全部不生效、让用户看见报错后重跑，
+        # 也不要留下一份「看起来回滚过了」的坏文件。
+        if not touched_ids and not expected_removed:
+            # 这个文件**一条都没改动成功**。此时不能 `save()`：pysubs2 重存会
+            # 把表头注释 `Aegisub` 改成 `pysubs2`，文件 md5 变了，用户以为
+            # 回滚跑过了，其实是空转。上一版就是这样——定位失败只 continue，
+            # 然后照样 save（bug #4 的残留）。
+            print(f"[!] {os.path.basename(f)}: 本批无一条定位成功，跳过写盘",
+                  file=sys.stderr)
+            md5_report.append((f, md5_before, md5_before, "SKIPPED"))
+            continue
+        problems = _rollback_assertions(subs, expects, untouched, expected_removed)
+        if problems:
+            for msg in problems:
+                print(f"[!] 回滚断言失败，拒绝写盘: {msg}", file=sys.stderr)
+            failed += len(problems)
+            md5_report.append((f, md5_before, md5_before, "SKIPPED"))
+            continue
         subs.save(f, encoding="utf-8")
-    print(f"[*] 回滚 {count} 条")
+        md5_after = _md5_of(f)
+        md5_report.append((f, md5_before, md5_after,
+                           "SAME" if md5_before == md5_after else "DIFF"))
+    print(f"[*] 回滚 {count} 条" + (f"，失败 {failed} 条" if failed else ""))
+    _print_md5_report(md5_report)
     return count
+
+
+def _md5_of(path: str) -> str:
+    """文件 md5；文件不存在返回空串。"""
+    import hashlib
+    if not os.path.exists(path):
+        return ""
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _rollback_assertions(subs, expects: dict, untouched: dict,
+                         expected_removed: dict | None = None) -> list:
+    """写盘前回读断言。返回问题列表（空 = 通过）。
+
+    三件事必须验：
+      1. **目标行真的变回了 old_text**。只写不读的话，pysubs2 里任何一条
+         「赋值了但对象不是文件里那一条」的偏差都发现不了。
+      2. **其它行一个都没被动**。这是 bug #1 的正面防线：上一版把 srt 477
+         写成了 476 的文本，而日志里记的是「回滚成功」，事后只能靠逐字节
+         比对才发现。这里用写盘前的快照逐条对比，多改一个字都拦下来。
+      3. **insert 回滚的合法删除**要放行。`expected_removed` 里登记的是
+         「本批预期会消失的行」，它不属于「凭空少了」。
+
+    `untouched` 里记的是「本次回滚开始前每一条事件的文本」，`expects` 里
+    是「本次允许变的那几条」。两者差集就是「不该动却动了」的行。
+    """
+    expected_removed = expected_removed or {}
+    problems = []
+    for eid, (want, note) in expects.items():
+        got = None
+        for ev in subs.events:
+            if id(ev) == eid:
+                got = ev.text
+                break
+        if got is None:
+            problems.append(f"{note} 的目标行在保存前消失了")
+            continue
+        if got != want:
+            problems.append(f"{note} 期望 {want!r}，实得 {got!r}")
+    # 邻行污染检查
+    present = set()
+    for ev in subs.events:
+        eid = id(ev)
+        present.add(eid)
+        if eid in expects or eid in expected_removed:
+            continue
+        before = untouched.get(eid)
+        if before is None:
+            # 回滚不该新增行；出现了就是被别的分支改出来的
+            problems.append(f"回滚凭空新增了一行: {ev.text!r}")
+            continue
+        if ev.text != before:
+            problems.append(
+                f"邻行被改动（未经本批回滚）: {before!r} -> {ev.text!r}")
+    # 预期删除的行必须真的没了
+    for eid, (was, note) in expected_removed.items():
+        if eid in present:
+            problems.append(f"{note} 的 insert 回滚该删掉 {was!r}，但它还在")
+    return problems
+
+
+def _print_md5_report(report) -> None:
+    """回滚结束显式给出「跟回滚前是否一致」。
+
+    上一版回滚完只打一行「回滚 N 条」，用户以为生效了。实测中 --rollback
+    跑完 md5 一个字节都没变，脚本却什么都没说 —— 这是最糟的一种沉默。
+    注意 md5 必然不同（pysubs2 重存会把表头注释 `Aegisub` 改成 `pysubs2`），
+    所以这里只报事实，并明确提示差异可能只来自表头，需要时做正文级比对。
+    """
+    if not report:
+        return
+    print()
+    for path, before, after, state in report:
+        if state == "SKIPPED":
+            print(f"[!] {os.path.basename(path)}: 断言失败，本次未写盘")
+        elif state == "SAME":
+            print(f"[!] {os.path.basename(path)}: md5 未变，回滚可能没有生效")
+        else:
+            print(f"[*] {os.path.basename(path)}: md5 已变 "
+                  f"({before[:8]}… -> {after[:8]}…)")
+    print("[*] 提示：pysubs2 重存会把表头注释 Aegisub 改写成 pysubs2，"
+          "md5 差异不全是正文差异；需要逐字节确认时用正文级比对。")
 
 
 def main():
