@@ -1,0 +1,38 @@
+[
+ {
+  "ep": "S06E02实测",
+  "total": 869,
+  "anchor": 1,
+  "items": 2,
+  "forms": {
+   "系词冗余": 1,
+   "名物化": 1
+  },
+  "nslice": 1,
+  "per_slice": [
+   1
+  ]
+ },
+ {
+  "ep": "S06E03实测",
+  "total": 767,
+  "anchor": 0,
+  "items": 0,
+  "forms": {},
+  "nslice": 1,
+  "per_slice": [
+   0
+  ]
+ },
+ {
+  "ep": "S06E04实测",
+  "total": 750,
+  "anchor": 0,
+  "items": 0,
+  "forms": {},
+  "nslice": 1,
+  "per_slice": [
+   0
+  ]
+ }
+]
