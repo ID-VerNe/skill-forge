@@ -227,7 +227,17 @@ def t_k4_refuse_write_on_failed_locate(tmp):
     append_log(resolve_work_dir(wd), "b9", "replace", a, 999, "中文",
                "根本不存在的原文", "根本不存在的当前文本", "test", "phantom")
 
-    af.run_rollback(resolve_work_dir(wd), batch_id="b9")
+    # v1.15 起：只要有定位/断言失败，run_rollback 会抛 SystemExit(1)，
+    # 让包装它的 CLI（--rollback-to / round_orchestrator）能看见失败。
+    # 这里要测的是「文件没被写」，所以先把退出码接住再看文件。
+    try:
+        af.run_rollback(resolve_work_dir(wd), batch_id="b9")
+    except SystemExit as e:
+        assert e.code not in (0, None), (
+            "全有或全无：有失败就必须带非 0 退出码，不能安静返回 0")
+    else:
+        raise AssertionError("定位失败时 run_rollback 应抛 SystemExit(非 0)，实际正常返回")
+
     after = open(a, "rb").read()
     assert before == after, (
         "定位失败的条目不该触发写盘 —— 文件被重存了(内容或表头已变)")
@@ -252,7 +262,11 @@ def t_k5_md5_report_emitted(tmp):
 
     buf = io.StringIO()
     with redirect_stdout(buf):
-        af.run_rollback(resolve_work_dir(wd), batch_id="b2")
+        try:
+            af.run_rollback(resolve_work_dir(wd), batch_id="b2")
+        except SystemExit:
+            # 退出码由 K4 负责断言，这里只看输出。
+            pass
     out = buf.getvalue()
     assert "md5" in out, f"回滚结束没有输出 md5 结论,实际输出:\n{out}"
     assert ("已变" in out) or ("未变" in out), (

@@ -166,6 +166,30 @@ if not pb.english and not pb.chinese and not sb.is_sound_effect_only():
 > | 顺序映射 + 文本交叉验证通过 | 文本（邻块对齐关系） | **能** |
 > | 文本对不上 / 候选不唯一又无文本证据 | 无 | **abort** |
 >
+> **⚠️ 顺序映射的前置条件（v1.15 第五轮，已裁决采纳）**
+>
+> 上表第三行不能无条件成立。顺序映射的成立前提是**两条轨都存在**：它靠「同一
+> SRT 块在英、中两轨上各有恰好一行、且两侧文本能交叉验证」推出块 ↔ 行对应。
+> 一旦某条轨整段缺失（纯中字素材、英文轨被前面某轮吞掉、或该块本来就只有一轨），
+> 那个「邻块对齐关系」就只剩单侧证据，退化成**按行号数出来的猜**——
+> 它仍然会给出一行，但那行是数出来的，不是验出来的。
+>
+> 所以第三行必须读成：
+>
+> | 情形 | 是否有证据 | 能否落盘 |
+> |---|---|---|
+> | 顺序映射 + **双轨都在** + 文本交叉验证通过 | 文本（邻块对齐关系） | 能 |
+> | 顺序映射 + **单轨**（对侧轨缺失） | 无（只是行号数出来的） | **abort** |
+>
+> 判据在实现上应可机械检查：`index_align` 的每一项都应当同时对应英、中两轨的
+> 行；只对应一侧的项不得进入 `index_align`。否则「顺序映射」会变成绕开 abort
+> 的旁路——它看起来有证据，其实只有一半。
+>
+> 这一条与 H-2（`_monotonic_fallback` 在无英文轨时整块短路、47 块中文被升格成
+> `PAIRING_OUT_OF_TOLERANCE`）是同一个病灶的两面：都假设「双轨齐全」。H-2 本轮
+> 未修（裁决范围外），但顺序映射这一侧的前提必须先写清，否则修 H-2 时会被
+> 「顺序映射能兜住」这句说法误导。
+>
 > 实现上对应 `_find_dialogue(..., strict=True)`：给了 `index_align` 但映射指向的起点
 > 上找不到行、或候选不唯一又无文本证据时返回 `None`，而不是退回 ±0.5s 窗蒙一个。
 > 区分「有证据的定位」与「无证据的猜」才是这一条要守住的东西，不是「必须唯一」。下文
@@ -273,15 +297,83 @@ E + G 可以一起做，成本低、收效直接。F 单独做，要先补测试
 
 **D1 为什么是去截断而不是换更聪明的截断**：改动总账里「原译」「终译」两列就是整份报告的存在理由。截到 20 字后，「He was going to say」和「He was going to say something」在表里长得一模一样，两条不同改动视觉上无法区分。要短得由调用方显式传 `limit`。
 
+### 7.3.1 第五轮裁决与修复（H-1 / M-1 / M-2）
+
+第五轮测试 agent 拿来两份文件（`S06E02实测3/问题汇总.md`、`答复.md`），Q1~Q7 全
+判「符合」、Q8 判「不符」。逐条核实后按四项裁决执行：
+
+| 裁决 | 内容 |
+|---|---|
+| H-1 | 硬拒 + 语言一致性检查（两道纵深防御），**不改写 current 照常写盘** |
+| Q8 | 接受 agent 的三级证据表，并补「顺序映射仅双轨可用」前提（已写入 §2.2） |
+| 批次范围 | 只做 H-1 + M-1 + M-2；**H-2 / M-3 / H-3 本轮不动** |
+| L-2 | 只改 docstring 写清样本口径，**不改代码、不加时间门槛** |
+
+**H-1 的两种实测形态**（都在 `%TEMP%/h1test` 复现，修前 RC=0、修后 RC=1）：
+
+| 形态 | 输入 | 修前后果 | 修后 |
+|---|---|---|---|
+| 语种矛盾 | `track=英文` + `current='我明白了'` | 英文轨被写入中文译文 | reject，文件逐字未动 |
+| 子串 current | `current='最基本的清理'`，实读 `'我会做最基本的清理 但它确实很脏'` | 整行换成 5 个字，后半句蒸发 | reject，不改写 current |
+
+第二种更险：**不需要写错任何字段**，只要 current 不是逐字整行。而且两道下游检查
+都接不住——verify 看「新文本是否落盘」（落盘即 PASS），cross_check 看重复/相似
+（不报「英文轨里出现中文」）。
+
+**为什么「原实现那道 `raise SystemExit(1)` 从来没生效过」**：撞车预检里那条
+`if not any(clean_ass_text(x) == want …)` 检查的是**改写后**的 `current`。旧实现打
+一行 `[?]` 就把 `fx["current"]` 换成回读值再照常写盘，改写让它恒真。
+
+**一处必须配合的修正（本轮新发现）**：`current` 的「回读快照」不能塞回
+`fx["current"]`。回读发生在整个文件循环**之前**，是「一条都没写时的快照」；同一
+srt_id 上若前一条 replace 先写（R6 合并场景：replace 合并两行 + retime 延长时间
+轴），后一条拿到的快照已经过期 → `_find_dialogue(prefer_text=…)` 对不上 → 返回
+None → 定位失败，retime 静默不执行（现象：合并后 end 没延到 1428.91）。而且快照
+带前导特效标签（`{\be3}…`），而匹配是拿 `clean_ass_text` 归一后的文本比的。
+所以拆成两个字段：`current`（只有 fix 自己声明时才有）与 `_current_snapshot`
+（只给撞车预检定位用）。
+
+**M-1**：`_find_dialogue` 里 `prefer_text` 给了却一行都没对上 → `return None`，
+不再退回「时间戳最近的那条」。注意 **strict 不是这里的开关**：strict 管的是
+「映射缺失时不许退窗」，而这里 current 已经给了、只是对不上，无论是否 strict 都不该猜。
+
+**M-2**：`run_rollback` 改为**全有或全无**。上一版是「能定位的照常写盘」：CASE-B
+实测 `回滚 1 条，失败 1 条` 然后 `subs.save()`，成品里一半新文本、一半原文，而
+调用方只看到一行「回滚 1 条」。这比「全失败」危险得多——全失败至少是「什么都没做」，
+半成功是「做了一半、且没人知道是哪一半」。回滚的语义是「退回到某个时刻」，一个
+时刻要么到达、要么没到达。
+
+配套两点：`failed > 0` 时 `raise SystemExit(1)`（原来 `return count` 让「0 条成功」
+和「部分成功」都返回 0，包装它的 `--rollback-to` 只看退出码），以及 `count -= file_ok`
+（没写盘就不算回滚成功，别让汇总数字好看）。
+
+**delete 的 continue 必须提到定位之前**：`delete` 的逆（重建一行）**必然**定位失败，
+因为那行已经删了。放在定位之后，每条 delete 都先被算进「定位失败」，再撞上全有或
+全无 → 整批回滚一律拒写，等于「只要这批里有 delete，就永远回滚不了」。已知限制 ≠ 失败：
+重建不了是「回滚做不到这一条」，不是「这批数据坏了」，不计 failed。
+
 ### 7.3 回归结果
 
-`tests/` 下 16 个 subtitle-polish 相关文件 **251 项全绿**（原 15 文件 245 项 + 本轮新增 `pairing_tags` 6 项）：
+`tests/` 下 19 个 subtitle-polish 相关文件 **287 项全绿**，0 失败（G 批次后 251 项 + 本轮新增 `current_strict` 6 项 + 补齐此前未计入的 `cross_check`/`missing_file_key`/`whitespace_policy`/`zh_only`）：
 
 ```
-axis_l0 17 / bugs 8 / cross_chunk 25 / curve_fit 12 / delete_identity 5 /
-fluency 8 / inclusive 23 / manual_log_check 6 / pairing_tags 6 / plan_chunk 19 /
-regression 41 / retime 10 / rounds 19 / seed 32 / timeline_credential 14 / verify_blindspot 6
+axis_l0 17 / bugs 8 / cross_check 7 / cross_chunk 25 / current_strict 6 /
+curve_fit 12 / delete_identity 5 / fluency 8 / inclusive 23 / manual_log_check 6 /
+missing_file_key 6 / pairing_tags 7 / plan_chunk 19 / regression 41 / retime 10 /
+rollback_identity 5 / rounds 19 / seed 32 / timeline_credential 14 /
+verify_blindspot 6 / whitespace_policy 6 / zh_only 5
 ```
+
+本轮 `current_strict` 的 6 项按「坏的拦住、好的放过」成对设计，只测一半等于没测：
+
+| 用例 | 断言 |
+|---|---|
+| N1 语种矛盾 | `track=英文` + 中文 current → 文件 md5 逐字节未变 + RC≠0 |
+| N2 子串 current | 行内片段非整行 → 文件 md5 逐字节未变 + RC≠0 |
+| N3 自洽 fix（反向对照） | 中文轨 + 逐字整行 → 正常写入 + RC=0 |
+| N4 行内碎片 delete | 片段**确实是一条独立行** → 放行（与 N2 的分界线：是不是行组里的一整条） |
+| M1 回滚全有或全无 | 一条定位失败 → 整文件拒写 + RC≠0 |
+| M2 回滚全部成功 | 正常写盘 + RC=0（防「靠全拒通过」） |
 
 新增的 `test_subtitle_polish_pairing_tags.py` 用最小夹具锁三形态判别与门禁（不依赖真实字幕）：
 先造三块 srt —— 一块正常、一块删掉中文行、一块 ass 起点偏 +1.20 s —— 再补一块附近 5 分钟什么都没有的，分别断言命中 `ZH_MISSING` / `PAIRING_OUT_OF_TOLERANCE(off≈+1.20s)` / `PAIRING_FAILED`；P4 断言音效块不打配对标记；P5 断言门禁分子含两种形态（3/10=30% → abort）；P6 断言 abort 发生在写盘前（目录不存在）。
@@ -290,5 +382,14 @@ regression 41 / retime 10 / rounds 19 / seed 32 / timeline_credential 14 / verif
 
 ### 7.4 剩下没做的
 
-- **批次 F（A5 方案甲）**：`_find_dialogue` 现在返回 `Event | None`，改成三态要连带改 `apply_fixes` / `verify_fixes` / `cross_check` 三个调用方。**先补测试锁住现有行为再动**。方案甲的取舍已定（保留 ±0.5s 窗但只在候选唯一时接受；0 或多条改用 `current` 唯一文本匹配；都不成 abort——**口径按 §2.2 修订为「不能无证据地猜」，顺序映射算有证据**），但**它和 A1 是同一类病**：现在的标签只说明「没配上」，说明不了「为什么没配上」，所以 F 落地时 `_find_dialogue` 的三态应当带上「候选 0 / 候选多条 / 时间窗命中但文本不符」这三种成因，否则又会重演 A1 的教训。
+**第五轮明确留到后面的（裁决范围外，不是因为难才不修，是因为它们各自要单独定口径）：**
+
+- **H-2 纯中字素材 47 块蒸发**：`_monotonic_fallback` 里 `if not srt_sorted or not en_rows: return {}` 把 `zh_rows`（`:387-388` 已算好）完全没用上。纯中字素材 47 块（5.4%）整块变空、被升格成 `PAIRING_OUT_OF_TOLERANCE`，而 `extract_slice` 报 `nonempty: 822/869（95%）` 看起来像合格。**要动对齐核心，风险最高**，且与 §2.2 新写的「顺序映射仅双轨可用」前提是同一病灶（都假设双轨齐全）——两者应当一起改，先改前提再改实现。
+- **M-3 `working/` 台账从未写入**：真实根因不是「累积快照重复计数」。实测 10 个 `logs/rNN.jsonl` **每个恰好 3 行**（都是 r00 那三条），因为 `_sync_working()` 只在 `:396`（整轮回滚）调用，正常轮次从不调用 ⇒ `working/log.jsonl` 整轮结束时仍不存在 ⇒ `_merge_working_log` 早退 `return 0` ⇒ `src` 回退主台账 ⇒ 拷成快照。**与 `paths.py` 白名单设计互相打架**，要先定「working 是不是独立命名空间」。
+- **H-3 retime 吃行尾空格**：`_retime_event` 之外的一处空白归一化，与「空白修剪不计入语义改动」口径有冲突，要单独核。
+- **L-1**（no-op fix 也写 log）、**L-4~L-7**：都是记账口径问题，不写坏成品。
+
+**更早留的：**
+
+- **批次 F（A5 方案甲）**：`_find_dialogue` 现在返回 `Event | None`，改成三态要连带改 `apply_fixes` / `verify_fixes` / `cross_check` 三个调用方。**先补测试锁住现有行为再动**。方案甲的取舍已定（保留 ±0.5s 窗但只在候选唯一时接受；0 或多条改用 `current` 唯一文本匹配；都不成 abort——**口径按 §2.2 修订为「不能无证据地猜」，顺序映射算有证据，但仅限双轨都在时**），但**它和 A1 是同一类病**：现在的标签只说明「没配上」，说明不了「为什么没配上」，所以 F 落地时 `_find_dialogue` 的三态应当带上「候选 0 / 候选多条 / 时间窗命中但文本不符」这三种成因，否则又会重演 A1 的教训。
 - **H 的路径引用同步**：`manual-flow.md` 已加归档说明；各脚本 `--help` 里若提到 `slices/` 固定路径需再核（当前未发现冲突引用）。

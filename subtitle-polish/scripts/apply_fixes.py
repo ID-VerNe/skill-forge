@@ -276,6 +276,8 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
                     return same[0]
                 # 声明文本对不上：说明映射或 current 有误。**不静默改相邻句**，
                 # 退回时间窗让调用方报错——错改比不改危害大。
+                # （退回后若时间窗里 prefer_text 仍不命中，下面会 `return None`；
+                # 若那边有其他行恰好文本相同，说明映射偏了一格，那行就是正解。）
             elif len(rows) > 1:
                 # ⚠️ 这里是 bug #3 的根因所在，别改回 `return rows[0]`。
                 #
@@ -322,13 +324,32 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
                     if id(e) not in used and abs(e.start / 1000.0 - target_start) <= 0.5]
             return rest[0] if rest else None
         # prefer_text：同一 srt_id 多条同轨行时，按 current 精确挑一条。
-        # 有命中就只在命中集里取最近的；都没命中则退回时间戳最近（保持旧行为，
-        # 调用方需要严格性时自己校验）。current 带不带标签都要能匹配。
+        # current 带不带标签都要能匹配。
         if prefer_text:
             want = clean_ass_text(prefer_text)
             hits = [e for e in candidates if clean_ass_text(e.text) == want]
             if hits:
                 candidates = hits
+            else:
+                # ⚠️ 调用方**明确给了** current，却一行都没对上 —— 这是硬失败，
+                # 不许退回「时间戳最近的那条」。
+                #
+                # 曾经的实现是 `if hits: candidates = hits` 然后照样
+                # `return candidates[0]`，注释还写着「调用方需要严格性时自己校验」。
+                # 但调用方校验不了：它拿到的是「某一行」，无法区分「current 命中
+                # 的那行」和「没命中时兜底的那行」。于是写下游一路静默放行，
+                # 最终形态就是 H-1：中文译文写进英文轨（`track` 只过滤候选、
+                # 不校验语言），以及子串 current 把整行替换掉、后半句蒸发。
+                #
+                # 这里返回 None 之后，调用方有两种正当处理：
+                #   ① 报错拒写（写入路径，见 run_accept 的 reject 分支）；
+                #   ② 回滚路径直接计失败（见 run_rollback）。
+                # 两者都比「拿最近的顶替」安全：顶替会同时弄坏「被写的那行」
+                # 和「本该被写的那行」。
+                #
+                # 注意 strict 不是这里的开关。strict 管的是「映射缺失时不许退窗」，
+                # 而这里 current 已经给了、只是对不上 —— 无论是否 strict 都不该猜。
+                return None
         return candidates[0]
     # 回滚场景：srt 推不到，按 fallback_text 在当前 subs 里搜
     if fallback_text:
@@ -821,9 +842,98 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
     return out_path
 
 
+_CJK_LO, _CJK_HI = chr(0x4E00), chr(0x9FFF)
+
+
+def _lang_of(text: str) -> str:
+    """粗分文本语种：`zh` / `en` / `""`（判不出）。
+
+    只用于**一致性校验**，不用于任何写盘决策——判错了只是少一道防御，
+    不会因为判错而拒掉正确的东西（下面的调用点只在「明确矛盾」时才拒）。
+    """
+    s = clean_ass_text(text or "")
+    if not s:
+        return ""
+    cjk = sum(1 for ch in s if _CJK_LO <= ch <= _CJK_HI)
+    latin = sum(1 for ch in s if ("a" <= ch.lower() <= "z"))
+    # 只有一边明显占多数才算判得出。中日混排、数字型号、专名（"MX-5"）
+    # 这类占比接近的一律返回 ""，交给下游按原文核对，不在这里武断。
+    if cjk >= 2 and cjk > latin * 2:
+        return "zh"
+    if latin >= 2 and latin > cjk * 2:
+        return "en"
+    return ""
+
+
+def _track_lang(track: str) -> str:
+    if track == TRACK_EN:
+        return "en"
+    if track == TRACK_ZH:
+        return "zh"
+    return ""
+
+
+def _check_track_consistency(fx: dict, declared: str, subs=None,
+                             srt_index=None, srt_id=None,
+                             index_align=None) -> str:
+    """`track` 与 `current` 的语言是否矛盾。返回原因字符串，空串表示没问题。
+
+    ## 为什么需要这道检查
+
+    `_find_dialogue` 里 `track` 只用来**过滤候选行**，没有任何一步校验
+    「`current` 是不是这一轨的语言」。所以 `track=英文` + 中文 `current`
+    会被判成「该轨找不到 current」→ 退回时间窗 → 命中同起点的英文行 →
+    把中文译文写进英文轨，退出码 0。
+
+    H-1 实测复现（`%TEMP%/h1test`）：
+        track=英文, current='我明白了'
+        → [?] 声明 current 在 track=英文 的行组里找不到，改用 ASS 实读值
+        → 写入 1 条，`Dialogue: ...,英文,,...,现在该正经起来了`
+
+    这是**唯一会主动写坏成品**的路径：verify 看「新文本是否落盘」（落盘了就是
+    PASS），cross_check 看重复/相似（不会报「英文轨里出现中文」），两道检查都过。
+
+    ## 「该行组里能逐字找到」优先于语种判断
+
+    语种判断是**粗粒度**的启发式，逐字命中是**精确**事实。只要 `current` 能在这
+    个 srt_id + track 的行组里逐字找到，它就不可能是「写错轨的文本」——写错轨
+    的文本恰好在同起点同轨的行里也逐字存在，这个概率可以忽略；而合法的碎片行
+    定位恰恰长这样：e03#594 的中文行是「我自己去过 Caffeine&Machine 很多次了」，
+    一条 delete 的 current 是行内片段 `'Caffeine&Machine'`，`_lang_of` 判它是
+    `en`——按语种一刀切会把这条正常 fix 误杀。
+
+    所以顺序是：**先查行组命中，命中就放行**；只有行组里也找不到时，才用语言
+    判断来区分「是写错轨了吗」（此时拒）和「只是写错了个别字」（交给第二道）。
+
+    给了 `subs`/`srt_index` 才有行组可查；没给时退回纯语种判断（保持可单测）。
+    """
+    if declared and subs is not None and srt_index is not None:
+        try:
+            if declared in _row_group_texts(subs, srt_index, srt_id,
+                                            fx.get("track", TRACK_ZH),
+                                            index_align=index_align):
+                return ""
+        except Exception:
+            # 行组查询本身不该让一条 fix 变成崩溃；查不了就退回语种判断。
+            pass
+    want = _lang_of(declared)
+    have = _track_lang(fx.get("track", TRACK_ZH))
+    if not want or not have or want == have:
+        return ""
+    return (f"声明 current 是{'中文' if want == 'zh' else '英文'}文本，"
+            f"但 track={fx.get('track', TRACK_ZH)} 要求"
+            f"{'中文' if have == 'zh' else '英文'}轨")
+
+
 def run_accept(fixes: list, work_dir: str, batch_id: str,
                force_collision: bool = False) -> None:
-    """执行替换，写 ASS + log.jsonl。"""
+    """执行替换，写 ASS + log.jsonl。
+
+    退出码：只要有 current 对不上 / srt_id 越界导致某文件整批被 reject，就在全部
+    文件处理完后 `SystemExit(1)`。理由见 `fully_rejected` 处注释——「跑完」和
+    「跑成了」必须能靠退出码区分。
+    """
+    fully_rejected = 0   # 有 reject、且最终没有一条 fix 可写的文件数
     by_file = {}
     for fx in fixes:
         if not fx.get("enabled", True):
@@ -865,6 +975,7 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
         #      不存在 → 声明值被污染（H2 的 #369 形态），改用回读值并告警。
         #   ③ 两者都拿不到时保持声明值，交给下游撞车预检报错，不在这里猜。
         bad_ids = 0
+        bad_mismatch = 0   # current 与目标行对不上（语言矛盾 / 行组里找不到）
         prof_zh = alignment_profile(subs, srt_blocks, TRACK_ZH) if srt_blocks else {"tol": 3.0}
         prof_en = alignment_profile(subs, srt_blocks, TRACK_EN) if srt_blocks else {"tol": 3.0}
         for fx in fxs:
@@ -893,8 +1004,36 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
                 fx["enabled"] = False
                 continue
             declared = clean_ass_text(fx.get("current", "") or "")
+            # H-1 第一道：语言一致性。放在所有「找不到就兜底」的分支之前——
+            # 兜底的全部前提是「声明值可信，只是这一轨里没精确命中」；如果声明值
+            # 根本是另一种语言，那个前提就塌了，任何兜底都只会写错轨。
+            bad_lang = _check_track_consistency(fx, declared, subs, srt_index,
+                                                sid, index_align=index_align) \
+                if declared else ""
+            if bad_lang:
+                bad_mismatch += 1
+                print(f"[!] {fx.get('id') or fx.get('audit_id','')}: {bad_lang}。reject\n"
+                      f"      current：{declared[:50]!r}\n"
+                      f"      实读   ：{clean_ass_text(rb)[:50]!r}", file=sys.stderr)
+                fx["enabled"] = False
+                continue
             if not declared:
-                fx["current"] = rb          # 没声明 → 只能用回读值
+                # 没声明 current → **不写 `fx["current"]`**，只把快照放进私有字段。
+                #
+                # 为什么不能直接写 `fx["current"]`（上一版的做法，R6 实测炸了）：
+                # 回读发生在整个文件的循环**之前**，是「一条都没写时的快照」。
+                # 同一 srt_id 上若有前一条 replace 先写（R6 合并场景：replace 合并
+                # 两行 + retime 延长时间轴），后一条 fix 拿到的快照已经过期，
+                # `_find_dialogue(prefer_text=…)` 对不上 → 返回 None → 定位失败，
+                # retime 静默不执行，现象是「合并后 end 没延到 1428.91」。
+                # 另外 `rb` 带前导特效标签（`{\be3}…`），而 prefer_text 是拿
+                # clean_ass_text 归一后的可见文本比的，带标签永远对不上。
+                #
+                # 但快照又**必须留着**：撞车预检要靠它把「两条都没写 current 的
+                # fix 落在同一行」认出来（bug K）。所以分开存：
+                #   - `_current_snapshot`：回读快照，只给撞车预检定位用
+                #   - `current`：只有 fix 自己声明时才有值，执行定位时才传
+                fx["_current_snapshot"] = clean_ass_text(rb) or rb
             elif clean_ass_text(rb) == declared:
                 pass                         # 一致，用哪个都一样
             elif declared in _row_group_texts(subs, srt_index, sid, trk,
@@ -903,17 +1042,41 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
                 # 保留声明值——它是 fix 用来指定**具体哪一条碎片行**的唯一手段。
                 pass
             else:
-                print(f"[?] {fx.get('id') or fx.get('audit_id','')}: 声明 current 在 "
-                      f"srt_id={sid} track={trk} 的行组里找不到，改用 ASS 实读值\n"
+                # H-1 第二道：声明值在该行组里确实找不到。
+                #
+                # 这里**不再「改用 ASS 实读值」**。原来的写法是打一行 `[?]` 就把
+                # `fx["current"]` 换成回读值然后照常写盘，等于把「current 写错了」
+                # 这件事故意降级成提示。下游接不住：撞车预检里那条
+                # `if not any(clean_ass_text(x) == want ...)` 检查的是**改写后**的
+                # current，改写让它恒真，于是这道 raise 从来没生效过。
+                #
+                # 三种实测形态（H-1 复现）全部走这条路：
+                #   ① track=英文 + 中文 current  → 中文写进英文轨（另由第一道拦掉）
+                #   ② 子串 current（非整行）     → 整行被换成新译，行内其余内容蒸发
+                #   ③ current 抄自别轮/别集       → 静默改掉另一句
+                # 其中 ② 最阴：**不需要写错任何字段**，只要 current 不是逐字整行。
+                bad_mismatch += 1
+                print(f"[!] {fx.get('id') or fx.get('audit_id','')}: 声明 current 在 "
+                      f"srt_id={sid} track={trk} 的行组里找不到。reject（不改写 current）\n"
                       f"      声明：{declared[:50]!r}\n"
-                      f"      实读：{clean_ass_text(rb)[:50]!r}", file=sys.stderr)
-                fx["current"] = rb
+                      f"      实读：{clean_ass_text(rb)[:50]!r}\n"
+                      f"      该行可能已被改过，或 current 写错/只是行内子串。",
+                      file=sys.stderr)
+                fx["enabled"] = False
+                continue
         if bad_ids:
             print(f"[!] {bad_ids} 条 srt_id 越界，已 reject（未计入本次写入）",
+                  file=sys.stderr)
+        if bad_mismatch:
+            print(f"[!] {bad_mismatch} 条 current 与目标行对不上，已 reject",
                   file=sys.stderr)
         fxs = [f for f in fxs if f.get("enabled", True)]
         if not fxs:
             print(f"[!] {file}: 回读校验后无可用 fix，跳过", file=sys.stderr)
+            # 全部被 reject 是**失败**，不是「没什么可做」。原来这里直接 `continue`
+            # 走到批次末尾、汇总里也只有「0 条」，退出码照样 0——调用方（含
+            # round_orchestrator）读退出码会以为这一批干净地跑完了。
+            fully_rejected += 1
             continue
 
         # accept 前的撞车预检（issue #2）：同一物理行被两条 fix 命中说明 fix
@@ -931,15 +1094,21 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
                     continue
                 fxiv = fx.get("id") or fx.get("audit_id", "")
                 track = fx.get("track", TRACK_ZH)
-                cur = fx.get("current", "")
+                # own_cur：fix 自己声明的 current（有就一定要精确命中）
+                # loc_cur：用于定位的文本，没声明时退回回读快照。
+                # 两者必须分开：快照只回答「这条 fix 大概落在哪一行」，
+                # 不能拿来当「这条 fix 声称这一行长这样」的凭据——
+                # 快照是对**未改动**的文件的观察，同批次前一条 fix 写完后它就过期了。
+                own_cur = fx.get("current", "") or ""
+                loc_cur = own_cur or fx.get("_current_snapshot", "") or ""
                 # 该 fix 在「无 current」时（或带 current 时）会落到哪一行
                 e = _find_dialogue(subs, srt_index, fx["srt_id"], track,
-                                   prefer_text=cur, index_align=index_align)
+                                   prefer_text=loc_cur, index_align=index_align)
                 if e is None:
                     continue
                 # 带了 current 但没匹配上 → 说明这条 fix 自身不准，直接拒
-                if cur:
-                    want = clean_ass_text(cur)
+                if own_cur:
+                    want = clean_ass_text(own_cur)
                     # 行组判定的锚点必须与 _find_dialogue 一致：用 index_align 的
                     # 精确起点，否则在断句点分歧素材上这里会把合法的 current 判成
                     # 「找不到」（±0.5s 框到的是隔壁句）。
@@ -954,7 +1123,7 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
                             and abs(x.start / 1000.0 - _anchor) <= _tol]
                     if not any(clean_ass_text(x.text) == want for x in same):
                         print(f"[!] {fxiv}: current 在 srt_id={fx['srt_id']} "
-                              f"track={track} 的行里找不到：{cur!r}", file=sys.stderr)
+                              f"track={track} 的行里找不到：{own_cur!r}", file=sys.stderr)
                         print("    该行可能已被改过，或 current 写错。先核对再跑。",
                               file=sys.stderr)
                         raise SystemExit(1)
@@ -1051,6 +1220,11 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
             shutil.copy2(file, bak)
         subs.save(file, encoding="utf-8")
         print(f"[*] 写入 {file} (batch {batch_id}, {len(fxs)} 条)")
+
+    if fully_rejected:
+        # 有文件「一条都没写成」，那是失败。把它并进退出码，而不是只留在
+        # stderr 里——round_orchestrator 的 --auto 只看退出码，看不见 stderr。
+        raise SystemExit(1)
 
 
 def run_apply_batch(work_dir: str, batch_id: str, confirm: bool = False) -> int:
@@ -1231,6 +1405,8 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
     md5_report = []
     for f, ents in by_file.items():
         md5_before = _md5_of(f)
+        file_failed = 0        # 本文件范围内的定位失败（决定这个文件写不写）
+        file_ok = 0            # 本文件已定位成功、准备写的条数（拒绝写盘时扣回）
         subs = pysubs2.load(f, encoding="utf-8-sig")
         # 回滚也需要 srt_id -> timestamp 映射。优先用日志里的 old_text 直接按时间戳定位
         # （日志有 old_text，按 track + 时间戳找当前行）
@@ -1252,6 +1428,18 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
             untouched[id(ev)] = ev.text
         for ent in ents:
             track = ent.get("track", TRACK_ZH)
+            # ── delete 的逆（重建一行）本就做不到，先判掉 ────────────────
+            # 放在定位之前，因为它**必然**定位失败：那行已经被删掉了。
+            # 上一版放在定位之后，于是每条 delete 都先被算进「定位失败」，
+            # 再撞上「全有或全无」→ 整批回滚一律拒写。等于说「只要这一批里有
+            # delete，这批就永远回滚不了」，而回滚不了的提示看起来像 bug。
+            #
+            # 已知限制 ≠ 失败：重建不了是「回滚做不到这一条」，不是「这一批
+            # 数据坏了」。所以它不计 failed、不触发拒写，只留一行提示。
+            if ent.get("action") == "delete":
+                print(f"[!] delete 回滚无法自动重建 srt_id={ent['srt_id']}"
+                      f"（已知限制：行已删除，日志里没有足够信息重建）", file=sys.stderr)
+                continue
             # retime 条目的 new_text 是时间串，不能当文本用，改用 srt_id 定位。
             if ent.get("action") == "retime":
                 e = _find_dialogue(subs, srt_index, ent["srt_id"], track,
@@ -1271,20 +1459,20 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                       f"track={track} (srt_path={srt_path or '未找到'})",
                       file=sys.stderr)
                 failed += 1
-                continue
-            if ent["action"] == "delete":
-                print(f"[!] delete 回滚无法自动重建 srt_id={ent['srt_id']}", file=sys.stderr)
+                file_failed += 1
                 continue
             if ent["action"] == "insert":
                 # insert 的逆 = 删该行（按 new_text fallback 定位插入的行）
                 if e is None:
                     print(f"[!] insert 回滚定位失败: srt_id={ent['srt_id']} track={track}", file=sys.stderr)
                     failed += 1
+                    file_failed += 1
                     continue
                 _removed = e.text
                 if not _remove_event(subs, e):
                     print(f"[!] insert 回滚失败: srt_id={ent['srt_id']} 未找到目标行", file=sys.stderr)
                     failed += 1
+                    file_failed += 1
                     continue
                 # insert 的逆是「删掉一行」，属于本批**预期**的删除。登记进
                 # expected_removed，否则断言会把这条合法删除报成「凭空少了一行」。
@@ -1294,6 +1482,7 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                            ent["srt_id"], ent["track"], _removed, "",
                            ent.get("category", ""), f"rollback of {ent['batch_id']}")
                 count += 1
+                file_ok += 1
                 continue
             if ent["action"] == "retime":
                 # retime 的逆 = 把时间轴写回 old_text 里的时间串
@@ -1315,6 +1504,7 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                            _format_timespec(old_s, old_e),
                            ent.get("category", ""), f"rollback of {ent['batch_id']}")
                 count += 1
+                file_ok += 1
                 continue
             cur = e.text
             e.text = ent["old_text"]
@@ -1324,6 +1514,7 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                        ent["srt_id"], ent["track"], cur, ent["old_text"],
                        ent.get("category",""), f"rollback of {ent['batch_id']}")
             count += 1
+            file_ok += 1
         # ── 写盘前三道断言 ──────────────────────────────────────────
         # 断言失败**拒绝写盘**。理由：回滚写错的代价是「目标行没还原 + 邻行被
         # 污染」，比不写盘严重得多。宁可这一批全部不生效、让用户看见报错后重跑，
@@ -1342,6 +1533,22 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
             for msg in problems:
                 print(f"[!] 回滚断言失败，拒绝写盘: {msg}", file=sys.stderr)
             failed += len(problems)
+            file_failed += len(problems)
+        if file_failed:
+            # ── 全有或全无 ──────────────────────────────────────────
+            # 本文件里有任何一条定位失败，整个文件**都不写**。
+            #
+            # 上一版是「能定位的照常写盘」：CASE-B 实测 `回滚 1 条，失败 1 条`
+            # 然后 `subs.save()`，结果是成品里一半是新文本、一半是原文——
+            # 两份文本混在同一个文件里，而调用方只看到一行「回滚 1 条」。
+            # 这比「全失败」危险得多：全失败至少是「什么都没做」，
+            # 半成功是「做了一半、且没人知道是哪一半」。
+            #
+            # 回滚的语义是「退回到某个时刻」。一个时刻要么到达、要么没到达，
+            # 没有「到了 60%」这种状态。
+            print(f"[!] {os.path.basename(f)}: 本批 {file_failed} 条定位/断言失败，"
+                  f"整个文件拒绝写盘（已定位成功的 {file_ok} 条也不写）", file=sys.stderr)
+            count -= file_ok        # 没写盘就不算回滚成功，别让汇总数字好看
             md5_report.append((f, md5_before, md5_before, "SKIPPED"))
             continue
         subs.save(f, encoding="utf-8")
@@ -1350,6 +1557,11 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
                            "SAME" if md5_before == md5_after else "DIFF"))
     print(f"[*] 回滚 {count} 条" + (f"，失败 {failed} 条" if failed else ""))
     _print_md5_report(md5_report)
+    if failed:
+        # 有失败就是失败。上一版 `return count` 让「0 条成功」和「部分成功」
+        # 都返回 0，包装它的 --rollback-to 只看退出码，会以为整轮回退成功。
+        # 用 1 而不是别的码，与 apply 路径的「拒绝」同义。
+        raise SystemExit(1)
     return count
 
 

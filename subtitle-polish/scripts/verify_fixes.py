@@ -31,7 +31,13 @@ from apply_fixes import (_find_dialogue, _build_srt_index, _find_paired_srt,
                          _build_index_alignment,
                          _format_timespec, _parse_timespec)
 
-# 邻块撞车默认参数（实测校准：坏条 4/15 命中，好条 0/84 误报）
+# 邻块撞车默认参数。
+# ⚠️ 样本口径：这个阈值是在 **84 条人工标注样本**（S06E04 一轮）上校准的——
+# 坏条 4/15 命中、好条 0/84 误报。后来用 869 条全量自检复测，误报率是 1.7%
+# （约 15 条），不是 0。两个数都对，只是**分母不同**：
+#   - 84 = 人工确认过的「好条」集合（本来就排除了语义可疑项）
+#   - 869 = 该集全部中文行，包含大量语义相近但确实不同的句子
+# 引用这个阈值时请连带说出样本量，别把「84 条 0 误报」当成「全量 0 误报」。
 NEIGHBOR_WINDOW = 3
 NEIGHBOR_FLOOR = 0.55
 _CJK_LO, _CJK_HI = chr(0x4E00), chr(0x9FFF)  # CJK 统一汉字区间
@@ -64,7 +70,9 @@ def detect_neighbor_duplicate(zh_text, srt_id, zh_by_sid, window=NEIGHBOR_WINDOW
 
     为什么需要：verify 只证明「字写进去了」，不证明「写进去的是对的」。实测
     S06E04 一轮 99 条 fix 里 15 条把正确译文换成邻块译文，verify 报 0 失败。
-    这条判据对该错位形态误报 0、召回 4/15，是纯字符串能抓到的部分；其余 11 条
+    这条判据对该错位形态在 84 条标注样本上误报 0、召回 4/15，是纯字符串能抓到
+    的部分（869 条全量自检下误报约 1.7%；两个数的分母不同，见 NEIGHBOR_FLOOR
+    处的说明，别当成同一个东西）；其余 11 条
     是「换成同场景另一句」，任何字符串判据都抓不到，只能靠 cross_check 人工
     复核语义。不要把它当成完整的错位检测器。
     """
