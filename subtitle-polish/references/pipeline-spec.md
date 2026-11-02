@@ -198,6 +198,15 @@ python <skill>/scripts/build_verify_ctx.py <findings.json> <slice_paths...> <srt
 ```
 
 - **id = audit_id**（多文件用 `<shortname>#<srt_id>`，如 `e02#152`；单文件也用此格式而非全局序号）。fixes.json / dry-run.md / audit-report.md 三处 id 一致，人 review 时一眼对上。**不用全局 1..N 序号**（第三轮实测用了全局序号 `1..33` + audit_id 双轨，人看 fixes.json 得靠 audit_id 反查 id，多此一举）。
+- **`file` 是必填**（bug #12）。`run_dry_run` / `run_accept` 都按 `file` 分组，缺了会在分组处崩成一条 `KeyError: 'file'` 的栈——栈里看不出是第几条。现在 `apply_fixes` 在**所有分组与护栏之前**先做 `_resolve_file_key()`：
+
+  | 情况 | 行为 |
+  |------|------|
+  | 每条都有 `file` | 直接继续 |
+  | 有缺失、命令行给了 `--file` | 补到缺失条目上（**不覆盖**已写的） |
+  | 有缺失、也没有 `--file` | 明确报错：点名是哪几条 id、并给出两种补法 |
+
+  顺序很关键：**结构校验必须全部前置到语义护栏之前**。旧顺序下护栏先跑，于是现场表现是「不带 `--confirm` 报护栏 → 加了 `--confirm` 才崩」，人被引向怀疑 `--confirm`，而 `--confirm` 只是让流程走得更远、越过原本拦路的护栏而已。
 - **一条审计发现可拆多条 fix**：例如 audit_id=`e02#152` 配对错位要改 srt 4+5 两行中文 → fix `e02#152a`(srt 4) + `e02#152b`(srt 5)，共享 `audit_id=e02#152`。id 加字母后缀区分。
 - **swap** 额外字段：`swap_with`: 另一个 srt_id。交换两行的文本部分，不动时间戳/样式/标签。
 - **insert** 新增一行（典型：注释轨）。`track` 指定新行轨道（如 `注释`），`final_new` 为新增文本（纯文本不带 ASS 标签，无现译行可继承标签）。样式由脚本按 track 从 ASS `[V4+ Styles]` 自动解析（ASS 须有对应样式，否则报错停下，不自动建样式）。日志 `old_text` 记为空，rollback 时删该行。

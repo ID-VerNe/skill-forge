@@ -82,6 +82,48 @@ def load_fixes(path: str) -> list:
         return json.load(f)
 
 
+def _resolve_file_key(fixes: list, cli_file: str = "") -> None:
+    """补全缺失的 `file` 键，补不出来就明确报错（bug #12）。
+
+    ## 为什么会崩
+
+    下游 `run_dry_run` / `run_accept` 都用 `by_file.setdefault(fx["file"], ...)`
+    分组，**硬取**。fixes.json 里少了 `file` 就是一条 `KeyError: 'file'` 栈，
+    而栈里只写着 `setdefault`，看不出「是第几条 fix 缺字段、缺的是哪个字段」。
+    崩溃发生在 `_block_on_guard` **之后**，所以现场表现是：先过语义护栏，
+    加了 `--confirm` 再崩——看起来像 `--confirm` 引起的，其实是顺序造成的错觉。
+
+    ## 兜底从哪来
+
+    全局 `--file` 参数（同时用于 `--rollback id=`）。fixes 里缺 `file` 时补上它，
+    这是「单文件批次」的常见形态：人写在命令行上，而不是重复写进每一条 fix。
+
+    ## 为什么不猜
+
+    既没有 `file` 字段也没有 `--file` 时**无从推断**——工作目录下可能有好几集
+    ASS，按文件名相似度挑一个就是猜，而猜错的后果是改错文件。所以直接
+    `SystemExit`，并把「是哪一条缺字段」和「两种补救方式」都打出来。
+    """
+    missing = [fx for fx in fixes if not (fx.get("file") or "").strip()]
+    if not missing:
+        return
+    default = (cli_file or "").strip()
+    if default:
+        for fx in missing:
+            fx["file"] = default
+        print("[*] %d 条 fix 缺 file 字段，已补命令行 --file：%s"
+              % (len(missing), default), file=sys.stderr)
+        return
+    ids = [str(fx.get("id") or fx.get("audit_id") or "?") for fx in missing[:5]]
+    more = "" if len(missing) <= 5 else " 等 %d 条" % len(missing)
+    raise SystemExit(
+        "[!] fixes.json 里 %d 条缺 `file` 字段（%s%s）。\n"
+        "    每条 fix 必须写 `file`（目标 ASS 绝对路径），否则无法分组执行。\n"
+        "    补救：① 在 fixes.json 每条里补 \"file\"; 或 ② 单文件批次时在命令行\n"
+        "    给 --file <该 ASS 路径>，脚本会补到所有缺字段的条目上。"
+        % (len(missing), ", ".join(ids), more))
+
+
 def _row_at_start(subs, start_sec: float, track: str, used=None):
     """按**精确起点**取 ASS 行（容差 0.002s）。
 
@@ -1466,6 +1508,10 @@ def main():
     wd = resolve_work_dir(args.work_dir)
     assert_no_orphan_log(args.work_dir)
     fixes = load_fixes(args.fixes)
+    # ① 结构补齐先行：缺 file 就在这里明确报错，而不是让下游 setdefault 崩成
+    #    `KeyError: 'file'`。它必须在所有分组/护栏之前——护栏本身不读 file，
+    #    所以旧顺序会让人先过护栏、再加 --confirm 才崩，误以为是 --confirm 的锅。
+    _resolve_file_key(fixes, args.file)
     # 结构预检先行：srt_id 越界 / 缺字段的条目直接剔除，不让它们进入护栏报告
     # （否则人看到的第一条理由是「短句重写」，而真正问题是「根本定位不到」）。
     bad = []
