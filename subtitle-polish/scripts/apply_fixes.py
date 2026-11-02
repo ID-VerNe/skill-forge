@@ -82,8 +82,93 @@ def load_fixes(path: str) -> list:
         return json.load(f)
 
 
+def _row_at_start(subs, start_sec: float, track: str, used=None):
+    """按**精确起点**取 ASS 行（容差 0.002s）。
+
+    与 `_find_dialogue` 的 ±0.5s 窗是两个不同的东西：窗是「猜这一句大概在哪」，
+    这个是「映射已经告诉我这一句的起点是哪一秒」。断句点分歧的素材上，±0.5s
+    窗会同时包住相邻两三句，只有精确起点能唯一定位。
+
+    容差 0.002 只吃浮点表示误差（起点来自毫秒/1000，两侧同源），不是「容忍偏差」。
+    同起点多行（碎片行）时按 `used` 跳过已处理行，再由调用方的 `prefer_text`
+    在候选里挑——碎片行的区分本来就要靠 current，不能在这里替它决定。
+    """
+    if used is None:
+        used = set()
+    hits = []
+    for e in subs.events:
+        if id(e) in used:
+            continue
+        if style_to_track(e.style or "") != track:
+            continue
+        if abs(e.start / 1000.0 - float(start_sec)) <= 0.002:
+            hits.append(e)
+    return hits
+
+
+def _build_index_alignment(ass_path, srt_blocks_indexed) -> dict:
+    """算出 {srt_id: 该句在 ASS 里的起点秒}，供后续按精确起点定位。
+
+    ## 为什么需要（issue v1.15 / S06E02 实测）
+
+    SRT 869 块按句切，ASS 中文轨按语音节奏重切。按序号硬配对后：
+
+        起点差 > 0.5s         727 / 869     ← ±0.5s 窗基本找不到行
+        中位差                3.08 s
+        p90                   4.61 s
+        最大                  6.33 s
+        ±0.5s 窗准确率        142 / 869
+        序号映射后准确率      869 / 869
+
+    所以「对不上」不是轴漂移，是**行边界不一致**。轴漂移该整体平移，行边界分歧
+    只能靠顺序映射：两边顺序一致、文本一致，位置差多少都不影响「这是同一句」。
+
+    ## 为什么用 `pair()` 而不是自己再写一套
+
+    `ass_srt_pair.pair()` 已经把「时间窗 + 顺序映射 + 文本校验」三件事做过一遍，
+    并且对同起点多行、音效块、跨块抢行都有专门处理。这里只取它的结论
+    （每个 srt_id 对应哪条英文行），把行起点整理成 {srt_id: 秒}。
+    自己另写一套必然与那里口径不一致。
+
+    ## 参数为什么是 ass_path 而不是 subs
+
+    `pair()` 吃的是 `List[AssDialogue]`（`lib.ass_srt_pair.parse_ass()` 的产物，
+    带 `.track`），不是 pysubs2 的 `SSAEvent`。直接把 `subs.events` 传进去会
+    在 `r.track` 上 AttributeError（retime / verify_blindspot 两组实测）。
+    这里自己解析一遍文件；解析开销远小于一次错改。
+
+    ## 失败时**不许**静默返回 {}
+
+    上一版这里写的是 `except Exception: return {}`，等于「映射建不出来就当没有」，
+    后果是调用方静默退回旧的 ±0.5s 窗、在断句点分歧的素材上照旧定位到相邻句、
+    照旧改错句子——比直接报错危险得多。现在原样抛出，让调用方看见。
+    """
+    from lib.ass_srt_pair import pair as _pair, parse_ass as _parse_ass
+
+    if not srt_blocks_indexed or not ass_path:
+        return {}
+    srt_blocks = [srt_blocks_indexed[k] for k in sorted(srt_blocks_indexed)]
+    try:
+        ass_blocks = _parse_ass(ass_path)
+        paired, _ass_only = _pair(ass_blocks, srt_blocks)
+    except Exception as exc:                      # noqa: BLE001
+        # 显式抛出：静默降级会让定位悄悄退回旧窗，改错句子且不留痕迹。
+        raise RuntimeError(
+            f"index_align 构建失败，拒绝退回 ±0.5s 窗静默定位：{exc}") from exc
+    out = {}
+    for pb in paired:
+        en = (pb.lines or {}).get("英文") or []
+        if not en:
+            continue
+        # 取该块英文行里最早的一条作为锚点：中英双轨同起点，英文行的起点即
+        # 这一句在 ASS 里的真实起点。
+        out[pb.srt_id] = min(r.start for r in en)
+    return out
+
+
 def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
-                   fallback_text: str = "", *, used=None, prefer_text: str = ""):
+                   fallback_text: str = "", *, used=None, prefer_text: str = "",
+                   index_align=None):
     """按 srt_id + track 在 ass subs 里定位 Dialogue event。
 
     返回 pysubs2 Event 对象或 None。
@@ -92,6 +177,9 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
         下的多条同轨行被重复命中（如「合并碎片行」= 1 replace + N delete）。
     prefer_text: 给了就优先匹配可见文本等于它的候选（fix 里的 current 字段）。
         用于同一 srt_id 有多条同轨行时精确指定要删/要改的那一条。
+    index_align: {srt_id: ASS 起点秒}，来自 `_build_index_alignment`。**优先级最高**：
+        有映射就按精确起点定位，不再走 ±0.5s 窗——断句点分歧的素材上那个窗会
+        包住相邻句，改了错的句子。
 
     为什么需要 used/prefer_text：_find_dialogue 原本的语义是「取时间戳最近的第
     一条」，无状态。生产环节把一句中文字幕拆成多条独立 Dialogue 时，同 start/end、
@@ -100,6 +188,19 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
     """
     if used is None:
         used = set()
+    # ① 映射优先：精确起点定位。这是 index_align 补丁的核心接入点。
+    if index_align and srt_id in index_align:
+        rows = _row_at_start(subs, index_align[srt_id], track, used=used)
+        if rows:
+            if prefer_text:
+                want = clean_ass_text(prefer_text)
+                same = [e for e in rows if clean_ass_text(e.text) == want]
+                if same:
+                    return same[0]
+                # 声明文本对不上：说明映射或 current 有误。**不静默改相邻句**，
+                # 退回时间窗让调用方报错——错改比不改危害大。
+            else:
+                return rows[0]
     if srt_id in srt_blocks_indexed:
         sb = srt_blocks_indexed[srt_id]
         target_start = sb.start  # 秒
@@ -147,7 +248,8 @@ def _find_dialogue(subs, srt_blocks_indexed, srt_id: int, track: str,
     return None
 
 
-def _row_group_texts(subs, srt_blocks_indexed, srt_id: int, track: str) -> set:
+def _row_group_texts(subs, srt_blocks_indexed, srt_id: int, track: str,
+                     index_align=None) -> set:
     """返回某个 srt_id + track 下**全部**候选行的可见文本集合。
 
     存在的理由：`read_current_strict` 只能回答「这组行里有一条看起来像这样」，
@@ -156,17 +258,31 @@ def _row_group_texts(subs, srt_blocks_indexed, srt_id: int, track: str) -> set:
     `current` 区分。拿回读值一律覆盖，N 条 delete 的 current 就全变成同一条，
     撞车预检会判定它们抢同一行并整批拒写（issue #2 的 bug H/I/J）。
 
-    时间窗与 `_find_dialogue` 保持同一个 0.5s，不要各写一份——两处口径不一致时，
-    「回读说存在」而「定位找不到」，报出来的错会是撞车或定位失败，查起来很远。
+    ## 锚点必须与 `read_current` 用同一个（index_align 补丁修的 P0）
+
+    这里原本写死「SRT 起点 + 0.5s」，而 `read_current` 接了 `starts=` 之后改用
+    「ASS 起点 + 0.002s」。两处口径不一致的直接后果：S06E02 上 read_current 说
+    「这一句是 X」，_row_group_texts 却去 SRT 起点附近找，取回来的是**相邻句
+    的文本集合**，于是「回读说 current 存在」而这里说「不存在」，报出来的错
+    是「current 与 ASS 不符」——查起来完全跑偏到文本层，实际是定位层的问题。
+
+    给了 `index_align` 就一律按它（与 `read_current_starts` 完全同源）；
+    没给才退回旧的 SRT 起点 + 0.5s，保持未建映射时的行为不变。
     """
     sb = srt_blocks_indexed.get(srt_id)
     if sb is None:
         return set()
+    if index_align and srt_id in index_align:
+        anchor = float(index_align[srt_id])
+        tol = 0.002
+    else:
+        anchor = float(sb.start)
+        tol = 0.5
     out = set()
     for e in subs.events:
         if style_to_track(e.style or "") != track:
             continue
-        if abs(e.start / 1000.0 - sb.start) <= 0.5:
+        if abs(e.start / 1000.0 - anchor) <= tol:
             out.add(clean_ass_text(e.text or ""))
     return out
 
@@ -253,10 +369,13 @@ def _replace_text(e, new_text: str):
     e.text = "".join(merged) + new_body
 
 
-def _swap_text(subs, srt_blocks_indexed, id_a: int, id_b: int, track: str):
+def _swap_text(subs, srt_blocks_indexed, id_a: int, id_b: int, track: str,
+               index_align=None):
     """交换两个 srt_id 对应行的文本部分，各自保留原特效标签（不动时间戳/样式/标签）。"""
-    ea = _find_dialogue(subs, srt_blocks_indexed, id_a, track)
-    eb = _find_dialogue(subs, srt_blocks_indexed, id_b, track)
+    ea = _find_dialogue(subs, srt_blocks_indexed, id_a, track,
+                        index_align=index_align)
+    eb = _find_dialogue(subs, srt_blocks_indexed, id_b, track,
+                        index_align=index_align)
     if not ea or not eb:
         return None, None, None, None
     tags_a, body_a = extract_leading_tags(ea.text)
@@ -411,6 +530,10 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
             srt_path = _find_paired_srt(file)
         srt_blocks = parse_srt(srt_path) if srt_path and os.path.exists(srt_path) else []
         srt_index = _build_srt_index(srt_blocks)
+        # 断句点分歧素材上，SRT 起点 ±0.5s 根本框不到对应的 ASS 行（S06E02 实测
+        # 869 块里 727 块超 0.5s，中位 3.08s）。有 SRT 就按配对结果建精确起点映射，
+        # 定位一律走映射。构建失败会 RuntimeError，不静默退回旧窗。
+        index_align = _build_index_alignment(file, srt_index) if srt_index else {}
         # 撞车检测：本文件的 fix 里，有没有两条在「没有 current」时定位到同一个
         # 物理 event。_find_dialogue 已取最近时间戳，但同一 srt_id 有多条同轨行
         # （一句被拆成多条 Dialogue）时必然撞同一行（见 issue #2）。
@@ -426,7 +549,7 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
                 continue
             track = fx.get("track", TRACK_ZH)
             sid = fx["srt_id"]
-            e = _find_dialogue(subs, srt_index, sid, track)
+            e = _find_dialogue(subs, srt_index, sid, track, index_align=index_align)
             if e is None:
                 continue
             eid = id(e)
@@ -458,7 +581,8 @@ def run_dry_run(fixes: list, work_dir: str) -> str:
             srt_id = fx["srt_id"]
             # 与上面撞车检测同一套消耗顺序，保证预览与实写命中同一行
             e = _find_dialogue(subs, srt_index, srt_id, track,
-                               prefer_text=fx.get("current", ""), used=used)
+                               prefer_text=fx.get("current", ""), used=used,
+                               index_align=index_align)
             # insert：该 track 行尚不存在，e=None 正常；ass_time 从 srt 块取
             sb = srt_index.get(srt_id)
             is_insert = (action == "insert")
@@ -613,6 +737,10 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
             print(f"[!] 找不到配对 srt: {file}（推路径 {_find_paired_srt(file)}）", file=sys.stderr)
             print(f"    在 fixes.json 里给每条加 \"srt_path\" 字段可显式指定", file=sys.stderr)
         srt_index = _build_srt_index(srt_blocks)
+        # 回读 / 行组 / 定位三处必须用同一套锚点。不一致时会出现「回读说
+        # current 存在、_row_group_texts 说找不到」的死循环，报错还会指向文本层，
+        # 实际是定位层（见 docs/v1.15-checklist 里 P0 ⑤ 的成因分析）。
+        index_align = _build_index_alignment(file, srt_index) if srt_index else {}
 
         # A2（issue #24 的 H2）：current 以 ASS 回读为准，不信 fixes.json 里抄来的。
         # 审计 JSON 的「原文」是审计员看到并可能已改写的镜像文本，抄它会让
@@ -639,7 +767,8 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
             trk = fx.get("track", TRACK_ZH)
             rb, why = read_current_strict(
                 subs, srt_blocks, sid, trk,
-                tol=(prof_en if trk == TRACK_EN else prof_zh)["tol"])
+                tol=(prof_en if trk == TRACK_EN else prof_zh)["tol"],
+                starts=index_align)
             if rb is None:
                 if why == "id_out_of_range":
                     bad_ids += 1
@@ -660,7 +789,8 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
                 fx["current"] = rb          # 没声明 → 只能用回读值
             elif clean_ass_text(rb) == declared:
                 pass                         # 一致，用哪个都一样
-            elif declared in _row_group_texts(subs, srt_index, sid, trk):
+            elif declared in _row_group_texts(subs, srt_index, sid, trk,
+                                              index_align=index_align):
                 # 声明值确实存在于该 srt_id 的同轨行中，只是不是「最近最长」那条。
                 # 保留声明值——它是 fix 用来指定**具体哪一条碎片行**的唯一手段。
                 pass
@@ -696,16 +826,24 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
                 cur = fx.get("current", "")
                 # 该 fix 在「无 current」时（或带 current 时）会落到哪一行
                 e = _find_dialogue(subs, srt_index, fx["srt_id"], track,
-                                   prefer_text=cur)
+                                   prefer_text=cur, index_align=index_align)
                 if e is None:
                     continue
                 # 带了 current 但没匹配上 → 说明这条 fix 自身不准，直接拒
                 if cur:
                     want = clean_ass_text(cur)
+                    # 行组判定的锚点必须与 _find_dialogue 一致：用 index_align 的
+                    # 精确起点，否则在断句点分歧素材上这里会把合法的 current 判成
+                    # 「找不到」（±0.5s 框到的是隔壁句）。
+                    if index_align and fx["srt_id"] in index_align:
+                        _anchor = float(index_align[fx["srt_id"]])
+                        _tol = 0.002
+                    else:
+                        _anchor = srt_index[fx["srt_id"]].start
+                        _tol = 0.5
                     same = [x for x in subs.events
                             if style_to_track(x.style or "") == track
-                            and abs(x.start / 1000.0
-                                    - srt_index[fx["srt_id"]].start) <= 0.5]
+                            and abs(x.start / 1000.0 - _anchor) <= _tol]
                     if not any(clean_ass_text(x.text) == want for x in same):
                         print(f"[!] {fxiv}: current 在 srt_id={fx['srt_id']} "
                               f"track={track} 的行里找不到：{cur!r}", file=sys.stderr)
@@ -728,7 +866,8 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
             track = fx.get("track", TRACK_ZH)
             srt_id = fx["srt_id"]
             e = _find_dialogue(subs, srt_index, srt_id, track,
-                               prefer_text=fx.get("current", ""), used=used)
+                               prefer_text=fx.get("current", ""), used=used,
+                               index_align=index_align)
             if action == "insert":
                 sb = srt_index.get(srt_id)
                 if sb is None:
@@ -790,7 +929,8 @@ def run_accept(fixes: list, work_dir: str, batch_id: str,
                            fx.get("category",""), fx.get("reason",""))
             elif action == "swap":
                 ea, eb, old_a, old_b = _swap_text(subs, srt_index, srt_id,
-                                                    fx["swap_with"], track)
+                                                    fx["swap_with"], track,
+                                                    index_align=index_align)
                 if ea:
                     append_log(work_dir, batch_id, "swap", file, srt_id, track,
                                old_a, ea.text, fx.get("category",""), fx.get("reason",""))
@@ -848,17 +988,19 @@ def run_apply_batch(work_dir: str, batch_id: str, confirm: bool = False) -> int:
         srt_path = _find_paired_srt(file)
         srt_blocks = parse_srt(srt_path) if srt_path and os.path.exists(srt_path) else []
         srt_index = _build_srt_index(srt_blocks)
+        index_align = _build_index_alignment(file, srt_index) if srt_index else {}
         prof = alignment_profile(subs, srt_blocks, TRACK_ZH) if srt_blocks else {"tol": 3.0}
         for ent in ents:
             track = ent.get("track", TRACK_ZH)
             sid = ent.get("srt_id")
             cur, why = read_current_strict(subs, srt_blocks, sid, track,
-                                           tol=prof["tol"])
+                                           tol=prof["tol"], starts=index_align)
             if cur is None:
                 print(f"[!] srt_id={sid} track={track} 回读失败（{why}），跳过",
                       file=sys.stderr)
                 continue
-            e = _find_dialogue(subs, srt_index, sid, track, prefer_text=cur)
+            e = _find_dialogue(subs, srt_index, sid, track, prefer_text=cur,
+                               index_align=index_align)
             if not e:
                 print(f"[!] srt_id={sid} 定位失败，跳过", file=sys.stderr)
                 continue
@@ -970,15 +1112,21 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
         srt_path = _find_paired_srt(f)
         srt_blocks = parse_srt(srt_path) if srt_path and os.path.exists(srt_path) else []
         srt_index = _build_srt_index(srt_blocks)
+        # 回滚同样走精确映射。这里缺 index_align 的后果比写入更隐蔽：回滚会
+        # 「定位成功」但落在隔壁句上，把一句没改过的译文改回成另一句的 old_text，
+        # 而日志里记的是成功——出问题只能靠逐字节比对才发现。
+        index_align = _build_index_alignment(file, srt_index) if srt_index else {}
         for ent in ents:
             track = ent.get("track", TRACK_ZH)
             # 回滚：按日志里的 new_text（当前内容）做 fallback 定位。
             # retime 条目的 new_text 是时间串，不能当文本用，改用 srt_id 定位。
             if ent.get("action") == "retime":
-                e = _find_dialogue(subs, srt_index, ent["srt_id"], track)
+                e = _find_dialogue(subs, srt_index, ent["srt_id"], track,
+                                   index_align=index_align)
             else:
                 e = _find_dialogue(subs, srt_index, ent["srt_id"], track,
-                                   fallback_text=ent.get("new_text",""))
+                                   fallback_text=ent.get("new_text",""),
+                                   index_align=index_align)
             if not e:
                 print(f"[!] 回滚定位失败: srt_id={ent['srt_id']} track={track} "
                       f"(srt_path={srt_path or '未找到'})", file=sys.stderr)

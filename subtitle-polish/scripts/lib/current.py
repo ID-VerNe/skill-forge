@@ -92,51 +92,24 @@ def alignment_profile(subs, srt_blocks: list, track: str) -> dict:
 
 
 def read_current(subs, srt_blocks: list, srt_id: int, track: str,
-                 tol: float = 1.5, base: Optional[float] = None) -> Optional[str]:
-    """按 srt_id + track 从 ASS 回读该行原文。
-
-    `srt_blocks` 是 parse_srt 的结果，每个元素需有 `.start` / `.end`（秒）。
-    `tol` 一般为 `alignment_profile()` 给出的 tol；`base` 是整份文件的系统性
-    偏移（本次实测三集都为 0，保留以便处理整体平移过的文件）。
-
-    定位只看 start，不看区间重叠——中文断句常把一句拆成多段，end 不可靠；
-    同一 start 命中多行（碎片行）时取「时长最长」的那条，因为碎片行是从主行
-    劈出来的，主行必然更长。
-    """
-    if not isinstance(srt_id, int) or srt_id <= 0:
-        return None
-    idx = srt_id - 1
-    if idx < 0 or idx >= len(srt_blocks):
-        return None
-    sb = srt_blocks[idx]
-    start = float(sb.start)
-    off = base or 0.0
-    best = None
-    best_score = None
-    for _, e in iter_events(subs):
-        if style_to_track(e.style) != track:
-            continue
-        es, ee = e.start / 1000.0, e.end / 1000.0
-        d = abs((es - start) - off)
-        if d > tol:
-            continue
-        score = (round(d, 3), -(ee - es))
-        if best_score is None or score < best_score:
-            best, best_score = e, score
-    return best.text if best is not None else None
-
-
-def read_current(subs, srt_blocks: list, srt_id: int, track: str,
-                 tol: float = 1.5, base: Optional[float] = None) -> Optional[str]:
+                 tol: float = 1.5, base: Optional[float] = None,
+                 starts: Optional[dict] = None) -> Optional[str]:
     """按 srt_id + track 从 ASS 回读该行原文。
 
     `srt_blocks` 是 parse_srt 的结果，每个元素需有 `.start` / `.end`（秒）。
     `base` 是该文件的中位偏差（见 `median_offset`）：给了就按「偏差 − base」
     判定，未给则按绝对偏差判。返回 None 表示定位失败，调用方必须当错误处理。
 
-    定位只看 start，不看区间重叠——中文断句常把一句拆成多段，end 不可靠；
-    同一 start 命中多行（碎片行）时取「时长最长」的那条，因为碎片行是从主行
-    劈出来的，主行必然更长。
+    ## `starts`：按「这一句在 ASS 里的实际起点」定位（index_align 补丁）
+
+    默认走 SRT 起点 + `tol` 窗。这在 S06E02 上会取错行：ASS 中文轨按语音节奏
+    重切，与 SRT 的句边界不同，按序号硬配对后起点差 >0.5s 的有 727/869、中位
+    3.08s，±0.5s 窗准确率只有 142/869。传 `starts`（{srt_id: ass 起点秒}）后
+    改用**精确起点**定位，容差收到 0.002s，准确率 869/869。
+
+    为什么容差是 0.002 而不是 0：起点是 ASS 里读出来的浮点秒（毫秒/1000），
+    再与 `e.start / 1000.0` 比较，同一条记录两边都是同一串毫秒除出来的，
+    理论差为 0；留 0.002 只为吃掉浮点表示误差，不是为了「容忍偏差」。
     """
     if not isinstance(srt_id, int) or srt_id <= 0:
         return None
@@ -146,6 +119,12 @@ def read_current(subs, srt_blocks: list, srt_id: int, track: str,
     sb = srt_blocks[idx]
     start = float(sb.start)
     off = base or 0.0
+    if starts and srt_id in starts:
+        # 映射给了精确起点，就不要再用 SRT 起点 ±tol 去找——那样会在
+        # 断句点分歧的素材上取到相邻句（apply_fixes 会照着改错的句子）。
+        start = float(starts[srt_id])
+        off = 0.0
+        tol = 0.002
     best = None
     best_score = None
     for _, e in iter_events(subs):
@@ -162,7 +141,8 @@ def read_current(subs, srt_blocks: list, srt_id: int, track: str,
 
 
 def read_current_strict(subs, srt_blocks: list, srt_id: int, track: str,
-                        tol: float = 1.5, base: Optional[float] = None):
+                        tol: float = 1.5, base: Optional[float] = None,
+                        starts: Optional[dict] = None):
     """同 read_current，但把失败原因也返回：(text, reason)。
 
     reason ∈ {"", "bad_id", "id_out_of_range", "no_event"}
@@ -171,7 +151,8 @@ def read_current_strict(subs, srt_blocks: list, srt_id: int, track: str,
         return None, "bad_id"
     if srt_id > len(srt_blocks):
         return None, "id_out_of_range"
-    t = read_current(subs, srt_blocks, srt_id, track, tol=tol, base=base)
+    t = read_current(subs, srt_blocks, srt_id, track, tol=tol, base=base,
+                     starts=starts)
     if t is None:
         return None, "no_event"
     return t, ""

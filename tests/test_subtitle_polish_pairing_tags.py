@@ -15,11 +15,31 @@ S06E02 的 R5 p1 读到 38 行空单元格,据此报出 38 条「漏译」,重�
 于是本文件锁住三件事:
 
   P1 有英文无中文         -> ZH_MISSING,不能是别的
-  P2 两边都空但容差外有行 -> PAIRING_OUT_OF_TOLERANCE(off=…),不能是 ZH_MISSING
+  P2 两边都空但容差外有行 -> BOUNDARY_OFFSET(off=…),不能是 ZH_MISSING
   P3 两边都空且附近没行   -> PAIRING_FAILED
   P4 音效块               -> 一个 pairing 标记都不打
   P5 门禁按「未配上」算,两种形态都算进分子
   P6 门禁在写盘之前 abort,不留下半份切片
+
+关于 P2 的期望值为什么从 PAIRING_OUT_OF_TOLERANCE 改成 BOUNDARY_OFFSET
+────────────────────────────────────────────────────────────────────
+建本文件时(issue v1.15)ass_srt_pair 只有三形态,靠「两边都空 + 起点差超容差」
+来认超容差块。后来为 S06E02 的断句点分歧打了 index_align 补丁,`pair()` 新增
+`_monotonic_fallback()`(LCS 锚点 + 顺序映射):凡是顺序和文本都对得上、只是行
+边界不同的块,现在会被**真的配上**,不再落进「两边都空」。于是判别段多出第四
+形态:
+
+  PAIRING_OUT_OF_TOLERANCE  两边都空、容差外有行 —— 轴有问题,要先校轴
+  BOUNDARY_OFFSET           配上了、但起点差超容差 —— 行边界/剪辑点分歧,轴没问题
+  PAIRING_FAILED            两边都空、附近根本没行 —— 素材不同版
+  ZH_MISSING                有英文无中文
+
+夹具里 srt 3@10.0 对 ASS@11.2、两边文本一致,补丁后会走顺序映射配上,所以它
+现在属于 BOUNDARY_OFFSET 而不是 PAIRING_OUT_OF_TOLERANCE。这个改动**不是给实现
+让路**:BOUNDARY_OFFSET 的含义更精确(「配上了、轴没毛病、只是切点不同」),若仍
+报成「超容差」,审计员会去校轴,而校轴解决不了断句点分歧。三形态在「两边都空」
+这条路径上仍然完整保留,P3/P5 仍然锁着它们。
+
 
 跑法:
   cd <skill-forge>
@@ -147,16 +167,25 @@ def t_p1_missing_translation(tmp):
     assert not _tags(p)[1:], f"漏译不该带 pairing 标记:{p.anomalies}"
 
 
-def t_p2_out_of_tolerance(tmp):
+def t_p2_boundary_offset(tmp):
+    """两边文本对得上、只是起点差 1.20s(超 ±0.5s 容差)。
+
+    期望 BOUNDARY_OFFSET 而不是 PAIRING_OUT_OF_TOLERANCE:index_align 补丁的顺序
+    映射会把它**配上**,「两边都空」的前提已不成立。详见文件头 P2 说明。
+    """
     paired = _pair(tmp)
     p = [x for x in paired if x.srt_id == 3][0]
     assert "ZH_MISSING" not in p.anomalies, (
         f"srt 3 在 ASS 里有完整中英对照,不能报漏译:{p.anomalies}")
-    oot = [a for a in p.anomalies if a.startswith("PAIRING_OUT_OF_TOLERANCE")]
-    assert oot, f"srt 3 应报 PAIRING_OUT_OF_TOLERANCE,实得 {p.anomalies}"
-    # 偏移量必须带出来,否则读的人只知道「超了」不知道「超多少」
-    m = re.search(r"off=([+-]?[\d.]+)s", oot[0])
-    assert m, f"标记里没有 off 值:{oot[0]}"
+    # 顺序映射配上之后不该再报「未配上」——这是本次改动最要紧的一条:
+    # 配上却报未配上,门禁会拿假数据 abort 整轮。
+    assert not [a for a in p.anomalies if a.startswith("PAIRING_FAILED")], (
+        f"srt 3 已被顺序映射配上,不该报未配上:{p.anomalies}")
+    off_tags = [a for a in p.anomalies if a.startswith("BOUNDARY_OFFSET")]
+    assert off_tags, f"srt 3 应报 BOUNDARY_OFFSET,实得 {p.anomalies}"
+    # 偏移量必须带出来,否则读的人只知道「有分歧」不知道「差多少」
+    m = re.search(r"off=([+-]?[\d.]+)s", off_tags[0])
+    assert m, f"标记里没有 off 值:{off_tags[0]}"
     off = float(m.group(1))
     assert abs(off - 1.20) < 0.02, f"偏移应为 +1.20s,实得 {off}"
 
@@ -249,12 +278,12 @@ def t_p6_gate_before_write(tmp):
 
 def main():
     print("=" * 70)
-    print("配对异常标记三形态回归测试 (issue v1.15 · A1)")
+    print("配对异常标记回归测试 (issue v1.15 · A1 三形态 + index_align 第四形态)")
     print("=" * 70)
     tmp = tempfile.mkdtemp(prefix="pairtag_")
     try:
         test("P1 有英文无中文 -> ZH_MISSING", lambda: t_p1_missing_translation(tmp))
-        test("P2 超容差 -> PAIRING_OUT_OF_TOLERANCE 且带 off", lambda: t_p2_out_of_tolerance(tmp))
+        test("P2 起点差超容差 -> BOUNDARY_OFFSET 且带 off", lambda: t_p2_boundary_offset(tmp))
         test("P3 附近无行 -> PAIRING_FAILED", lambda: t_p3_pairing_failed(tmp))
         test("P4 音效块不打配对标记", lambda: t_p4_sound_effect_not_flagged(tmp))
         test("P5 门禁分子含两种形态", lambda: t_p5_gate_counts_both_shapes(tmp))

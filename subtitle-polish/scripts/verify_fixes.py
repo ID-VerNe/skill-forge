@@ -28,6 +28,7 @@ from lib.paths import resolve_work_dir, report_path
 from lib.tags import extract_leading_tags
 from lib.ass_srt_pair import clean_ass_text
 from apply_fixes import (_find_dialogue, _build_srt_index, _find_paired_srt,
+                         _build_index_alignment,
                          _format_timespec, _parse_timespec)
 
 # 邻块撞车默认参数（实测校准：坏条 4/15 命中，好条 0/84 误报）
@@ -91,11 +92,11 @@ def detect_neighbor_duplicate(zh_text, srt_id, zh_by_sid, window=NEIGHBOR_WINDOW
     return best if best[0] >= floor else (best[0], None)
 
 
-def build_zh_index(subs, srt_index):
+def build_zh_index(subs, srt_index, index_align=None):
     """{srt_id: 中文可见文本}（同 srt_id 多条时取第一条非空）。"""
     out = {}
     for sid in (srt_index or {}):
-        e = _find_dialogue(subs, srt_index, sid, TRACK_ZH)
+        e = _find_dialogue(subs, srt_index, sid, TRACK_ZH, index_align=index_align)
         if e is None:
             continue
         txt = clean_ass_text(e.text)
@@ -104,13 +105,13 @@ def build_zh_index(subs, srt_index):
     return out
 
 
-def find_cross_block_copies(fixes, subs, srt_index):
+def find_cross_block_copies(fixes, subs, srt_index, index_align=None):
     """dry-run 用：本批 fix 的新译文与邻块现有译文撞车的条目。
 
     返回 [{"id", "srt_id", "score", "neighbor", "new"}]。
     只做预警，不改任何文本。
     """
-    zh_by_sid = build_zh_index(subs, srt_index)
+    zh_by_sid = build_zh_index(subs, srt_index, index_align=index_align)
     hits = []
     for fx in fixes:
         if not fx.get("enabled", True):
@@ -169,7 +170,7 @@ def check_english_alignment(entry, subs, srt_index):
     return True, ""
 
 
-def verify_entry(entry, subs, srt_index):
+def verify_entry(entry, subs, srt_index, index_align=None):
     """核对单条记录。返回 (ok: bool, actual: str, detail: str)。"""
     track = entry.get("track", TRACK_ZH)
     action = entry.get("action", "replace")
@@ -177,7 +178,8 @@ def verify_entry(entry, subs, srt_index):
 
     if action == "delete":
         # 验该行已不存在：按 srt_id+track 找，应返回 None
-        e = _find_dialogue(subs, srt_index, entry["srt_id"], track)
+        e = _find_dialogue(subs, srt_index, entry["srt_id"], track,
+                           index_align=index_align)
         if e is None:
             return True, "", "行已删除"
         return False, e.text, "delete 后该行仍存在"
@@ -186,7 +188,7 @@ def verify_entry(entry, subs, srt_index):
         # 破例 Edit：按 log 的 new_text fallback 定位，核对可见文本一致即可。
         # 不要求 srt_id 精确时间戳匹配（manual_edit 可能改了时间戳）。
         e = _find_dialogue(subs, srt_index, entry["srt_id"], track,
-                           fallback_text=expected_new)
+                           fallback_text=expected_new, index_align=index_align)
         if e is None:
             return False, "", "定位失败（manual_edit 后该行找不到，可能时间戳变了）"
         _, exp_body = extract_leading_tags(expected_new)
@@ -198,7 +200,8 @@ def verify_entry(entry, subs, srt_index):
     if action == "retime":
         # retime 日志的 old_text/new_text 存的是时间串（见 issue #3），
         # 不核对文本，只核对时间轴是否与 new_text 一致。
-        e = _find_dialogue(subs, srt_index, entry["srt_id"], track)
+        e = _find_dialogue(subs, srt_index, entry["srt_id"], track,
+                           index_align=index_align)
         if e is None:
             return False, "", "定位失败（retime 后该行找不到）"
         try:
@@ -212,14 +215,15 @@ def verify_entry(entry, subs, srt_index):
 
     if action == "rollback" and expected_new == "":
         # rollback 到 delete 前态：行应已删除（log 的 new_text 空）
-        e = _find_dialogue(subs, srt_index, entry["srt_id"], track)
+        e = _find_dialogue(subs, srt_index, entry["srt_id"], track,
+                           index_align=index_align)
         if e is None:
             return True, "", "行已删除（rollback of delete）"
         return False, e.text, "rollback-to-delete 后该行仍存在"
 
     # replace / swap / rollback-to-replace：按 srt_id+track 定位，核对 new_text
     e = _find_dialogue(subs, srt_index, entry["srt_id"], track,
-                       fallback_text=expected_new)
+                       fallback_text=expected_new, index_align=index_align)
     if e is None:
         return False, "", "定位失败（srt_id+track 找不到对应行）"
     # 双端去前导标签后比可见文本（标签合并策略可能让标签顺序略不同，
@@ -234,7 +238,7 @@ def verify_entry(entry, subs, srt_index):
         # E：与 ±3 邻块译文撞车，典型是抄错行。注意这不是完整的错位
         # 检测器——「换成同场景另一句」判不出来，仍须 cross_check 人工复核。
         if track == TRACK_ZH:
-            zh_by_sid = build_zh_index(subs, srt_index)
+            zh_by_sid = build_zh_index(subs, srt_index, index_align=index_align)
             # 先和**本轮之前**的邻块译文比（排除本次写入的那条），
             # 免得「我把两条都改对了、只是恰好写得像」被判撞车。
             prior = dict(zh_by_sid)
@@ -281,6 +285,9 @@ def run(entries, work_dir, label):
         srt_path = _find_paired_srt(f)
         srt_blocks = parse_srt(srt_path) if srt_path and os.path.exists(srt_path) else []
         srt_index = _build_srt_index(srt_blocks)
+        # 验证必须用与写入完全相同的锚点。用旧窗验证会「验通过」一件写错了行的
+        # 改动——因为定位和验证用了同一个错窗，两边一起看邻句，看起来一致。
+        index_align = _build_index_alignment(f, srt_index) if srt_index else {}
         # 该文件内每 (srt_id, track) 取最后一条
         latest = _latest_per_target(ents)
         for e in latest:
@@ -290,7 +297,8 @@ def run(entries, work_dir, label):
                 # 逼人去删日志。单列一栏，明确「待复测」。
                 pending_sections.append(e)
                 continue
-            ok, actual, detail = verify_entry(e, subs, srt_index)
+            ok, actual, detail = verify_entry(e, subs, srt_index,
+                                              index_align=index_align)
             if ok:
                 ok_count += 1
             else:
@@ -315,12 +323,15 @@ def run(entries, work_dir, label):
             fsrt_path = _find_paired_srt(f)
             fsrt_blocks = parse_srt(fsrt_path) if fsrt_path and os.path.exists(fsrt_path) else []
             fsrt_index = _build_srt_index(fsrt_blocks)
+            f_align = (_build_index_alignment(fsubs, fsrt_index)
+                       if fsubs is not None and fsrt_index else {})
             for e, actual, detail in items:
                 ass_time = ""
                 if fsubs is not None:
                     ev = _find_dialogue(fsubs, fsrt_index, e["srt_id"],
                                         e.get("track", TRACK_ZH),
-                                        fallback_text=e.get("new_text", ""))
+                                        fallback_text=e.get("new_text", ""),
+                                        index_align=f_align)
                     if ev:
                         ass_time = f"{seconds_to_ass(ev.start/1000.0)}-{seconds_to_ass(ev.end/1000.0)}"
                 lines.append(f"### srt_id={e['srt_id']} track={e.get('track','')} "

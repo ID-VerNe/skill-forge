@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pysubs2
 
-from lib.ass_srt_pair import parse_srt, TRACK_ZH, TRACK_EN
+from lib.ass_srt_pair import parse_ass, parse_srt, pair, TRACK_ZH, TRACK_EN
 from lib import regress as rg
 from lib.log import read_log, filter_log
 from lib.paths import resolve_work_dir, report_path
@@ -47,35 +47,42 @@ def _cjk(s):
     return "".join(CJK.findall(s or ""))
 
 
-def _ms_to_key(ms):
-    """pysubs2 start(ms) → 与 srt timestamp 对齐的 2 位小数秒。"""
-    return round(ms / 1000.0, 2)
-
-
 def load_pairs(ass_path, srt_path):
-    """返回 [{srt_id, start, end, en, zh}]，按时间戳配对同一行。"""
+    """返回 [{srt_id, start, end, en, zh}]，按 SRT 块与 ASS 行的真实配对取文本。
+
+    原实现是「SRT 起点 == ASS 起点」精确相等配对，只在行边界完全一致时成立。
+    断句点分歧的素材（S06E02 实测：SRT 按句切、ASS 中文轨按语音节奏重切，
+    869 块里 727 块的起点差 >0.5s）上它会把 en/zh 大片取成空串，于是对照检查
+    报「漏译」，而真实原因是定位层配不上——诊断指向错误。
+
+    现在一律走 lib.ass_srt_pair.pair() 的顺序映射结果。**构建失败直接抛**：
+    静默退回按起点精确相等会让这个脚本在坏素材上重新产出假漏译。
+    """
     blocks = parse_srt(srt_path)
     subs = pysubs2.load(ass_path, encoding="utf-8-sig")
 
-    en_map, zh_map = {}, {}
-    for line in subs:
-        style = line.style.strip()
-        body = TAG.sub("", line.text).strip()
-        key = _ms_to_key(line.start)
-        if style == TRACK_EN:
-            en_map[key] = body
-        elif style == TRACK_ZH:
-            zh_map[key] = body
+    # pair() 要 List[AssDialogue]（带 .track），不是 pysubs2 的 SSAEvent。
+    # 传 subs.events 会在 r.track 上 AttributeError——这里单独解析一遍。
+    ass_blocks = parse_ass(ass_path)
+    paired, _ass_only = pair(ass_blocks, blocks)
+    by_srt = {}
+    for pb in paired:
+        en_rows = (pb.lines or {}).get(TRACK_EN) or []
+        zh_rows = (pb.lines or {}).get(TRACK_ZH) or []
+        by_srt[pb.srt_id] = (
+            " ".join(TAG.sub("", r.text).strip() for r in en_rows).strip(),
+            " ".join(TAG.sub("", r.text).strip() for r in zh_rows).strip(),
+        )
 
     out = []
     for b in blocks:
-        key = round(b.start, 2)
+        en, zh = by_srt.get(b.index, ("", ""))
         out.append({
             "srt_id": b.index,
-            "start": key,
+            "start": round(b.start, 2),
             "end": round(b.end, 2),
-            "en": en_map.get(key, ""),
-            "zh": zh_map.get(key, ""),
+            "en": en,
+            "zh": zh,
         })
     return out
 

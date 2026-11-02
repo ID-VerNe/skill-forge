@@ -335,12 +335,183 @@ def _nearest_ass_offset(srt_block: SrtBlock, ass_blocks: List[AssDialogue]):
     return off
 
 
+def _monotonic_fallback(srt_blocks: List[SrtBlock],
+                        ass_blocks: List[AssDialogue],
+                        already: set) -> dict:
+    """容差窗外的「顺序 + 文本」兜底配对：srt 块 -> 英文 ass 行。
+
+    为什么需要：`_match_by_time_and_text` 只认 ±TIME_TOLERANCE 窗。当 ASS 与
+    SRT 对**同一句**台词的起点相差 1~6 s（S06E02 实测集中在 4 处剪辑点，
+    T 侧在剪接后把整段向后推），窗内没有候选，整块被判空 → 非空率跌到 43%、
+    切片全废。这不是「漏译」，是**行边界 / 剪辑点分歧**，处置方式完全不同
+    （不改文本、不改时间轴）。
+
+    为什么不能简单放宽 TIME_TOLERANCE：相邻块间隔常在 0.3~0.5 s，放宽后
+    相邻块会互相抢行，制造假重复。
+
+    这里的做法：
+      ① LCS 找文本一致的锚点，按出现次序对应（重复台词也按序对各的）；
+      ② 锚点之间（含首尾）两段**条数相等**时才按序一一对应——这时顺序
+         本身就是充分证据（S06E02 实测 869 vs 869，869 块文本全一致）；
+      ③ 条数不等（真并块/拆块）才按位置比例对应，且要求文本比例达标，
+         宁可留空也不硬配一句不相干的台词；
+      ④ **同起点的多行不参与**（见下方 `_start_count` 段）：顺序映射的产物是
+         「一块 -> 一行」，面对同起点 N 行只能挑一行、静默丢掉其余，
+         会把 MULTI_SAME_LANG 这个真缺陷信号吃掉。
+
+    返回 {srt_id: (en_row, zh_row)}；已由时间窗配上的块不参与。
+    """
+    srt_sorted = sorted(srt_blocks, key=lambda b: b.start)
+    en_rows = sorted([r for r in ass_blocks if r.track == TRACK_EN],
+                     key=lambda r: r.start)
+    zh_rows = sorted([r for r in ass_blocks if r.track == TRACK_ZH],
+                     key=lambda r: r.start)
+    if not srt_sorted or not en_rows:
+        return {}
+
+    # 同起点的多行**不参与顺序映射**。理由：顺序映射的产物是「一个 srt 块 -> 一行」，
+    # 面对同起点的 N 行它只能挑一行，剩下 N-1 行被静默丢掉；而 `pair()` 的
+    # MULTI_SAME_LANG 判定恰恰依赖「同一个 matched 里同 track 有多行」——
+    # 映射把多行压成一行，那条真重复就再也报不出来了
+    # （tests/test_subtitle_polish_bugs.py 的 C2 实测：真同时间戳重复行
+    # anomalies=[]，信号彻底消失）。
+    #
+    # 同起点多行是**生产缺陷**（该删的碎片行），删它全靠 MULTI_SAME_LANG，
+    # 不能让一个只为「吸收行边界分歧」而生的兜底机制把它吃掉。这类块的起点差
+    # 本来就为 0（同时间戳），时间窗必然命中，不需要兜底——留给
+    # `_match_by_time_and_text`（它遇距离相同会**全部保留**）。
+    _start_count = {}
+    for r in en_rows:
+        _k = round(r.start, 3)
+        _start_count[_k] = _start_count.get(_k, 0) + 1
+    en_rows_unique = [r for r in en_rows if _start_count[round(r.start, 3)] == 1]
+
+    srt_keys = [normalize_for_compare(b.english_text()) for b in srt_sorted]
+    en_keys = [normalize_for_compare(r.text) for r in en_rows_unique]
+
+    # ① LCS 锚点：文本完全一致的块按出现次序对应（重复台词也按序对各的）。
+    sm = SequenceMatcher(None, srt_keys, en_keys, autojunk=False)
+    anchors = [(blk.a, blk.b, blk.size) for blk in sm.get_matching_blocks()
+               if blk.size]
+    anchor_pairs = []
+    for a0, b0, size in anchors:
+        for k in range(size):
+            anchor_pairs.append((a0 + k, b0 + k))
+
+    # ② 锚点之间（以及首尾）配对：条数相等按序对，不等按比例 + 文本校验。
+    out = {}
+
+    def link(si, ri, strict):
+        if not (0 <= si < len(srt_sorted) and 0 <= ri < len(en_rows_unique)):
+            return
+        # 第二道闸：同起点多行的那一行绝不能进兜底表。en_rows_unique 已经剔掉了，
+        # 这里再挡一次，防止将来有人误把 en_rows 传回来时 MULTI_SAME_LANG
+        # 悄无声息地消失（C2 就是这么红过）。
+        if _start_count.get(round(en_rows_unique[ri].start, 3), 0) > 1:
+            return
+        if strict:
+            ratio = _text_ratio(srt_sorted[si].english_text(),
+                                en_rows_unique[ri].text)
+            if ratio < TEXT_RATIO_THRESHOLD:
+                return      # 比例兜底配上不相干的台词，宁可留空报未配上
+        out[srt_sorted[si].index] = (si, ri)
+
+    def fill_gap(s_lo, s_hi, r_lo, r_hi):
+        """把 srt[s_lo:s_hi] 与 ass[r_lo:r_hi] 对应起来。"""
+        n_s, n_r = s_hi - s_lo, r_hi - r_lo
+        if n_s <= 0 or n_r <= 0:
+            return
+        if n_s == n_r:
+            for j in range(n_s):
+                link(s_lo + j, r_lo + j, strict=False)
+        else:
+            for j in range(n_s):
+                link(s_lo + j, r_lo + min(n_r - 1, j * n_r // n_s), strict=True)
+
+    prev_s = prev_r = -1
+    for si, ri in anchor_pairs:
+        fill_gap(prev_s + 1, si, prev_r + 1, ri)
+        link(si, ri, strict=False)
+        prev_s, prev_r = si, ri
+    fill_gap(prev_s + 1, len(srt_sorted), prev_r + 1, len(en_rows_unique))
+
+    # ③ 中文轨：该英文行在中文轨里的同起点行（ASS 双语轨同时间戳对齐）。
+    zh_by_start = {}
+    for r in zh_rows:
+        zh_by_start.setdefault(round(r.start, 3), r)
+
+    result = {}
+    for srt_id, (si, ri) in out.items():
+        en_row = en_rows_unique[ri]
+        result[srt_id] = (en_row, zh_by_start.get(round(en_row.start, 3)))
+    return result
+
+
 def pair(ass_blocks: List[AssDialogue], srt_blocks: List[SrtBlock]) -> List[PairedBlock]:
     """按 srt 块配对 ass 行，生成 PairedBlock 列表。"""
     paired = []
     used_ass = set()
+    # 第一遍：±TIME_TOLERANCE 时间窗 + 文本双校验（原有行为）
+    window_matched = {}       # srt_id -> [AssDialogue]
     for sb in srt_blocks:
-        matched = _match_by_time_and_text(sb, ass_blocks)
+        m = _match_by_time_and_text(sb, ass_blocks)
+        if m:
+            window_matched[sb.index] = m
+    # 第二遍：顺序映射兜底（吸收剪辑点 / 行边界分歧）
+    window_ids = set(window_matched)
+    fallback_pairs = _monotonic_fallback(srt_blocks, ass_blocks, set())
+    # 顺序映射是「块 ↔ 行」的全局解，可信度高于 ±0.5s 窗：窗口只比时间，
+    # 遇到剪接点会把相邻那句当成本句配进去（S06E02 的 srt 852 就是这样被
+    # 配到「it is an international job」的，文本比例 0.71 恰好过 0.6 部分匹配线）。
+    #
+    # 所以两边合成一张表，冲突时按**证据强度**裁决：
+    #   顺序映射命中同一行 → 采纳映射（窗口那一票是时间巧合）；
+    #   窗口命中的行已被映射认领、但本块映射指向别处 → 采映射；
+    #   映射没覆盖本块 → 保留窗口结果（原有行为）。
+    mapped_en = {id(v[0]) for v in fallback_pairs.values() if v[0] is not None}
+    _fallback_lookup = {}
+    for srt_id, (en_row, zh_row) in fallback_pairs.items():
+        rows = [r for r in (en_row, zh_row) if r is not None]
+        if not rows:
+            continue
+        # 窗口已经配到「同一轨道多行」= 真同时间戳重复行，`_match_by_time_and_text`
+        # 在距离相同时会**全部保留**。这种块绝不能让顺序映射覆盖：
+        # 映射是「块 -> 一行」的模型，覆盖后重复行被压成一行，
+        # MULTI_SAME_LANG 就再也报不出来（C2 实测 anomalies=[]）。
+        # 重复行的起点差本来就是 0，不需要兜底来救，窗口结果才是对的。
+        win = window_matched.get(srt_id) or []
+        _trk_count = {}
+        for r in win:
+            _trk_count[r.track] = _trk_count.get(r.track, 0) + 1
+        if any(n > 1 for n in _trk_count.values()):
+            continue
+        _fallback_lookup[srt_id] = (rows, srt_id not in window_ids)
+
+    for sb in srt_blocks:
+        matched = window_matched.get(sb.index)
+        fallback = False
+        exact = False      # 时间窗命中（起点在 ±TIME_TOLERANCE 内），不是兜底猜的
+        if sb.index in _fallback_lookup:
+            matched, fallback = _fallback_lookup[sb.index]
+        elif matched:
+            # 映射没覆盖这个块：窗口命中的行若已被映射认领给别的块，
+            # 说明这是跨块抢行，丢掉，留给兜底表报未配上。
+            matched = [r for r in matched
+                       if r.track != TRACK_EN or id(r) not in mapped_en]
+        if matched:
+            matched = list(matched)
+            # 「顺序映射有没有覆盖本块」不等于「这一块是不是真超容差」。
+            # 兜底表是按「条数相等就按序配」无条件配上的，最常见的命中恰恰是
+            # **时间窗本来就能配上的正常块**（S06E02 全片 869 块里绝大多数）。
+            # 若只看 `fallback` 标志，这些正常块会统统被打上 BOUNDARY_OFFSET
+            # （tests/test_subtitle_polish_pairing_tags.py 的 P2 实测）。
+            # 所以起点差以 ASS 侧实际行距为准，不用兜底标志推断。
+            near = _nearest_ass_offset(sb, ass_blocks)
+            # 阈值必须用 `TIME_TOLERANCE`，不能写字面量 0.5：有人调松容差时
+            # 字面量这里会悄悄失效，正常块又被误标。
+            exact = near is not None and abs(near) <= TIME_TOLERANCE
+        else:
+            matched = []
         # ONE_TO_MANY: 一个 srt 块配到多个时间戳相近但不同的行
         # 实际 matched 都是同时间戳的，MULTI_SAME_LANG 看 track 重复
         pb = PairedBlock(
@@ -379,8 +550,16 @@ def pair(ass_blocks: List[AssDialogue], srt_blocks: List[SrtBlock]) -> List[Pair
                     if 0.6 <= ratio < TEXT_RATIO_THRESHOLD:
                         anomalies.append("TIME_TEXT_DRIFT")
                         break
-        # 漏译：有英文无中文（音效块除外）
-        if pb.english and not pb.chinese:
+        # 漏译：有英文无中文（音效块除外）。
+        #
+        # 「音效块除外」这一条**必须显式写上**，不能靠 `pb.english` 恰好为空来豁免。
+        # 兜底表（_monotonic_fallback）会给音效块也配上英文行：
+        # tests/test_subtitle_polish_pairing_tags.py 的 P4 夹具里 ASS 是
+        # `[ENGINE REVS]`@1.0、SRT 是 `[ENGINE REVS]`@3.0，顺序映射把两者配上，
+        # 于是 pb.english 非空、pb.chinese 为空，旧写法照样报 ZH_MISSING——
+        # 而音效块本来就没有中文译文，这是**假漏译**。BOUNDARY_OFFSET 分支
+        # 已经加了同样的排除，这里必须一致，否则修了一半、审计员仍会看到噪声。
+        if pb.english and not pb.chinese and not sb.is_sound_effect_only():
             anomalies.append("ZH_MISSING")
         # 两边都没配上，且不是纯音效块 —— 必须再往下分两种（A1，issue v1.15）。
         #
@@ -395,13 +574,35 @@ def pair(ass_blocks: List[AssDialogue], srt_blocks: List[SrtBlock]) -> List[Pair
         #   超容差     → 轴的问题，该放宽容差或先做轴校准，**绝不能补译**
         #   真的没有行 → 素材不同版/轨缺失，该换素材
         # 合成一个标签，读的人分不出来，只会一律当「漏译」处理。
+        #
+        # 四形态判别。顺序固定：先问「有没有内容」，再问「内容是错位还是缺失」，
+        # 最后才问「配上但起点差多少」。
+        #   PAIRING_FAILED            两边都空、附近根本没行 —— 素材不同版
+        #   PAIRING_OUT_OF_TOLERANCE  两边都空、容差外有行 —— 轴有问题，要先校轴
+        #   BOUNDARY_OFFSET           配上了、但起点差超容差 —— 行边界分歧，轴没毛病
+        #   ZH_MISSING                有英文无中文
+        # 后加的 BOUNDARY_OFFSET 由 index_align 补丁的顺序映射引入：以前
+        # 「超容差但顺序/文本对得上」会落进「两边都空」被误报成要校轴，
+        # 现在真的配上了，改报更精确的「切点不同」。三形态在「两边都空」这条
+        # 路径上完整保留。
         if not pb.english and not pb.chinese and not sb.is_sound_effect_only():
             # 容差窗外最近的 ass 起点差多少：有值 → 是错位，不是缺失。
             near = _nearest_ass_offset(sb, ass_blocks)
-            if near is not None:
+            if near is not None and abs(near) <= TIME_TOLERANCE:
+                # 窗内明明有行却没配上 = 文本对不上（真缺内容 / 素材不同版），
+                # 不是轴错位。S06E02 那 47 条「配对失败」全是 off≥0.50，落不进这里。
+                anomalies.append(f"PAIRING_FAILED(srt_id={sb.index})")
+            elif near is not None:
                 anomalies.append(f"PAIRING_OUT_OF_TOLERANCE(off={near:+.2f}s)")
             else:
                 anomalies.append(f"PAIRING_FAILED(srt_id={sb.index})")
+        elif fallback and not exact and not sb.is_sound_effect_only():
+            # 顺序兜底配上的块，且起点差确实超容差：行边界 / 剪辑点分歧。
+            # 不是漏译、也不是要修轴——单列标签，既不进未配上率门禁，
+            # 也让审计员看得到这批块的起点差。
+            near = _nearest_ass_offset(sb, ass_blocks)
+            if near is not None:
+                anomalies.append(f"BOUNDARY_OFFSET(off={near:+.2f}s)")
         pb.lines = track_lines
         pb.anomalies = anomalies
         paired.append(pb)

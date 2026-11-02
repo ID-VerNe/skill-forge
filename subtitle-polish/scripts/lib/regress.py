@@ -69,6 +69,12 @@ def history(entries: list, file: str = "") -> dict:
     for e in sorted(entries, key=lambda x: x.get("ts", "")):
         if e.get("action") not in TEXT_ACTIONS:
             continue
+        # 已作废的改动不进台账：写入后又整份回滚 / 从备份恢复的批次，其日志条目
+        # 仍留在 log.jsonl（审计留痕，这是对的），但不该被当成一次真实改动。
+        # 否则同一行会显示成「连续改动」，后续轮次据此误判回归——把一条早已撤销
+        # 的旧文本当成「本轮把它改坏了」的证据。
+        if e.get("reverted"):
+            continue
         if not e.get("srt_id"):
             continue
         if file and e.get("file") != file:
