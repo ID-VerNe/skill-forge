@@ -232,15 +232,27 @@ def write_slice(out_dir: str, stem: str, idx: int, start: int, end: int,
     with open(path, "w", encoding="utf-8") as f:
         # 头注
         f.write(f"# slice {idx}: srt_id {start+1}-{end} (ass Dialogue index 0-based)\n")
+        # anomalies 与 notes 分两段写：前者是需要动手的问题，后者只是知情。
+        # 混成一段会让审计员在同一段里读到 495 条「切点不同」，把真问题淹掉
+        # （issue #24 / bug #8 的现场就是如此）。
         anomalies_in_slice = []
+        notes_in_slice = []
         for pb in paired[start:end]:
             if pb.anomalies:
                 anomalies_in_slice.append(
                     f"#   {pb.srt_id}: {', '.join(pb.anomalies)}"
                 )
+            if getattr(pb, "notes", None):
+                notes_in_slice.append(
+                    f"#   {pb.srt_id}: {', '.join(pb.notes)}"
+                )
         if anomalies_in_slice:
             f.write("# anomalies:\n")
             f.write("\n".join(anomalies_in_slice) + "\n")
+        if notes_in_slice:
+            # 明写「不需处理」，否则审计员看到 off=+3.08s 仍会当成要修轴。
+            f.write("# notes（已配上，仅知情，不需处理）:\n")
+            f.write("\n".join(notes_in_slice) + "\n")
         # 异常：该范围内 ass 有 srt 无
         if ass_only_in_range:
             f.write(f"# ASS_HAS_SRT_NONE ({len(ass_only_in_range)} 行未配对):\n")

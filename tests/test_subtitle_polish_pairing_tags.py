@@ -15,11 +15,12 @@ S06E02 的 R5 p1 读到 38 行空单元格,据此报出 38 条「漏译」,重�
 于是本文件锁住三件事:
 
   P1 有英文无中文         -> ZH_MISSING,不能是别的
-  P2 两边都空但容差外有行 -> BOUNDARY_OFFSET(off=…),不能是 ZH_MISSING
+  P2 两边都空但容差外有行 -> notes 里 BOUNDARY_OFFSET(off=…),不能是 ZH_MISSING
   P3 两边都空且附近没行   -> PAIRING_FAILED
   P4 音效块               -> 一个 pairing 标记都不打
   P5 门禁按「未配上」算,两种形态都算进分子
   P6 门禁在写盘之前 abort,不留下半份切片
+  P7 BOUNDARY_OFFSET 只进 notes,不进 anomalies(分级,issue #24)
 
 关于 P2 的期望值为什么从 PAIRING_OUT_OF_TOLERANCE 改成 BOUNDARY_OFFSET
 ────────────────────────────────────────────────────────────────────
@@ -39,6 +40,19 @@ S06E02 的 R5 p1 读到 38 行空单元格,据此报出 38 条「漏译」,重�
 让路**:BOUNDARY_OFFSET 的含义更精确(「配上了、轴没毛病、只是切点不同」),若仍
 报成「超容差」,审计员会去校轴,而校轴解决不了断句点分歧。三形态在「两边都空」
 这条路径上仍然完整保留,P3/P5 仍然锁着它们。
+
+关于 P7:为什么光有 P2 还不够
+────────────────────────────
+P2 原本查的是 `pb.anomalies`,v1.16 改查 `pb.notes`。**这不是「换个地方找同一个
+东西」,而是分级本身被改了**:BOUNDARY_OFFSET 从「要处理的问题」降为「仅需知情
+的信息」,标识符名字保持不变(v1.15 裁决:只降级不改名)。
+
+依据是实测数量级差:S06E02 上它出现 **495 次**,而真正的配对失败是 **0 次**。
+混在同一个字段里,任何「有 anomalies 就 abort / 人工复核」的规则都会在 S06E02
+上每次都全量阻断——等于变相让 727 个**已经配上**的块一起 abort。
+
+P7 因此是**双向**断言:notes 里必须有、anomalies 里必须没有。只写前一半的话,
+一个手滑同时往两个列表 append 的实现照样能过。
 
 
 跑法:
@@ -152,6 +166,11 @@ def _pair(tmp):
 
 
 def _tags(pb):
+    """该块命中的「要处理的」配对标记。
+
+    只查 anomalies、**故意不查 notes**:notes 里的 BOUNDARY_OFFSET 不是问题,
+    把它算进来会让 P1/P4 这类「不该有任何配对问题」的断言失去意义。
+    """
     return [x for x in pb.anomalies if x.startswith("PAIRING")
             or x == "ZH_MISSING"]
 
@@ -172,6 +191,10 @@ def t_p2_boundary_offset(tmp):
 
     期望 BOUNDARY_OFFSET 而不是 PAIRING_OUT_OF_TOLERANCE:index_align 补丁的顺序
     映射会把它**配上**,「两边都空」的前提已不成立。详见文件头 P2 说明。
+
+    ⚠️ 从 v1.16 起 BOUNDARY_OFFSET 记在 `pb.notes` 而不是 `pb.anomalies`
+    (issue #24 / bug #8)。本测试查的是 notes——不是「换个地方找同一个东西」,
+    而是锁住分级本身:它**不该**出现在 anomalies 里。见 P7。
     """
     paired = _pair(tmp)
     p = [x for x in paired if x.srt_id == 3][0]
@@ -181,8 +204,8 @@ def t_p2_boundary_offset(tmp):
     # 配上却报未配上,门禁会拿假数据 abort 整轮。
     assert not [a for a in p.anomalies if a.startswith("PAIRING_FAILED")], (
         f"srt 3 已被顺序映射配上,不该报未配上:{p.anomalies}")
-    off_tags = [a for a in p.anomalies if a.startswith("BOUNDARY_OFFSET")]
-    assert off_tags, f"srt 3 应报 BOUNDARY_OFFSET,实得 {p.anomalies}"
+    off_tags = [a for a in p.notes if a.startswith("BOUNDARY_OFFSET")]
+    assert off_tags, f"srt 3 的 notes 应有 BOUNDARY_OFFSET,实得 notes={p.notes}"
     # 偏移量必须带出来,否则读的人只知道「有分歧」不知道「差多少」
     m = re.search(r"off=([+-]?[\d.]+)s", off_tags[0])
     assert m, f"标记里没有 off 值:{off_tags[0]}"
@@ -275,6 +298,42 @@ def t_p6_gate_before_write(tmp):
 
 
 # ─────────────────────────────────────────────────────────────
+# P7:分级(issue #24 / bug #8)
+# ─────────────────────────────────────────────────────────────
+
+def t_p7_boundary_offset_is_info_not_problem(tmp):
+    """BOUNDARY_OFFSET 必须是 info,不能进 anomalies。
+
+    ## 为什么这条要单独锁
+
+    它是本文件里唯一「断言某个标记**不存在**于 anomalies」的测试。
+    P2 只能证明「标志出现在 notes 里」——但一个手滑同时往两个列表里 append
+    的实现照样能过 P2,而后果是致命的:S06E02 实测 BOUNDARY_OFFSET 495 次、
+    真失败 0 次,同时进 anomalies 就等于「有 anomalies 就 abort」的规则
+    每次都全量阻断。
+
+    所以这里**双向**锁死:notes 里必须有,anomalies 里必须没有。
+    只改分级不改名是 v1.15 的明确裁决,标识符本身保持 BOUNDARY_OFFSET。
+    """
+    paired = _pair(tmp)
+    p = [x for x in paired if x.srt_id == 3][0]
+    assert [a for a in p.notes if a.startswith("BOUNDARY_OFFSET")], (
+        f"srt 3 的 notes 里应有 BOUNDARY_OFFSET,实得 notes={p.notes}")
+    leaked = [a for a in p.anomalies if a.startswith("BOUNDARY_OFFSET")]
+    assert not leaked, (
+        f"BOUNDARY_OFFSET 混进了 anomalies:{leaked}。"
+        f"它不是要处理的事——S06E02 上它出现 495 次、真失败 0 次,"
+        f"进 anomalies 会让门禁每次都全量阻断。")
+    # 反向保险:真问题仍然必须在 anomalies 里,别把整个 anomalies 清空了事
+    p1 = [x for x in paired if x.srt_id == 2][0]
+    assert "ZH_MISSING" in p1.anomalies, (
+        f"srt 2 的 ZH_MISSING 被误降级了:{p1.anomalies}")
+    p3 = [x for x in paired if x.srt_id == 4][0]
+    assert [a for a in p3.anomalies if a.startswith("PAIRING_FAILED")], (
+        f"srt 4 的 PAIRING_FAILED 被误降级了:{p3.anomalies}")
+
+
+# ─────────────────────────────────────────────────────────────
 
 def main():
     print("=" * 70)
@@ -283,11 +342,13 @@ def main():
     tmp = tempfile.mkdtemp(prefix="pairtag_")
     try:
         test("P1 有英文无中文 -> ZH_MISSING", lambda: t_p1_missing_translation(tmp))
-        test("P2 起点差超容差 -> BOUNDARY_OFFSET 且带 off", lambda: t_p2_boundary_offset(tmp))
+        test("P2 起点差超容差 -> notes 带 BOUNDARY_OFFSET 与 off", lambda: t_p2_boundary_offset(tmp))
         test("P3 附近无行 -> PAIRING_FAILED", lambda: t_p3_pairing_failed(tmp))
         test("P4 音效块不打配对标记", lambda: t_p4_sound_effect_not_flagged(tmp))
         test("P5 门禁分子含两种形态", lambda: t_p5_gate_counts_both_shapes(tmp))
         test("P6 门禁在写盘前 abort", lambda: t_p6_gate_before_write(tmp))
+        test("P7 BOUNDARY_OFFSET 只进 notes 不进 anomalies",
+             lambda: t_p7_boundary_offset_is_info_not_problem(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print()

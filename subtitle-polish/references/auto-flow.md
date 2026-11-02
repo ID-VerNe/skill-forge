@@ -63,8 +63,11 @@ python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slice
 - 按 srt 块序号切，~700 块/份 + 100 块 overlap。
 - 输出 `.subtitle-polish/slices/<stem>_p<n>.txt`，一 block 一行：
   `<srt_id> | <ass_time> | <英文> | <中文> | <注释>`
-- 头注列异常标记：ASS_HAS_SRT_NONE / ZH_MISSING / PAIRING_OUT_OF_TOLERANCE(off=±N.NNs) / PAIRING_FAILED(srt_id=N) / ONE_TO_MANY / MULTI_SAME_LANG / ASS_TRACK_OVERWRITE
-  （`ZH_MISSING`=英文在中文空，真漏译；`PAIRING_OUT_OF_TOLERANCE`=有内容但超出 ±0.5s，轴错位；`PAIRING_FAILED`=真的没有对应行。三者都不该补译。见 `pipeline-spec.md` 异常标记表。）
+- 头注分两段写，**问题与信息不混排**：
+  - `# anomalies:` 列需要处理的：ASS_HAS_SRT_NONE / ZH_MISSING / PAIRING_OUT_OF_TOLERANCE(off=±N.NNs) / PAIRING_FAILED(srt_id=N) / ONE_TO_MANY / MULTI_SAME_LANG / ASS_TRACK_OVERWRITE
+    （`ZH_MISSING`=英文在中文空，真漏译；`PAIRING_OUT_OF_TOLERANCE`=有内容但超出 ±0.5s，轴错位；`PAIRING_FAILED`=真的没有对应行。三者都不该补译。）
+  - `# notes（已配上，仅知情，不需处理）:` 列 `BOUNDARY_OFFSET(off=±N.NNs)` —— 配上了，只是行边界/剪辑点分歧，**别校轴、别补译**。
+  - 依据：S06E02 实测 `BOUNDARY_OFFSET` 495 次、真失败 0 次。混成一段会让审计员看见 495 条「差 3 秒」而以为整份素材都要校轴，同时把真问题淹掉。见 `pipeline-spec.md` 异常标记表。
 - **两道门禁先过再写盘**：① 整份非空率 < 50% → 整份作废；② 未配上率 > 10% → abort 并列 srt_id 与形态构成。
   顺序固定（先空再零星），反过来会让全空切片先报「未配上 100%」。
   **门禁不许绕过**：过不去说明轴或素材有问题，先修再切。

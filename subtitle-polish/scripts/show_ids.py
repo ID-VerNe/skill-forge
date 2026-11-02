@@ -72,6 +72,7 @@ def build_rows(ass_path: str, srt_path: str) -> tuple:
             "zh": (pb.chinese or "").strip(),
             "note": (pb.note or "").strip(),
             "anomalies": list(pb.anomalies or []),
+            "notes": list(getattr(pb, "notes", None) or []),
         })
     rows.sort(key=lambda r: r["srt_id"])
     return rows, ass_only, unknown
@@ -216,6 +217,10 @@ def main() -> int:
             print("      NOTE: " + _clip(r["note"], args.width))
         if r["anomalies"]:
             print("       ! " + "；".join(r["anomalies"]))
+        # notes 用不同前缀（·）而不是 !：这不是问题，是「已配上、仅知情」。
+        # 同一符号会把 495 条切点分歧和真失败画成一样，读的人只能一律当告警处理。
+        if r.get("notes"):
+            print("       · " + "；".join(r["notes"]))
     print(f"[*] {len(keep)} 条（总 {len(rows)} 块）", file=sys.stderr)
     return 0
 

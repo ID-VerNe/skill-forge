@@ -140,7 +140,27 @@ class PairedBlock:
     english: str = ""
     chinese: str = ""
     note: str = ""
+    # 需要处理的问题。**只放 actionable 项**：AXIS_MISMATCH 类
+    # （PAIRING_OUT_OF_TOLERANCE / PAIRING_FAILED）、漏译（ZH_MISSING）、
+    # 生产缺陷（MULTI_SAME_LANG / ASS_TRACK_OVERWRITE / ONE_TO_MANY）、
+    # 待人工核查（TIME_TEXT_DRIFT）。
     anomalies: List[str] = field(default_factory=list)
+    # 平级**信息**，不是问题。放「已经配上了、但值得知情」的事实，例如
+    # BOUNDARY_OFFSET（行边界/剪辑点分歧，轴没毛病）。
+    #
+    # ## 为什么必须和 anomalies 分家（issue #24 / bug #8）
+    #
+    # 不只为了可读性。S06E02 实测 BOUNDARY_OFFSET 出现 **495 次**、
+    # 真正的失败 **0 次**。放在同一个字段里，任何「有 anomalies 就 abort /
+    # 人工复核」的规则都会在 S06E02 上**每次都全量阻断**，等于变相让 727 个
+    # 块都 abort —— 一个「其实都配上了」的素材被自己的告警机制卡死。
+    #
+    # 所以判定口径是**语义**而非数量：这条标记表示「出了需要动手的事吗」。
+    # BOUNDARY_OFFSET 表示「配上了，两侧只是切点不同」，不需要动手，
+    # 就不该进 anomalies。名字保持不变（v1.15 裁决：只降级不改名）——
+    # 改名要动测试断言、pipeline-spec、历史日志口径，收益只是可读性，
+    # 而真正的问题是分级不是名字。
+    notes: List[str] = field(default_factory=list)
     # 用于修复脚本定位：track -> AssDialogue
     lines: dict = field(default_factory=dict)  # track -> List[AssDialogue]
 
@@ -521,7 +541,8 @@ def pair(ass_blocks: List[AssDialogue], srt_blocks: List[SrtBlock]) -> List[Pair
             ass_time=f"{_ass_time_str(sb.start)}-{_ass_time_str(sb.end)}",
         )
         track_lines = {}
-        anomalies = []
+        anomalies = []   # 需要动手的
+        info = []        # 只需知情的（见 PairedBlock.notes 的注释）
         for ab in matched:
             track_lines.setdefault(ab.track, []).append(ab)
             used_ass.add(id(ab))
@@ -585,6 +606,14 @@ def pair(ass_blocks: List[AssDialogue], srt_blocks: List[SrtBlock]) -> List[Pair
         # 「超容差但顺序/文本对得上」会落进「两边都空」被误报成要校轴，
         # 现在真的配上了，改报更精确的「切点不同」。三形态在「两边都空」这条
         # 路径上完整保留。
+        #
+        # ⚠️ 这四形态**不是同一级**，别按名字长得像就塞同一个列表（bug #8）：
+        #   anomalies（要动手）：PAIRING_OUT_OF_TOLERANCE / PAIRING_FAILED / ZH_MISSING
+        #   notes    （只知情）：BOUNDARY_OFFSET
+        # 判据是「出了需要处理的事吗」。前三个都要处理（校轴 / 换素材 / 补译），
+        # 第四个只是两侧切点不同、内容已经配上。S06E02 实测它出现 495 次而真失败
+        # 0 次——混在一起会让「有 anomalies 就 abort」的规则每次都全量阻断，
+        # 等于把 727 个已配上的块一并 abort 掉。
         if not pb.english and not pb.chinese and not sb.is_sound_effect_only():
             # 容差窗外最近的 ass 起点差多少：有值 → 是错位，不是缺失。
             near = _nearest_ass_offset(sb, ass_blocks)
@@ -598,13 +627,15 @@ def pair(ass_blocks: List[AssDialogue], srt_blocks: List[SrtBlock]) -> List[Pair
                 anomalies.append(f"PAIRING_FAILED(srt_id={sb.index})")
         elif fallback and not exact and not sb.is_sound_effect_only():
             # 顺序兜底配上的块，且起点差确实超容差：行边界 / 剪辑点分歧。
-            # 不是漏译、也不是要修轴——单列标签，既不进未配上率门禁，
-            # 也让审计员看得到这批块的起点差。
+            # 不是漏译、也不是要修轴——不进 anomalies（它不是需要动手的事），
+            # 改记 info。见下面 `pb.notes` 处的完整理由。
             near = _nearest_ass_offset(sb, ass_blocks)
             if near is not None:
-                anomalies.append(f"BOUNDARY_OFFSET(off={near:+.2f}s)")
+                # 名字保持 BOUNDARY_OFFSET 不变（v1.15 裁决：只降级不改名）。
+                info.append(f"BOUNDARY_OFFSET(off={near:+.2f}s)")
         pb.lines = track_lines
         pb.anomalies = anomalies
+        pb.notes = info
         paired.append(pb)
     # ASS_HAS_SRT_NONE: ass 行没被任何 srt 块匹配
     all_matched_ids = {id(ab) for pb in paired for trk in pb.lines.values() for ab in trk}
