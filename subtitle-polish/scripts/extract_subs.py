@@ -54,7 +54,10 @@ def probe(media):
            "-show_entries",
            "stream=index,codec_name:stream_tags=language,title:stream_disposition=default,forced",
            "-of", "json", media]
-    out = subprocess.run(cmd, capture_output=True, text=True)
+    # issue #27：显式按 UTF-8 解码，避免中文 Windows 的 GBK 默认编码把含中文的
+    # ffprobe 报错/流标题解成乱码。
+    out = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                         errors="replace")
     if out.returncode != 0:
         raise SystemExit("ffprobe 失败：\n" + (out.stderr or "")[-600:])
     import json
@@ -133,7 +136,8 @@ def extract(media, streams, out_dir, fmt, only=None):
         dst = os.path.join(out_dir, name)
         cmd = [ffmpeg, "-y", "-v", "error", "-i", media,
                "-map", "0:%d" % s["index"]] + codec_args + [dst]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                           errors="replace")
         if r.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) < 200:
             print("  [skip] s:%d %s -> 抽取失败 %s"
                   % (k, s["codec"], (r.stderr or "").strip()[-160:]))
@@ -164,7 +168,8 @@ def run_axis(media, picked, out_dir, asr_words=None):
         cmd += ["--asr-words", asr_words]
 
     print("\n判轴（一次 ASR 比对 %d 条候选）" % len(picked))
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                       errors="replace")
     out = (r.stdout or "") + (r.stderr or "")
     for line in out.splitlines():
         if line.startswith(("[axis]", "  轴族", "    ", "  →", "  [cred]")):

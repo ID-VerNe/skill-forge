@@ -108,6 +108,14 @@ python <skill>/scripts/timeline_gate.py ./subs --json gate.json
 
 (a) 和 (b) 是一条的两面：只要报告里还写着「通过」，读者就不会去看那行小字。
 
+`round_orchestrator --report` 的时间轴结论**以凭据为准，不以 `--init` 时的 `--media` 为准**（issue #28）：
+
+- 凭据新鲜 → 按 `axis.verdict` 写 PASS / FAIL / AMBIGUOUS；
+- `--init` 没给 `--media` 但凭据记录过片源 → 用凭据里的路径复核「没换片」，不要写 UNVERIFIED；
+- 凭据缺失或失效 → 才写 UNVERIFIED，并在「本次未覆盖」里列出失效原因。
+
+这样「先跑文本轮、后补验轴」的批次也能在最终报告里如实写成 PASS。
+
 ## 与修复动作的联动
 
 `align_patch` 改完时间轴后调 `credential.touch_patch()`：

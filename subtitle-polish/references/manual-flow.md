@@ -70,6 +70,8 @@ python <skill>/scripts/extract_slice.py <ass> [<srt>] --out .subtitle-polish/sli
 - 用户若要同步改英文轨 → 另开一批，fixes.json 里 `track=英文`，同 srt_id 定位英文行。`final_new` 写正确的英文台词。
 - SRT 源**不改动**（skill 不写 SRT）。若用户要改 SRT，自行用编辑器改，skill 不介入。
 
+若整条素材**没有独立人工 SRT**（英文轨本身就是 whisper 转录），自动审校的默认疗程又不跑第 6 类，这些 ASR 听写错误会静默留在英文轨。`round_orchestrator --report` 的「本次未覆盖」会为此类素材加一条提示：建议以 `--with-spelling` 重跑或人工抽查英文轨（issue #30）。派生 SRT 仍是听写结果时，`--init` 加 `--asr-transcribed` 标记，报告同样会提示。
+
 **ASR 错误的最终责任在用户**——skill 不做**用词**核对，无法验证"原话到底是哪个词"。用户给的纠正就是权威，主 agent 不要凭语音相似度反驳用户判断（如"fifth toe 与 fat arse 语音差很远"这种保留意见可以提，但最终按用户说的写）。注意这条只针对「哪个词」，**时间轴**（什么时候说的）必须核对，见 `align-audit.md`。
 
 ### 同源连环误译的扩展

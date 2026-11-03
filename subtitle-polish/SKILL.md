@@ -162,6 +162,7 @@ python <skill>/scripts/timeline_gate.py <ass> --media <片源>        # 凭据�
 详见 `references/align-audit.md` §7。
 
 无片源时第三条跑不了,但必须在报告里写明「本次未验时间轴」,不能默认它是对的。
+`round_orchestrator --report` 读字幕旁的 `<episode>.ts.json` 凭据:事后补验过轴就按凭据写 PASS/FAIL/AMBIGUOUS,不再只看 `--init` 时冻结的 `--media`。
 
 `cross_check` 会输出撞车预警(新译文 ≈ ±3 邻块现有中文)。误报率实测为 0,
 **每条预警都要人看**;但它召回只有 4/15(其余是「同场景换句」「缩译掩盖漏译」,
@@ -258,7 +259,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 - **第 8 类白名单是默认值,不是禁区**:`母头/公头/处女座/夫妻肺片/大陆架/台湾地区` 等词在 L4 白名单里,默认判「不是问题」。agent 通读后若认为确实该改,只能写 L3 并给理由,**不得自行生成替换词绕过白名单**;要改白名单本身得改 `references/inclusive-language.md` 并由 `tests/test_subtitle_polish_inclusive.py` 交叉校验。
 - **判断归 agent,脚本只定位**(适用于全部 8 类):`scan_seed.py` 出的锚点只表示「这里出现了某种形态」,不表示「这里是问题」;`scan_inclusive.py` 返回 0 条候选也不代表干净,只代表词表没命中。**任何一类都不许拿脚本命中当结论**。全文通读与最终判定由并行 subagent 做,分工与切分规则见 `references/subagent-delegation.md`。
 - **不 Edit ASS**:所有修改走脚本。**例外**:相邻 srt 块时间差 < 0.5s 时脚本 `_find_dialogue` 取最近也分不开(dry-run 会报"撞车预警"),允许破例 Edit ASS 兜底,但必须用 `apply_fixes.py --manual-log` 子命令补记 log.jsonl,不能手写 JSON。详见 `references/manual-flow.md` 兜底节。
-- **srt 是权威英文源**(除拼写错误,srt 与 ass 同源,拼写靠子 agent 判断)。**ASR 听写错误**(如 `big closet`→`big chested`)算英文源本身错,默认只改中文轨,英文轨改不改是另一次决定,SRT 源始终不动。详见 `references/manual-flow.md` ASR 节。
+- **srt 是权威英文源**(除拼写错误,srt 与 ass 同源,拼写靠子 agent 判断)。**ASR 听写错误**(如 `big closet`→`big chested`)算英文源本身错,默认只改中文轨,英文轨改不改是另一次决定,SRT 源始终不动。详见 `references/manual-flow.md` ASR 节。若英文轨是 whisper/ASR 转录(无独立人工 SRT;派生 SRT 场景 `--init` 时加 `--asr-transcribed` 标记),报告的「本次未覆盖」会明确提示 ASR 听写错误风险,建议以 `--with-spelling` 重跑或人工抽查英文轨。
 - **派生 SRT 与 ASS 英文轨同源**:无独立 SRT 源时,`extract_slice.py` 从 ASS 英文轨派生的 `.srt` **就是权威英文源**,只是换了容器。因此第 6 类(原文拼写)不能拿「SRT 与 ASS 英文不一致」当证据——两者逐字相同;whisper 转录本身听错的内容算源错,默认只改中文轨,不重写英文。派生不改 ASS、不进成品目录,可用 `--no-derive-srt` 关闭。
 - **异常标记**:提取脚本自动标 ASS_HAS_SRT_NONE 等,这些本身是审计线索。`MULTI_SAME_LANG` 在配对算法去重后,只有真同时间戳重复行才标(不再因 ±0.5s 容差误配产生)。
 - **不要幻觉**:没把握说某行是问题就别报;但「判过了、认为不是问题」要写成 `false_positive` 记下来——清单与规则靠它迭代,沉默等于让清单只增不减。
