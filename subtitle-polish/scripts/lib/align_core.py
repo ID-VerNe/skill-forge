@@ -239,7 +239,54 @@ def mad_of(vals, center):
     return median([abs(v - center) for v in vals])
 
 
-def robust_reject(pairs, k_mad=6.0, floor=1.5):
+OUTLIER_NOISE = "aligner_noise_candidate"   # 孤立离群：更可能是对齐器单字锚定噪声
+OUTLIER_STEP = "real_step_candidate"        # 连续离群：更像真实剪辑点阶跃/轴漂移
+OUTLIER_UNKNOWN = "unclassified"            # 首/末锚点等无法判别的情形
+
+
+def _classify_outliers(pairs, rejected_by_pos, cluster_gap=30.0):
+    """给每个离群点标 `isolation` / `outlier_kind`（issue #29）。
+
+    判别只看**相邻锚点是否也离群**，不看 delta 大小：
+      - isolated：左右相邻锚点都正常 → 孤立单行，更可能是 forced-aligner
+        在单字锚定时把词锚到别处（实测 −15.25 s 的那条，独立重转写后
+        发声时刻就落在字幕起点 ±1.2 s 内）。
+      - clustered：相邻锚点同样离群、且时间差在 `cluster_gap` 内 → 连续
+        多行一起偏，才更像真实的剪辑点阶跃或轴漂移。
+      - edge：处在首/末锚点（缺一侧邻点）→ 无法判别，标 unclassified。
+
+    **这里只做归类，不参与剔除**。阈值与 keep 集合完全由 `robust_reject`
+    原来的口径决定，PASS/FAIL 不受影响。
+    """
+    n = len(pairs)
+    order = sorted(range(n), key=lambda i: pairs[i][0])
+    rank = {i: k for k, i in enumerate(order)}
+    counts = {"isolated": 0, "clustered": 0, "edge": 0}
+    kind_counts = {OUTLIER_NOISE: 0, OUTLIER_STEP: 0, OUTLIER_UNKNOWN: 0}
+    for pos, rec in rejected_by_pos.items():
+        k = rank[pos]
+        prev_pos = order[k - 1] if k > 0 else None
+        next_pos = order[k + 1] if k + 1 < n else None
+
+        near = []
+        for other in (prev_pos, next_pos):
+            if other is not None and other in rejected_by_pos:
+                if abs(pairs[other][0] - pairs[pos][0]) <= cluster_gap:
+                    near.append(other)
+        if near:
+            isolation, kind = "clustered", OUTLIER_STEP
+        elif prev_pos is None or next_pos is None:
+            isolation, kind = "edge", OUTLIER_UNKNOWN
+        else:
+            isolation, kind = "isolated", OUTLIER_NOISE
+        rec["isolation"] = isolation
+        rec["outlier_kind"] = kind
+        counts[isolation] += 1
+        kind_counts[kind] += 1
+    return counts, kind_counts
+
+
+def robust_reject(pairs, k_mad=6.0, floor=1.5, cluster_gap=30.0):
     """按中位/MAD 剔除「文本与音频不一致」的离群点。
 
     剔除对象是 ASR 听错、译文漏词、片头片尾噪声等——它们的 delta 不代表
@@ -251,35 +298,52 @@ def robust_reject(pairs, k_mad=6.0, floor=1.5):
     E02 的 whisper 剔 43、qwen 剔 50，其中最大 delta 达 −19.75 s——这种量级
     到底是真的文本错位、还是门禁阈值设错了，只看计数永远答不上来。
 
+    issue #29：每条离群点额外带 **机器可读** 的 `isolation`（isolated /
+    clustered / edge）与 `outlier_kind`（aligner_noise_candidate /
+    real_step_candidate / unclassified）。孤立离群更可能是 forced-aligner
+    的单字锚定噪声，报告里据此提示「建议抽查音频」，但**不改变剔除口径**，
+    也不下「一定是错轴」的结论。
+
     info["thr_mode"] 说明阈值是哪个档生效的，因为这直接决定这条判据的性质：
       - "floor"：mad 太小，`k_mad*mad` 低于 1.5 s 硬下限，实际卡的是 floor。
         **此时 k_mad 参数完全没起作用**，改它不会有任何变化——这是最容易
         误判调参方向的地方。
       - "k_mad"：正常按 MAD 倍数在卡。
+
+    `cluster_gap` 是「连续离群」的时间邻域（秒）：相邻锚点也离群、但相隔
+    超过这个距离时，不并成一段阶跃，避免字幕稀疏区里两个无关离群被误连。
     """
     ys = [p[1] for p in pairs]
     if not ys:
         return [], {"med": 0.0, "mad": 0.0, "thr": 0.0, "thr_mode": "floor",
                     "dropped": 0, "drop_idx": [], "rejected": [],
-                    "max_abs_dev": 0.0}
+                    "max_abs_dev": 0.0, "cluster_gap": cluster_gap,
+                    "isolation_counts": {"isolated": 0, "clustered": 0, "edge": 0},
+                    "kind_counts": {OUTLIER_NOISE: 0, OUTLIER_STEP: 0,
+                                    OUTLIER_UNKNOWN: 0}}
     med = median(ys)
     mad = mad_of(ys, med)
     k_thr = k_mad * mad
     thr = max(floor, k_thr)
     keep, rejected = [], []
-    for p in pairs:
+    rejected_by_pos = {}
+    for pos, p in enumerate(pairs):
         dev = p[1] - med
         if abs(dev) <= thr:
             keep.append(p)
         else:
             # 带偏差值与方向：正=音频晚于字幕，负=字幕晚于音频。
             # 只给 idx 和 delta，审计员还得自己回去减中位数。
-            rejected.append({
+            rec = {
                 "idx": p[2] if len(p) > 2 else None,
                 "start": round(p[0], 3),
                 "delta": round(p[1], 4),
                 "dev": round(dev, 4),
-            })
+            }
+            rejected.append(rec)
+            rejected_by_pos[pos] = rec
+    iso_counts, kind_counts = _classify_outliers(
+        pairs, rejected_by_pos, cluster_gap=cluster_gap)
     rejected.sort(key=lambda r: -abs(r["dev"]))
     info = {
         "med": med,
@@ -294,6 +358,10 @@ def robust_reject(pairs, k_mad=6.0, floor=1.5):
         "drop_idx": [r["idx"] for r in rejected],
         "rejected": rejected,
         "max_abs_dev": abs(rejected[0]["dev"]) if rejected else 0.0,
+        # issue #29：判别结果同时给计数，下游报告不必自己再扫一遍列表。
+        "cluster_gap": cluster_gap,
+        "isolation_counts": iso_counts,
+        "kind_counts": kind_counts,
     }
     return keep, info
 
@@ -305,6 +373,10 @@ def format_reject_table(info, limit=20):
     **返回全文，不截断调用方要落盘的部分**——截断只作用于显示，
     这与 D1（报告不许截断）是同一条纪律：给人看的地方可以省行，
     留证据的地方不能。
+
+    issue #29：每行带 `isolation` / `outlier_kind`，并在存在孤立离群时
+    追加一句提示——孤立离群只说明「可能」是对齐器单字锚定噪声，
+    建议抽查音频确认；它不是「一定错轴」，也不改变 PASS/FAIL。
     """
     n = info.get("dropped", 0)
     if not n:
@@ -316,15 +388,30 @@ def format_reject_table(info, limit=20):
                if mode == "floor"
                else "k_mad×MAD（MAD=%.3f）" % (info.get("mad") or 0.0)))
     out = [head,
-           "  最大偏差 %.2f s" % (info.get("max_abs_dev") or 0.0),
-           "  偏差最大的 %d 条（dev=delta−中位，正=音频晚于字幕）："
-           % min(limit, n)]
+           "  最大偏差 %.2f s" % (info.get("max_abs_dev") or 0.0)]
+    iso = info.get("isolation_counts") or {}
+    if iso:
+        out.append("  判别：isolated %d 条（可能的对齐器单字锚定噪声）"
+                   " / clustered %d 条（更像真实阶跃）"
+                   " / edge %d 条（无法判别）"
+                   % (iso.get("isolated", 0), iso.get("clustered", 0),
+                      iso.get("edge", 0)))
+    out.append("  偏差最大的 %d 条（dev=delta−中位，正=音频晚于字幕）："
+               % min(limit, n))
     for r in (info.get("rejected") or [])[:limit]:
-        out.append("    idx=%-6s start=%-9.3f delta=%+.3f dev=%+.3f"
+        out.append("    idx=%-6s start=%-9.3f delta=%+.3f dev=%+.3f  %s / %s"
                    % (r["idx"] if r["idx"] is not None else "?",
-                      r["start"], r["delta"], r["dev"]))
+                      r["start"], r["delta"], r["dev"],
+                      r.get("isolation", "-"),
+                      r.get("outlier_kind", "-")))
     if n > limit:
         out.append("    …（共 %d 条，完整清单见 --json 的 stats.reject.rejected）" % n)
+    if iso.get("isolated"):
+        out.append("  提示：isolated 条目**可能**是 forced-aligner 单字锚定噪声，"
+                   "建议抽查对应音频确认，"
+                   "不要据此认定「一定是错轴」；")
+        out.append("        需要二次确认时，可对该段音频用更长上下文重转写复核"
+                   "（可选，本脚本不自动执行）。")
     return out
 
 

@@ -368,16 +368,41 @@ def build_report(args, stats, n_rows, engine, compare, axis_res=None):
                     else "`k_mad`×MAD",
                     rej.get("max_abs_dev") or 0.0))
         L.append("")
-        L.append("| idx | start(s) | delta | dev=delta−中位 |")
-        L.append("|---|---|---|---|")
+        L.append("| idx | start(s) | delta | dev=delta−中位 | isolation | outlier_kind |")
+        L.append("|---|---|---|---|---|---|")
         for r in rej.get("rejected") or []:
-            L.append("| %s | %.3f | %+.3f | %+.3f |"
+            L.append("| %s | %.3f | %+.3f | %+.3f | %s | %s |"
                      % (r["idx"] if r["idx"] is not None else "?",
-                        r["start"], r["delta"], r["dev"]))
+                        r["start"], r["delta"], r["dev"],
+                        r.get("isolation", "-"), r.get("outlier_kind", "-")))
         L.append("")
         L.append("> dev 为正 = 音频发声晚于字幕显示。若整批 dev 同号且量级接近，"
                  "多是一次整体错位（该修轴），不是噪声（该剔）；"
                  "若正负混杂且量级分散，才是文本不一致。")
+        L.append("")
+        iso = rej.get("isolation_counts") or {}
+        if iso:
+            L.append("判别口径（`isolation` / `outlier_kind`，机器可读，见 `--json` 的 "
+                     "`stats.reject`）：")
+            L.append("")
+            L.append("| isolation | 含义 | outlier_kind | 怎么读 |")
+            L.append("|---|---|---|---|")
+            L.append("| `isolated` | 左右相邻锚点都正常 | "
+                     "`aligner_noise_candidate` | **可能**是 forced-aligner "
+                     "单字锚定噪声；建议抽查音频确认，**不是**「一定错轴」 |")
+            L.append("| `clustered` | 相邻锚点同样离群（%g s 内） | "
+                     "`real_step_candidate` | 更像真实的剪辑点阶跃/轴漂移 |"
+                     % float(rej.get("cluster_gap") or 0.0))
+            L.append("| `edge` | 处在首/末锚点，缺一侧邻点 | `unclassified` | "
+                     "无法判别，需要人看 |")
+            L.append("")
+            L.append("> 本次 isolated **%d** 条 / clustered **%d** 条 / edge **%d** 条。"
+                     % (iso.get("isolated", 0), iso.get("clustered", 0),
+                        iso.get("edge", 0)))
+            L.append("> 判别只用于**提示**：离群剔除口径与 PASS/FAIL 结论都不因此改变。"
+                     "对 isolated 条目，建议抽查对应音频确认，**不要**据此认定「一定是错轴」；"
+                     "需要二次确认时，可对该段音频用更长上下文重转写复核"
+                     "（可选，本脚本不自动执行）。")
     L.append("")
     # 结案口径钉在开头：这份报告的结论只有三态，不写「基本对上」这类模糊话。
     L.append("## 时间轴状态")
