@@ -1356,6 +1356,8 @@ def _find_paired_srt(ass_path: str) -> str:
     2. ass 同目录的 原始srt/ 下同名 .srt
     3. ass 所在目录的父目录的 原始srt/ 下同名 .srt（项目根常见布局）
     4. ass 所在目录的父目录同名 .srt
+    5. `<work_dir>/derived/<stem>.srt`（issue #26：无独立 SRT 源时从 ASS
+       英文轨派生的派生物。放最后，用户真实给的 .srt 永远优先）
     """
     base = os.path.splitext(ass_path)[0]
     name = os.path.basename(base)
@@ -1366,6 +1368,7 @@ def _find_paired_srt(ass_path: str) -> str:
         os.path.join(ass_dir, "原始srt", name + ".srt"),
         os.path.join(parent, "原始srt", name + ".srt"),
         os.path.join(parent, name + ".srt"),
+        os.path.join(resolve_work_dir(), "derived", name + ".srt"),
     ]
     for c in candidates:
         if os.path.exists(c):

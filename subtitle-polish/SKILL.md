@@ -1,7 +1,7 @@
 ---
 name: subtitle-polish
-version: 1.13.0
-description: 字幕精校,支持手动/对轴/自动审校三种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。对轴模式:拿片源对齐时间轴(align_audit/align_patch/align_audit --compare)。自动审校模式:输入 ASS 双语成品 + SRT 源,按 10(默认)或 11 轮疗程逐轮审计修复,每轮一个 batch_id、快照可整轮回滚;加 --auto 走无监管自动跑完并出总账。**审计判断一律由并行 subagent 通读全文后自己做,脚本(scan_seed/scan_inclusive)只出定位线索、不当判据**;修复由脚本执行(dry-run/accept/rollback)。也支持 /subtitle-polish 命令。
+version: 1.14.0
+description: 字幕精校,支持手动/对轴/自动审校三种模式。用户说"精校字幕"、"字幕审计"、"修字幕"时触发。手动模式:用户直接给修改指令,主 agent 翻译成 fixes.json 后 dry-run→accept→verify 一气呵成。对轴模式:拿片源对齐时间轴(align_audit/align_patch/align_audit --compare)。自动审校模式:输入 ASS 双语成品 + SRT 源(无独立 SRT 源时自动从 ASS 英文轨派生),按 10(默认)或 11 轮疗程逐轮审计修复,每轮一个 batch_id、快照可整轮回滚;加 --auto 走无监管自动跑完并出总账。**审计判断一律由并行 subagent 通读全文后自己做,脚本(scan_seed/scan_inclusive)只出定位线索、不当判据**;修复由脚本执行(dry-run/accept/rollback)。也支持 /subtitle-polish 命令。
 ---
 
 # subtitle-polish 字幕精校 Skill
@@ -19,13 +19,18 @@ description: 字幕精校,支持手动/对轴/自动审校三种模式。用户�
 ## 适用范围
 
 - 输入:ASS 双语成品(英文行 + 中文行成对,track 取值 `英文/中文/注释`)+ SRT 源(权威英文)
+- **无独立 SRT 源也可跑**:若 ASS 自带 `英文` 轨(常见于 whisper 转录:英文轨是权威英文、中文轨是译文),
+  省略 srt 时 `extract_slice.py` 会自动从英文轨派生一份 SRT 到 `.subtitle-polish/derived/`,
+  作为整条 pipeline 的权威源。派生物不改 ASS、不进成品目录;`--no-derive-srt` 可显式关闭。
+  口径见 `references/pipeline-spec.md`「无独立 SRT 源」节
 - **时间轴契约**:输入字幕的时间轴**必须可信,且必须能证明**。证明形式是 `<episode>.ts.json` 凭据,
   由 `align_audit --write-credential` 产出,由 `timeline_gate.py` 在阶段 0 校验。
   没有凭据 = 没验 = 不许按「通过」结案。详见 `references/timeline-credential.md`
+  **派生 SRT 不提供任何时间轴证据**:有没有 SRT 源都要照常对音频跑 `align_audit`,不许伪造 PASS
 - 可选:片源(MKV/MP4 或已抽好的 wav)。给了才能验时间轴,详见 `references/align-audit.md`
 - **翻译前的第 0 步**:若手上只有片源,先用 `extract_subs.py` 抽内嵌字幕流 + `align_audit --compare` 判轴,
   拿到一条与音频同轴的英文 SRT 再开工。时间轴应在翻译前建立,不是交付前抢救——见 `references/build-timeline.md`
-- 不适用:无 SRT 源(拒绝运行)、VTT/单语成品、SRT 双语(不处理)
+- 不适用:ASS 无英文轨且无 SRT 源(无法派生,拒绝运行)、VTT/单语成品、SRT 双语(不处理)
 - 修复手段:文本改走 extract_slice / apply_fixes / global_replace,时间改走 align_patch,
   **不直接 Edit ASS**
 
@@ -62,7 +67,10 @@ ass 与 srt 可以是目录或单文件:
    | 都没命中 | 自动审校模式(默认) | — |
 
 2. **解析 prompt**:提取 ass 路径、srt 路径、片源路径、可选项目背景。
-3. **校验**:自动审校模式与手动模式若无 srt 路径 → 停下,告知"需要 SRT 源才能跑"。手动模式下若无具体修改指令 → 停下,告知"手动模式需要你告诉我要改什么"。对轴模式若无片源 → 停下,告知"对轴必须有片源"。
+3. **校验**:自动审校模式与手动模式若无 srt 路径 → 先看 ASS 有没有 `英文` 轨:有则自动派生
+   SRT(`extract_slice.py` 默认行为,派生物在 `.subtitle-polish/derived/`);没有才停下,告知
+   "ASS 无英文轨且无 SRT 源,无法派生"。用户可用 `--no-derive-srt` 显式关闭自动派生,
+   此时仍需手给 srt。手动模式下若无具体修改指令 → 停下,告知"手动模式需要你告诉我要改什么"。对轴模式若无片源 → 停下,告知"对轴必须有片源"。
 4. **按模式读对应 reference 再动手**,不要凭记忆执行:
    - 手动 → `references/manual-flow.md`(M0→M6)
    - 对轴 → `references/align-flow.md`(A0→A5 骨架) + `references/build-timeline.md`(判轴优先) + `references/align-audit.md`(判据/引擎/修复手段)
@@ -201,6 +209,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
                                 #   / timeline_gate / precheck_timeline
                                 #   / scan_seed(出锚点) / scan_inclusive(词表判定)
                                 #   / structure_check(结构前置门禁) / show_ids(对照表)
+                                #   / derive_srt(无独立源时从 ASS 英文轨派生 SRT)
                                 #   / round_orchestrator + lib/
 ```
 
@@ -208,7 +217,8 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 
 | 脚本 | 用途 | 模式 |
 |---|---|---|
-| `extract_slice.py` | ASS+SRT 配对切片,标异常 | 自动审校 |
+| `extract_slice.py` | ASS+SRT 配对切片,标异常;省略 srt 时自动派生 | 自动审校 |
+| `derive_srt.py` | 从 ASS 英文轨派生 SRT(派生物默认落 `.subtitle-polish/derived/`) | 自动审校 |
 | `precheck_punct.py` | 中文行标点归一(默认 dry-run) | 自动审校 |
 | `pre_audit.py` | 三轨预审(需显式开启) | 自动审校 |
 | `scan_seed.py` | 出锚点（命中词/白名单候选/感叹·贬义·主权形态 + 上下文段），贴进审计 prompt。**只定位，不判断** | 自动审校(R11, 也用于 1–7 类查漏) |
@@ -230,6 +240,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 项目产物(不进 skill):
 ```
 .subtitle-polish/
+├── derived/           # 无独立 SRT 源时从 ASS 英文轨派生的 .srt（中间产物）
 ├── slices/            # 切片
 ├── reports/           # audit-report.md / detail / dry-run.md / optional-fixes.md
 ├── fixes.json
@@ -248,5 +259,6 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 - **判断归 agent,脚本只定位**(适用于全部 8 类):`scan_seed.py` 出的锚点只表示「这里出现了某种形态」,不表示「这里是问题」;`scan_inclusive.py` 返回 0 条候选也不代表干净,只代表词表没命中。**任何一类都不许拿脚本命中当结论**。全文通读与最终判定由并行 subagent 做,分工与切分规则见 `references/subagent-delegation.md`。
 - **不 Edit ASS**:所有修改走脚本。**例外**:相邻 srt 块时间差 < 0.5s 时脚本 `_find_dialogue` 取最近也分不开(dry-run 会报"撞车预警"),允许破例 Edit ASS 兜底,但必须用 `apply_fixes.py --manual-log` 子命令补记 log.jsonl,不能手写 JSON。详见 `references/manual-flow.md` 兜底节。
 - **srt 是权威英文源**(除拼写错误,srt 与 ass 同源,拼写靠子 agent 判断)。**ASR 听写错误**(如 `big closet`→`big chested`)算英文源本身错,默认只改中文轨,英文轨改不改是另一次决定,SRT 源始终不动。详见 `references/manual-flow.md` ASR 节。
+- **派生 SRT 与 ASS 英文轨同源**:无独立 SRT 源时,`extract_slice.py` 从 ASS 英文轨派生的 `.srt` **就是权威英文源**,只是换了容器。因此第 6 类(原文拼写)不能拿「SRT 与 ASS 英文不一致」当证据——两者逐字相同;whisper 转录本身听错的内容算源错,默认只改中文轨,不重写英文。派生不改 ASS、不进成品目录,可用 `--no-derive-srt` 关闭。
 - **异常标记**:提取脚本自动标 ASS_HAS_SRT_NONE 等,这些本身是审计线索。`MULTI_SAME_LANG` 在配对算法去重后,只有真同时间戳重复行才标(不再因 ±0.5s 容差误配产生)。
 - **不要幻觉**:没把握说某行是问题就别报;但「判过了、认为不是问题」要写成 `false_positive` 记下来——清单与规则靠它迭代,沉默等于让清单只增不减。

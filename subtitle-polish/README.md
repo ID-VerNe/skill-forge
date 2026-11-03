@@ -126,6 +126,7 @@ python scripts/round_orchestrator.py --run <stamp> --rollback-to r03   # 整轮�
 
 ```
 .subtitle-polish/
+├── derived/           # 无独立 SRT 源时从 ASS 英文轨派生的 .srt（中间产物）
 ├── slices/            # 切片（审计中间产物）
 ├── reports/           # audit-report.md / detail / dry-run.md / precheck-punct.md / verify-fixes.md
 ├── fixes.json         # 主修清单（1–6 类）
@@ -154,6 +155,6 @@ python tests/test_subtitle_polish_rounds.py       # 轮次编排 / 定格 / 快�
 
 ## 范围与边界
 
-- **适用**：ASS 双语成品 + SRT 源。track 取值 `英文/中文/注释`。
-- **不适用**：无 SRT 源（拒绝运行）、VTT / 单语成品、SRT 双语。
+- **适用**：ASS 双语成品 + SRT 源；或 ASS 自带 `英文` 轨、无独立 SRT 源（自动派生，见 `references/pipeline-spec.md`）。track 取值 `英文/中文/注释`。
+- **不适用**：ASS 无英文轨且无 SRT 源（无法派生）、VTT / 单语成品、SRT 双语。
 - 其他语言对要改 track 名需改 prompts 模板与脚本配置。

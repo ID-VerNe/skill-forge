@@ -11,6 +11,7 @@
 ## M1. 配对
 
 同自动阶段 1。解析 prompt 提取 ass/srt 路径，单文件直接用、多文件同名配对。手动模式通常单文件。
+没有独立 srt 且 ASS 自带 `英文` 轨时，不阻断：M2 的 `extract_slice.py` 会自动派生（见下）。
 
 ## M2. 接收修改指令
 
@@ -25,10 +26,11 @@
 > 事后要回答「当时看到的是什么」得靠它。同目录两套并存才是真问题（基准分裂）。
 
 ```bash
-python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slices/
+python <skill>/scripts/extract_slice.py <ass> [<srt>] --out .subtitle-polish/slices/
 ```
 
-参数是 `--out`（输出目录），不是 `--outdir`。
+参数是 `--out`（输出目录），不是 `--outdir`。省略 `<srt>` 时默认从 ASS 英文轨派生
+到 `.subtitle-polish/derived/<stem>.srt`；`--no-derive-srt` 关闭派生（此时必须有 srt）。
 
 ### 指令形态
 

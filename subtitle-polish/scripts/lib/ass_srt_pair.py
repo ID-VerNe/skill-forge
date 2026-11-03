@@ -25,7 +25,7 @@ except ImportError:
         "pysubs2 未安装。skill 应已自动安装；手动: pip install pysubs2"
     )
 
-from .time_fmt import ass_to_seconds, srt_to_seconds
+from .time_fmt import ass_to_seconds, srt_to_seconds, seconds_to_srt
 
 TIME_TOLERANCE = 0.5  # 秒，时间戳模糊匹配容差
 TEXT_RATIO_THRESHOLD = 0.85  # 文本相似度阈值
@@ -261,6 +261,51 @@ def parse_ass(path: str) -> List[AssDialogue]:
             text_field=text_field,
         ))
     return result
+
+
+def derive_srt_path(ass_path: str, work_dir: str = "") -> str:
+    """无独立 SRT 源时的派生落点：`<work_dir>/derived/<stem>.srt`。
+
+    派生物是**工作目录里的中间文件**，不是成品：它不进字幕成品目录，
+    也不改 ASS 英文轨。放在 derived/ 子目录是为了和 slices/reports 区分，
+    清理工作目录时一并丢弃，不会有人把它误当成用户提供的权威源。
+    """
+    from .paths import resolve_work_dir
+    stem = os.path.splitext(os.path.basename(ass_path))[0]
+    return os.path.join(resolve_work_dir(work_dir), "derived", stem + ".srt")
+
+
+def derive_srt_from_ass(ass_path: str, out_path: str) -> int:
+    """从 ASS 的英文轨派生一份 SRT（时间戳 + 文本逐行对应）。
+
+    复用 `parse_ass()` 的轨道解析与文本清洗，不新写 ASR——ASS 里的英文轨
+    本身就是 whisper 转录的权威英文，派生只是把它换成管线认识的 SRT 容器。
+    只取 `track == 英文` 的行，中文/注释轨不参与；ASS 原文件只读不写。
+
+    输出固定为 UTF-8 无 BOM + `\\n` 换行 + 从 1 开始的连续序号，同一份 ASS
+    反复派生得到逐字节相同的结果（可复现）。返回派生的块数。
+    """
+    blocks = [b for b in parse_ass(ass_path) if b.track == TRACK_EN]
+    if not blocks:
+        raise SystemExit(
+            f"[!] 无法从 ASS 派生 SRT：{ass_path} 里没有英文轨（track={TRACK_EN}）。\n"
+            f"    请提供独立的 .srt 源，或检查样式名是否能映射到英文轨"
+            f"（支持 英文/eng/english/en 等写法）。")
+    # SRT 要求按时间递增；同起点时保持 ASS 原始顺序（稳定排序）。
+    blocks.sort(key=lambda b: b.start)
+    parts = []
+    for i, b in enumerate(blocks, 1):
+        parts.append(str(i))
+        parts.append(f"{seconds_to_srt(b.start)} --> {seconds_to_srt(b.end)}")
+        parts.append(b.text)
+        parts.append("")
+    content = "\n".join(parts)
+    parent = os.path.dirname(os.path.abspath(out_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    return len(blocks)
 
 
 def _text_ratio(a: str, b: str) -> float:
