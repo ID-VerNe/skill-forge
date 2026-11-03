@@ -53,13 +53,18 @@
 - 多文件：用 `lib/ass_srt_pair.pair_dirs(ass_dir, srt_dir)` 同名配对。
 - 单文件：直接用 `pair_files(ass_path, srt_path)`。
 - 输出 `[(ass_path, srt_path), ...]` 给用户确认。
+- **没有独立 SRT 源时**：只要 ASS 自带 `英文` 轨，跳过第 1 步的 srt 路径解析，
+  直接进入第 2 步让 `extract_slice.py` 自动派生（派生物在 `.subtitle-polish/derived/`）。
+  ASS 无英文轨且无 srt 才停下。口径见 `pipeline-spec.md`「无独立 SRT 源」节。
 
 ## 2. 提取切片
 
 对每对文件跑：
 ```bash
-python <skill>/scripts/extract_slice.py <ass> <srt> --out .subtitle-polish/slices/
+python <skill>/scripts/extract_slice.py <ass> [<srt>] --out .subtitle-polish/slices/
 ```
+- 省略 `<srt>` 时自动从 ASS 英文轨派生一份到 `.subtitle-polish/derived/<stem>.srt`
+  再切片；`--no-derive-srt` 关闭该行为（此时必须有 srt）。用户显式给了 `<srt>` 则不派生。
 - 按 srt 块序号切，~700 块/份 + 100 块 overlap。
 - 输出 `.subtitle-polish/slices/<stem>_p<n>.txt`，一 block 一行：
   `<srt_id> | <ass_time> | <英文> | <中文> | <注释>`

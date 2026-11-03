@@ -7,7 +7,12 @@ ass + srt -> 按 srt 块序号切，~700 块/份 + 100 块 overlap。
 头注列异常标记。
 
 用法:
-  python extract_slice.py <ass> <srt> [--out DIR] [--blocks N] [--overlap N]
+  python extract_slice.py <ass> [<srt>] [--out DIR] [--blocks N] [--overlap N]
+                         [--derive-srt | --no-derive-srt]
+
+未给 <srt> 时，默认从 ASS 的英文轨派生一份 SRT 到
+`<work_dir>/derived/<stem>.srt`，作为整条 pipeline 的权威源；
+`--no-derive-srt` 关闭该行为（此时没有 SRT 源就报错退出）。
 """
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.ass_srt_pair import (
     pair_files, pair, TRACK_EN, TRACK_ZH, TRACK_NOTE,
+    derive_srt_from_ass, derive_srt_path,
 )
 from lib.time_fmt import seconds_to_ass
 
@@ -267,9 +273,32 @@ def write_slice(out_dir: str, stem: str, idx: int, start: int, end: int,
     return path
 
 
+def resolve_srt_source(ass_path: str, srt_path: str, derive: bool = True) -> str:
+    """确定本次切片使用的 SRT 源。
+
+    - 用户显式给了 srt：直接用，**绝不重复派生**（用户提供的文件优先）。
+    - 没给 srt、derive=True：从 ASS 英文轨派生到 `.subtitle-polish/derived/`。
+    - 没给 srt、derive=False：报错退出（这是显式关闭派生后的行为）。
+    """
+    if srt_path:
+        return srt_path
+    if not derive:
+        raise SystemExit(
+            "[!] 未提供 SRT 源，且 --no-derive-srt 已关闭自动派生。\n"
+            "    无独立 SRT 时，从 ASS 英文轨派生是默认路径（去掉 --no-derive-srt）；\n"
+            "    或者显式给出 <srt> 路径。")
+    out = derive_srt_path(ass_path)
+    n = derive_srt_from_ass(ass_path, out)
+    print(f"[*] 未提供 SRT，已从 ASS 英文轨派生 {n} 块 -> {out}")
+    print("    （派生物只放 .subtitle-polish/derived/，不改英文轨、不进成品目录）")
+    return out
+
+
 def run(ass_path: str, srt_path: str, out_dir: str,
-        blocks_per: int = DEFAULT_BLOCKS, overlap: int = DEFAULT_OVERLAP) -> list:
+        blocks_per: int = DEFAULT_BLOCKS, overlap: int = DEFAULT_OVERLAP,
+        derive_srt: bool = True) -> list:
     """主流程。返回切片文件路径列表。"""
+    srt_path = resolve_srt_source(ass_path, srt_path, derive_srt)
     ass_blocks, srt_blocks = pair_files(ass_path, srt_path)
     if not srt_blocks:
         print(f"[!] SRT 解析为空: {srt_path}", file=sys.stderr)
@@ -325,12 +354,16 @@ def run(ass_path: str, srt_path: str, out_dir: str,
 def main():
     ap = argparse.ArgumentParser(description="ass+srt -> 按 srt 块切片")
     ap.add_argument("ass", help="ass 文件路径")
-    ap.add_argument("srt", help="srt 文件路径")
+    ap.add_argument("srt", nargs="?", default="",
+                    help="srt 文件路径；省略时从 ASS 英文轨派生")
     ap.add_argument("--out", default=".subtitle-polish/slices", help="输出目录")
     ap.add_argument("--blocks", type=int, default=DEFAULT_BLOCKS, help="每份块数")
     ap.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP, help="overlap 块数")
+    ap.add_argument("--derive-srt", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="省略 srt 时是否从 ASS 英文轨派生（默认开；--no-derive-srt 关闭）")
     args = ap.parse_args()
-    run(args.ass, args.srt, args.out, args.blocks, args.overlap)
+    run(args.ass, args.srt, args.out, args.blocks, args.overlap, args.derive_srt)
 
 
 if __name__ == "__main__":

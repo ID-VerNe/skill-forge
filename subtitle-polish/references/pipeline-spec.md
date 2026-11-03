@@ -3,12 +3,37 @@
 ## 输入
 
 - **ass 成品**：双语 ASS（英文行 + 中文行成对，同一时间戳）。track 取值固定 `英文/中文/注释`。
-- **srt 源**：权威英文源（纯英文）。srt 必须提供，否则 skill 拒绝运行。
+- **srt 源**：权威英文源（纯英文）。优先用用户提供的 `.srt`；**没有独立 srt 时**，只要 ASS 自带 `英文` 轨，`extract_slice.py` 会自动派生一份到 `.subtitle-polish/derived/<stem>.srt`（见下节）。只有「ASS 无英文轨且无 srt 源」才拒绝运行。
 - **SRT 权威边界**：srt 是权威英文源，**只用于配对定位与英文原文展示，skill 不写 SRT**。例外是"原文拼写错误"类（第 6 类）——srt 与 ass 英文同源，srt 不能作权威，靠子 agent 判断。**ASR 听写错误**（如 `big closet`→`big chested`、`fifth toe`→`fat arse`）算英文源本身错，skill 默认只改中文轨，英文轨改不改是另一次决定（见 `manual-flow.md` ASR 节），SRT 源**始终不动**。
 - **调用**：
   ```
   /subtitle-polish 精校：<ass_dir_or_file> 其对应的srt是 <srt_dir_or_file>
   ```
+
+## 无独立 SRT 源（whisper 转录）的派生规则
+
+适用场景：英文轨本身就是 whisper 转录的权威英文，用户没有独立 `.srt`，ASS 是唯一素材。
+这是合法的「权威英文 + 中文译文」结构，不是「缺源」。
+
+- **入口**：
+  - 管线内自动：`extract_slice.py <ass>`（省略 `<srt>`）默认先派生再切片；
+  - 单独派生：`derive_srt.py <ass> [--out PATH]`。
+- **派生逻辑**：复用 `parse_ass()` 的轨道解析，只取 `track == 英文` 的行；按起点稳定排序，
+  序号从 1 连续，时间用 `seconds_to_srt()` 转 `HH:MM:SS,CCC`，文本用 `parse_ass()` 已清洗的
+  内容（去 ASS 标签、`\N` 折成空格）。中文/注释轨不参与。**不新写 ASR。**
+- **落点**：`<work_dir>/derived/<stem>.srt`（默认 `.subtitle-polish/derived/`）。
+  是工作目录里的中间产物：**不进成品目录、不改 ASS 英文轨**。
+- **可复现**：UTF-8 无 BOM、`\n` 换行、序号连续；同一份 ASS 反复派生逐字节相同。
+- **显式关闭**：`extract_slice.py --no-derive-srt`。关闭后没有 srt 源就报错退出。
+- **已提供 srt 时不派生**：用户给的 `.srt` 永远优先；`apply_fixes._find_paired_srt` 也把
+  `derived/` 放在查找顺序的最后，不会盖过同目录真实 `.srt`。
+- **权威口径**：派生 `.srt` 与 ASS 英文轨**逐字同源**，它就是权威英文源，只是换了容器。
+  因此不能拿「SRT 与 ASS 英文不一致」当第 6 类拼写错误的证据——两者本应一致；
+  **whisper 转录本身听错的英文算源本身错**，默认只改中文轨，英文轨改不改是另一次决定，
+  SRT 源始终不动（与 `SKILL.md` 权威边界同一口径）。
+- **时间轴**：派生 SRT **不提供任何时间轴证据**。有没有 SRT 源都要照常对音频跑
+  `align_audit`（见 `align-audit.md`）；无片源则在报告里记 `UNVERIFIED`。
+  **不许因为「反正从 ASS 派生，时间戳一致」就伪造 PASS。**
 
 ## 配对规则
 
@@ -119,6 +144,7 @@
 所有产物放项目根 `.subtitle-polish/`：
 ```
 .subtitle-polish/
+├── derived/         # 无独立 SRT 源时从 ASS 英文轨派生的 .srt（中间产物）
 ├── slices/          # 切片文件（审计中间产物）
 ├── reports/
 │   ├── audit-report.md       # 主审计报告（小节式，严重度排序）
