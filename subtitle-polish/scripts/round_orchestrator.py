@@ -50,6 +50,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import verdict as V
+from lib import credential as CRED
 from lib.log import read_log
 from lib.paths import (resolve_work_dir, orphan_logs, assert_no_orphan_log,
                        assert_report_location)
@@ -172,9 +173,13 @@ def _structure_gate(ass: str) -> bool:
         print("[!] 找不到 structure_check.py，跳过结构门禁（不等于通过）",
               file=sys.stderr)
         return True
+    # issue #27：`text=True` 会按 locale.getpreferredencoding() 解码子进程 stdout。
+    # 中文 Windows 上那是 GBK(cp936)，而 structure_check 输出 UTF-8，中文会变乱码。
+    # 退出码不受影响，但「为什么放行」这句给人看的摘要会不可读。显式按 UTF-8 解码。
     try:
         p = subprocess.run([sys.executable, script, "--ass", ass, "--quiet"],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=120)
     except Exception as e:            # noqa: BLE001
         print(f"[!] 结构检查未能执行（{e}），跳过门禁（不等于通过）",
               file=sys.stderr)
@@ -195,7 +200,8 @@ def _structure_gate(ass: str) -> bool:
 
 def init_run(wd: str, ass: str, srt: str, plan: list, *,
              media: str = "", gated: bool = True, stamp: str = "",
-             skip_structure_check: bool = False) -> str:
+             skip_structure_check: bool = False,
+             asr_transcribed: bool = False) -> str:
     """建 runs/<stamp>：manifest + round-plan.json + r00 快照 + logs/r00.jsonl。
 
     ## R0 之前先过结构门禁（C3b）
@@ -238,6 +244,9 @@ def init_run(wd: str, ass: str, srt: str, plan: list, *,
             "with_inclusive": any(r["id"] == "r11" for r in plan),
             "with_spelling": any(6 in r["scope"] for r in plan),
             "gated": bool(gated),
+            # issue #30：显式标记「英文轨是 ASR(whisper) 转录」。派生 SRT 场景下
+            # srt 路径非空，仅凭路径分不出是不是听写结果，需要 init 时记一笔。
+            "asr_transcribed": bool(asr_transcribed),
         },
         "created": datetime.now().isoformat(timespec="seconds"),
         "frozen": None,
@@ -581,6 +590,78 @@ def _md_cell(text, limit: int = 0) -> str:
     return s
 
 
+def _timeline_state(m: dict) -> dict:
+    """报告里的时间轴结论：以 sidecar 凭据为准，manifest.media 只作补充。
+
+    issue #28：`media` 是 `--init` 时冻结进 manifest 的。无片源开工、跑完文本轮
+    之后才补验轴时，manifest 里永远是空，报告却一直写「UNVERIFIED（无片源）」。
+    这里改读 `<episode>.ts.json`：
+
+      1. 凭据存在且新鲜 -> 按 axis.verdict 写 PASS / FAIL / AMBIGUOUS；
+      2. manifest 没记片源但凭据记过 -> 用凭据里的路径复核「没换片」；
+      3. 两者都没有 -> 才写 UNVERIFIED。
+    """
+    ass = m.get("ass") or ""
+    media = m.get("media") or ""
+    data = CRED.load(ass) if ass else None
+    if data and not media:
+        rec = (data.get("media") or {}).get("path") or ""
+        if rec:
+            media = rec
+    if not ass:
+        return {"code": V.UNVERIFIED, "label": V.label(V.UNVERIFIED),
+                "reason": "没有 ASS 路径，无法定位凭据", "has_credential": False,
+                "media": "", "sidecar": ""}
+    res = CRED.check(ass, media=media or None)
+    code = res["verdict"]
+    reasons = res.get("reasons") or []
+    return {
+        "code": code,
+        "label": V.label(code),
+        "reason": reasons[0] if reasons else "",
+        "has_credential": bool(res.get("data")),
+        "media": media,
+        "sidecar": (res.get("detail") or {}).get("sidecar", ""),
+    }
+
+
+def _timeline_top_text(st: dict) -> str:
+    """顶栏一句话。PASS/FAIL/AMBIGUOUS 与 UNVERIFIED 的成因要分开写。"""
+    if st["code"] == V.PASS:
+        return "时间轴 PASS（凭据已验）"
+    if st["code"] == V.FAIL:
+        return "时间轴 FAIL（凭据判轴有问题）"
+    if st["code"] == V.AMBIGUOUS:
+        return "时间轴 AMBIGUOUS（验了但判不出）"
+    if st["has_credential"]:
+        return "时间轴 UNVERIFIED（凭据失效：%s）" % (st["reason"] or "原因未记录")
+    if st["media"]:
+        return "时间轴 UNVERIFIED（有片源但未验轴）"
+    return "时间轴 UNVERIFIED（无片源）"
+
+
+def _timeline_gap_text(st: dict) -> str:
+    """「本次未覆盖」里的时间轴条目。只有 UNVERIFIED 才算未覆盖。"""
+    if st["has_credential"]:
+        return ("时间轴 —— 凭据失效（%s），判 UNVERIFIED（不是通过）"
+                % (st["reason"] or "原因未记录"))
+    if st["media"]:
+        return "时间轴 —— 有片源但未验轴，判 UNVERIFIED（不是通过）"
+    return "时间轴 —— 无片源，判 UNVERIFIED（不是通过）"
+
+
+def _is_asr_transcribed(m: dict) -> bool:
+    """英文轨是不是 whisper/ASR 转录（issue #30）。
+
+    两种来源都算：init 时显式 `--asr-transcribed`（派生 SRT 场景，路径非空但
+    内容仍是听写结果），或根本没提供独立 SRT（没有权威英文源，只能是听写）。
+    这种素材即使中文轨全对，第 6 类（原文拼写）不跑也会把 ASR 错误留在英文轨。
+    """
+    if (m.get("opts") or {}).get("asr_transcribed"):
+        return True
+    return not (m.get("srt") or "").strip()
+
+
 def render_report(wd: str, stamp, extra_stamps=None) -> str:
     """出总账。`stamp` 可传单个 run 名，也可传列表（D3：`--runs a,b`）。
 
@@ -641,6 +722,8 @@ def _render_single_report(wd: str, stamp: str) -> str:
     churn = _churn_by_batch(wd)
     conflicts = _conflicts(wd)
     ledger = _parse_ledger(read_log(wd))
+    # issue #28：时间轴结论从 sidecar 凭据读，不再只看 init 时冻结的 media。
+    tl = _timeline_state(m)
 
     L = [f"# 最终报告 — {os.path.basename(m['ass'])}", ""]
     top = [f"轮次 {len(done)}/{len(rounds)} 已跑完"]
@@ -649,8 +732,7 @@ def _render_single_report(wd: str, stamp: str) -> str:
     if skipped:
         top.append(f"skip {len(skipped)}")
     top.append(f"净改动 {total} 条")
-    if not m.get("media"):
-        top.append("时间轴 UNVERIFIED（无片源）")
+    top.append(_timeline_top_text(tl))
     if m.get("frozen"):
         top.append(f"**已定格于 {m['frozen']['at']}：{m['frozen']['reason']}**")
     L += ["> " + " / ".join(top), ""]
@@ -764,13 +846,17 @@ def _render_single_report(wd: str, stamp: str) -> str:
     gaps = []
     if 6 not in scopes:
         gaps.append("第 6 类（原文拼写）—— 改英文轨需显式 `--with-spelling`")
+        if _is_asr_transcribed(m):
+            gaps.append("英文轨为 whisper 转录（init 未提供独立 SRT）："
+                        "可能存在 ASR 听写错误，建议以 `--with-spelling` 重跑"
+                        "或人工抽查英文轨")
     if not any(r["id"] == "r09" for r in rounds):
         gaps.append("第 7 类（低严重度）—— 需显式 `--with-low`")
     if not any(r["id"] == "r11" for r in rounds):
         gaps.append("第 8 类（性别中立/敏感词）—— 需显式 `--with-inclusive`")
-    if not m.get("media"):
-        gaps.append("时间轴 —— 无片源，判 UNVERIFIED（不是通过）")
-    L += [f"- {g}" for g in gaps] if gaps else ["无（本轮全部开启且有片源）。"]
+    if tl["code"] == V.UNVERIFIED:
+        gaps.append(_timeline_gap_text(tl))
+    L += [f"- {g}" for g in gaps] if gaps else ["无（本轮全部开启且时间轴已验）。"]
     L += ["", "> 默认不跑的类别是**设计决定**，不是遗漏。不写出来，"
               "下一轮看到「跑完了」会以为这些也审过了。", ""]
 
@@ -895,14 +981,18 @@ def _render_cross_run(sums) -> list:
     所以这张表把「不可比」先摆在最前面，而不是让人自己发现。
     """
     L = ["## 本次合并了 %d 次跑测" % len(sums), "",
-         "| run | ASS | 片源 | 轮次 | 已跑 | 回滚 | skip | 净改动 | 定格 |",
+         "| run | ASS | 时间轴 | 轮次 | 已跑 | 回滚 | skip | 净改动 | 定格 |",
          "|---|---|---|---|---|---|---|---|---|"]
+    states = {}
     for m in sums:
         rounds = m["rounds"]
         done = [r for r in rounds if r["verdict"] != "pending"]
+        # issue #28：时间轴按凭据写，不再用 manifest.media 的「有/无」代替结论。
+        st = _timeline_state(m)
+        states[m["stamp"]] = st
         L.append("| %s | %s | %s | %d | %d | %d | %d | %d | %s |" % (
             m["stamp"], os.path.basename(m.get("ass") or ""),
-            "有" if m.get("media") else "**无（UNVERIFIED）**",
+            st["label"],
             len(rounds), len(done),
             sum(1 for r in rounds if r["verdict"] == "rollback"),
             sum(1 for r in rounds if r["verdict"] == "skip"),
@@ -915,10 +1005,12 @@ def _render_cross_run(sums) -> list:
     if len({os.path.normcase(os.path.abspath(m.get("ass") or "")) for m in sums}) > 1:
         warn.append("各 run 的 ASS 不是同一个文件——净改动条数**不可直接相加**，"
                     "它们是不同输入上的改动，合并后只会得到没有意义的和。")
-    if len({m.get("media") and os.path.normcase(os.path.abspath(m["media"])) or ""
-            for m in sums}) > 1:
-        warn.append("片源不一致（含「有的有、有的无」）——时间轴结论不可比，"
-                    "UNVERIFIED 的那次没有被检查过，不等于通过。")
+    codes = {st["code"] for st in states.values()}
+    if len(codes) > 1:
+        detail = "、".join("%s=%s" % (k, states[k]["label"])
+                          for k in sorted(states))
+        warn.append("时间轴结论不一致（%s）——UNVERIFIED 的那次没有被检查过，"
+                    "不等于通过，不能与 PASS 相提并论。" % detail)
     plans = {tuple(r["id"] for r in m["rounds"]) for m in sums}
     if len(plans) > 1:
         warn.append("轮次表不同（`--with-low/--with-inclusive/--with-spelling` 开关不一致）"
@@ -971,6 +1063,9 @@ def main():
     ap.add_argument("--skip-structure-check", action="store_true",
                     help="放行结构门禁（C3b）。仅在确认 ABORT 是误报时用，"
                          "放行理由写进报告")
+    ap.add_argument("--asr-transcribed", action="store_true",
+                    help="英文轨是 whisper/ASR 转录（无独立人工 SRT 源）。"
+                         "报告会在「本次未覆盖」提示 ASR 听写错误风险")
     args = ap.parse_args()
 
     wd = resolve_work_dir(args.work_dir)
@@ -1008,7 +1103,8 @@ def main():
             return 1
         stamp = init_run(wd, args.ass, args.srt, plan, media=args.media,
                          stamp=args.stamp,
-                         skip_structure_check=args.skip_structure_check)
+                         skip_structure_check=args.skip_structure_check,
+                         asr_transcribed=args.asr_transcribed)
         print(f"[*] run {stamp} → {run_dir(wd, stamp)}")
         print(render_plan(plan, args.ass))
         return 0

@@ -55,7 +55,8 @@ def tail_voice(media, start, total):
            "-i", media, "-af", "silencedetect=noise=-35dB:d=1.5",
            "-f", "null", "-"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        r = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=180)
     except Exception:
         return None
     err = r.stderr or ""

@@ -102,6 +102,12 @@ token 不是本项目的稀缺资源，**精确**才是目标。这条是硬约�
 `UNVERIFIED` 不进闸：没有片源跑不了闸门属常态，只在总账顶栏写「本次未验时间轴」
 （`lib/verdict.py` 的语义是「没验」，不是「通过」）。
 
+**总账的时间轴结论读凭据，不读 manifest 的 `media`**（issue #28）。`--init` 没带
+`--media`、跑完文本轮后才用 `align_audit --write-credential` 补验的批次，manifest 里
+`media` 仍是空；只看它会把已验成 PASS 的批次误写成 UNVERIFIED。`round_orchestrator
+--report` 按 `<episode>.ts.json` 写：凭据新鲜 → PASS/FAIL/AMBIGUOUS；manifest 没记
+片源但凭据记过 → 用凭据里的路径复核「没换片」；两者都无 → 才写 UNVERIFIED。
+
 ## 4. 定格规则（无监管模式）
 
 | 触发 | 动作 |
@@ -210,6 +216,14 @@ python <skill>/scripts/round_orchestrator.py --run <stamp> --rollback-to r03
 
 **「未覆盖」一节是必须的**：默认不跑第 6/7/8 类是设计决定，不是遗漏。
 报告必须把它写出来，否则下一轮人看到「10 轮跑完」会以为这些类也审过了。
+
+时间轴条目按凭据写：只有凭据缺失/失效时才列进「未覆盖」；已验成 PASS/FAIL/AMBIGUOUS
+的批次不算未覆盖（FAIL/AMBIGUOUS 由顶栏与闸门处置）。
+
+**whisper 转录素材另加一条提示**（issue #30）：`--init` 未提供独立 SRT 时，英文轨就是
+ASR 转录，可能带同音/近音词听写错误；第 6 类默认不跑，报告会在「本次未覆盖」里提示
+「建议以 `--with-spelling` 重跑或人工抽查英文轨」。开了 `--with-spelling` 则不再提示。
+派生 SRT（路径非空、内容仍是听写）用 `--init --asr-transcribed` 显式标记，效果相同。
 
 ## 7. 挑完之后怎么退
 

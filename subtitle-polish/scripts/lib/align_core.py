@@ -522,7 +522,8 @@ def media_to_wav(media: str, out_dir: str, sr: int = 16000) -> str:
         raise SystemExit("未找到 ffmpeg：抽音轨需要它。可先自行转成 wav 再用 --media 指过去。")
     cmd = [ffmpeg, "-y", "-v", "error", "-i", media,
            "-vn", "-ac", "1", "-ar", str(sr), dst]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                          errors="replace")
     if proc.returncode != 0 or not os.path.exists(dst):
         raise SystemExit("ffmpeg 抽音轨失败：\n" + (proc.stderr or "")[-800:])
     return dst
