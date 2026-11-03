@@ -115,6 +115,7 @@ token 不是本项目的稀缺资源，**精确**才是目标。这条是硬约�
 | `gate_ver` 失败 | 回滚本轮快照 → 后续照跑，总账标该轮 `rollback` |
 | `gate_axis` FAIL / AMBIGUOUS | **整体定格**：后续轮次全 skip，总账顶栏置顶 |
 | 单轮改动数 = 0 | 不 skip，记 `no_finding`，继续（类别专轮无发现是正常结果） |
+| 本轮产出 `optional-fixes.json` 但未 `--promote` | 记 `advisory`：内容改动照常落盘，报告单列「本轮 N 条建议未落盘」 |
 | 同一行被连续 3 轮改动 | **冻结该行**：后续轮次不得再改，总账进「争执行」交人裁 |
 | 某轮改动率 > 30%（改动行 / 总块数） | 不执行，回滚 + skip，总账写「该轮建议发散，需人工」 |
 
@@ -130,14 +131,17 @@ token 不是本项目的稀缺资源，**精确**才是目标。这条是硬约�
 ├── manifest.json         # 轮次状态机（见 5.2）
 ├── round-plan.json       # 本次实际排出的轮次表（开关决定）
 ├── r00.ass               # 第 0 轮 = 起点，逐字节快照
-├── r01.ass ...           # 每轮**执行结束后**的快照（skip 的轮次不产生新快照）
+├── r01.ass ...           # 每轮**执行结束后**的快照（skip/rollback 的轮次不产生新快照）
 ├── logs/
-│   └── rNN.jsonl         # 该轮 log.jsonl 的整本快照（回滚时逐字节还原）
+│   └── rNN_<batch_or_none>.jsonl  # 该轮 log.jsonl 的整本快照；文件名带 batch_id
 ├── rounds/
 │   └── rNN/{fixes.json, dry-run.md, verify.md, cross-check.md, fresh.jsonl}
-├── working/              # 逐轮执行时用的 log 副本（见 5.3）
+├── working/              # 逐轮执行时用的 log 副本（见 5.4）
 └── final-report.md
 ```
+
+**log 快照文件名必须带 `batch_id`**（无 batch 写 `r09_none`）：这样「这一轮到底改没改」
+在目录里直接可见，也构成 5.4 的写一次守卫标识。
 
 ### 5.2 manifest.json
 
@@ -155,15 +159,20 @@ token 不是本项目的稀缺资源，**精确**才是目标。这条是硬约�
   "rounds": [
     {"id": "r01", "name": "整体第1遍", "scope": [1,2,3,4,5],
      "batch_id": "20261101_231512", "n_fixes": 27,
-     "verdict": "keep",       // keep | rollback | skip | no_finding
-     "snapshot": "r01.ass", "note": ""}
+     "verdict": "keep",       // keep | rollback | skip | no_finding | advisory
+     "snapshot": "r01.ass",
+     "log_snapshot": "logs/r01_20261101_231512.jsonl",  // 写一次，之后不得覆盖
+     "optional_pending": 0,   // advisory 轮：本轮 N 条建议未落盘
+     "note": ""}
   ]
 }
 ```
 
-`verdict` 五态语义：
+`verdict` 六态语义：
 
 - `keep` —— 执行了、验证过了，快照是本轮的；
+- `advisory` —— 执行了、内容改动已落盘，但本轮产出的 `optional-fixes.json` 有
+  N 条未 `--promote`；报告必须单列「本轮 N 条建议未落盘」，不得静默；
 - `rollback` —— 执行了但 `gate_ver` 失败，已回滚到**上一轮快照**；
 - `skip` —— 没执行（`gate_out` 失败 / 改动率超限 / 已定格）；
 - `no_finding` —— 执行了，0 条改动（正常，尤其类别专轮）；
@@ -172,9 +181,15 @@ token 不是本项目的稀缺资源，**精确**才是目标。这条是硬约�
 ### 5.3 回滚按快照，不按 log 反向应用
 
 ```bash
-# 回到第 3 轮末（ASS 与 log 都还原）
+# 先预演：打印「将还原到 X 行 / 当前 Y 行 / 影响 Z 条」，不确认不动盘
 python <skill>/scripts/round_orchestrator.py --run <stamp> --rollback-to r03
+
+# 确认执行（ASS 与 log 都还原）
+python <skill>/scripts/round_orchestrator.py --run <stamp> --rollback-to r03 --yes
 ```
+
+不带 `--yes` 时退出码非 0，且不写任何文件。**这是不可逆操作**：报告里的整轮回退
+命令也必须带 `--yes`。
 
 **为什么不用 `apply_fixes --rollback batch=` 逐轮反向应用**：多轮叠加后会撞上三个既有限制
 （`pipeline-spec.md` 回滚节已列）——
@@ -184,18 +199,23 @@ python <skill>/scripts/round_orchestrator.py --run <stamp> --rollback-to r03
 3. `global_replace` 与 `apply_fixes` 的交叉（同一行被两种手段先后改过）。
 
 快照整文件还原是确定性的，且与「回到第 N 轮末」这个语义一一对应。
-**log 快照 `logs/rNN.jsonl` 必须跟着还原**：否则后续回滚、`verify_fixes --all`、
-`regression_check` 看到的台账会包含已被撤销的改动，台账就不干净了。
+**log 快照 `logs/rNN_<batch_or_none>.jsonl` 必须跟着还原**：否则后续回滚、
+`verify_fixes --all`、`regression_check` 看到的台账会包含已被撤销的改动，台账就不干净了。
 
 ### 5.4 逐轮执行时的工作目录
 
 为避免与用户手工操作的 `.subtitle-polish/log.jsonl` 互相污染，`--auto` 一轮执行时：
 
-1. `logs/rNN.jsonl` → 作为本轮起始台账写入 `working/log.jsonl`；
+1. 上一轮的 log 快照 → 作为本轮起始台账写入 `working/log.jsonl`；
 2. 本轮 `apply_fixes --accept` 追加到 `working/log.jsonl`；
-3. 本轮结束：`working/log.jsonl` → `logs/rNN.jsonl`（覆盖）。
+3. 本轮结束：`working/log.jsonl` **归并回** `.subtitle-polish/log.jsonl`（按条目去重追加，
+   不是覆盖），然后把归并后的主台账整本写成 `logs/rNN_<batch_or_none>.jsonl`。
 
-逐步模式不隔离（人就在旁边看着，命令是自己敲的）。
+写快照是**一次性动作**：`logs/rNN_*.jsonl` 在 `--record rNN` 那一刻写入后即封存。
+不允许同一个 stem 被第二次写入，也不允许在更晚轮次落盘后回头补记早期轮次
+（会直接报「r09 的台账快照已被 r11 越过，无法补记」）。要重跑就 `--init` 开新 run。
+
+逐步模式不隔离（人就在旁边看着，命令是自己敲的），但同样遵守「写一次」。
 
 ## 6. 最终报告 `final-report.md`
 
@@ -206,9 +226,15 @@ python <skill>/scripts/round_orchestrator.py --run <stamp> --rollback-to r03
 ─ 逐轮摘要  轮次 | 名称 | 类别 | 发现 | 修 | verdict | 沉住度 | batch_id
 ─ 争执行   被 ≥2 轮改过的行：逐轮文本 + 每轮理由 + 一条命令回滚到任一版
 ─ 改动总账  srt_id | ass_time | 英文 | 原译 | 终译 | 类别 | 轮次 | 回滚命令
+─ 建议未落盘  verdict=advisory 的轮次：本轮 N 条建议未落盘（不在净改动里）
 ─ 白名单    第 8 类命中但按 L4 白名单未动的行（防"漏改"误读）
 ─ 未覆盖    第 6 类 / 第 7 类 / 第 8 类 / 时间轴（按实际开关如实写）
 ```
+
+**报告里的命令必须来自本次实际使用的解释器、脚本路径、run、`batch_id` / `srt_id`
+和文件路径，不许手拼 `python <skill>/...` 模板。** 两个回滚粒度分别标明：
+整批 `--rollback batch=<batch_id>`，单条 `--rollback id=<srt_id> --file <ass>`。
+整轮回退命令取本次实际记到的最后一轮，并带 `--yes`。
 
 **「沉住度」** = 该轮改的行里，后来又被改过的比例（`regression_check` 的 `churn`）。
 它给轮次结构提供了唯一可观测的精度指标：某一类专轮沉住度常年 < 50%，
@@ -229,12 +255,14 @@ ASR 转录，可能带同音/近音词听写错误；第 6 类默认不跑，报
 
 | 想退的量 | 命令 |
 |---|---|
-| 整轮（回到第 N 轮末） | `round_orchestrator.py --run <stamp> --rollback-to rNN` |
+| 整轮（回到第 N 轮末） | `round_orchestrator.py --run <stamp> --rollback-to rNN --yes` |
+| 整批（这一轮的全部改动） | `apply_fixes.py --rollback batch=<batch_id>` |
 | 单条 | `apply_fixes.py --rollback id=<srt_id> --file <ass>` |
-| 整个 run（回到起点） | `round_orchestrator.py --run <stamp> --rollback-to r00` |
+| 整个 run（回到起点） | `round_orchestrator.py --run <stamp> --rollback-to r00 --yes` |
 
-**每次 `--rollback-to` 都会把 `logs/rNN.jsonl` 写回 `.subtitle-polish/log.jsonl` 与
-`working/log.jsonl`**，所以退完之后台账与快照是一致的，可以直接接着跑下一轮。
+**每次 `--rollback-to` 都会把对应的 `logs/rNN_<batch_or_none>.jsonl` 写回
+`.subtitle-polish/log.jsonl` 与 `working/log.jsonl`**，所以退完之后台账与快照是一致的。
+快照写一次即封存，同一 run 里不能重记被回滚的轮次——要重跑请 `--init` 开新 run。
 
 单条回滚**不受** `run` 目录管理（它走 log），所以单条退完之后台账与快照会不一致——
 这是已知的、可接受的：快照只用于整轮退，单条退的账由 `verify_fixes --batch-id` 复核。

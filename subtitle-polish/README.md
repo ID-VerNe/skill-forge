@@ -117,10 +117,11 @@ python scripts/timeline_gate.py  <ass> --media <片源>                         
 python scripts/apply_fixes.py --rollback batch=<batch_id>
 python scripts/apply_fixes.py --rollback id=<srt_id> --file <ass_path>
 python scripts/apply_fixes.py --rollback before=<ts>
-python scripts/round_orchestrator.py --run <stamp> --rollback-to r03   # 整轮快照
+python scripts/round_orchestrator.py --run <stamp> --rollback-to r03          # 预演（打印影响面）
+python scripts/round_orchestrator.py --run <stamp> --rollback-to r03 --yes  # 整轮快照还原
 ```
 
-**多轮叠加后不要用 `--rollback batch=` 逐轮往回退**：会撞上 retime 浮点残差、delete 无法重建、global_replace 交叉三个限制。回退轮次用 `round_orchestrator.py --rollback-to rNN`，它是整字节快照，ASS 与 log 一起还原。详见 `references/rounds-spec.md` §5.3。
+**多轮叠加后不要用 `--rollback batch=` 逐轮往回退**：会撞上 retime 浮点残差、delete 无法重建、global_replace 交叉三个限制。回退轮次用 `round_orchestrator.py --rollback-to rNN --yes`，它是整字节快照，ASS 与 log 一起还原。详见 `references/rounds-spec.md` §5.3。
 
 ## 产出（项目侧，不进 skill）
 

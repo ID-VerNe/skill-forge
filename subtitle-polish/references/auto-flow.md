@@ -264,7 +264,8 @@ python <skill>/scripts/scan_inclusive.py <ass> --srt <srt> --layer L1,L2,L3
   - `action` ∈ replace | delete | swap | insert（swap 换文本不换时间戳，附 `swap_with`；insert 新增一行如注释轨，样式按 track 自动解析）。
   - `srt_path` 显式写，避免脚本找不到配对 srt。
 - id 空间与 status 取值详见 `pipeline-spec.md`。
-- 第 7 类进 `.subtitle-polish/optional-fixes.json`，默认不并入主修。
+- 第 7 类进 `.subtitle-polish/optional-fixes.json`，默认不并入主修。该轮未 `--promote`
+  的建议在 `--record` 时记为 `verdict=advisory`，最终报告单列「本轮 N 条建议未落盘」。
 
 ## 8. 脚本 dry-run
 
@@ -422,16 +423,23 @@ R8 这正是菲尔的强项 → 这就是菲尔的地盘     （又改回去）
 
 - 重跑审计前，先确认上一轮 verify + 对照复核都过了；不过就回滚，不要把坏状态当基线。
 - **每轮开始前保留一份快照**。无监管模式由 `round_orchestrator.py` 自动做
-  （`.subtitle-polish/runs/<stamp>/rNN.ass` + `logs/rNN.jsonl`，见 `rounds-spec.md` §5）；
+  （`.subtitle-polish/runs/<stamp>/rNN.ass` + `logs/rNN_<batch_or_none>.jsonl`，见 `rounds-spec.md` §5）；
   逐步模式手工存 `.subtitle-polish/<run>/S06E04.eng.ass.before.bak`，与执行后做 diff。
   差异里出现「中文行内容等于其邻块内容」的，直接判为回归。
 - 报告里写明本轮相对快照改了多少行（中文/英文各几行），便于下一轮比对。
-- 每轮跑完记一次轮次状态（`n_fixes` / `verdict` / `snapshot`），否则后面算不出沉住度：
+- 每轮跑完记一次轮次状态（`n_fixes` / `verdict` / `snapshot` / `log_snapshot`），否则后面算不出沉住度：
 
   ```bash
   python <skill>/scripts/round_orchestrator.py --run <stamp> --record r07 \
       --n-fixes 12 --verdict keep --batch-id <ts>
   ```
+
+  - 快照只写一次：`--record r07` 之后 `logs/r07_<ts>.jsonl` 即封存，重记会被拒绝；
+    更晚轮次已落盘后再补记早期轮次也会被拒绝（要重跑请 `--init` 开新 run）。
+  - 本轮有 `retime_curve` / `delete` / 手工兜底时，这些条目必须带 `batch_id` 且
+    `--record` 必须带 `--batch-id`，否则拒绝记账；手工兜底只能走 `apply_fixes --manual-log`。
+  - 本轮产出 `optional-fixes.json` 但未 `--promote` → `verdict=advisory`，
+    manifest 记 `optional_pending=N`，`final-report.md` 必须单列「本轮 N 条建议未落盘」。
 
 ## 全局替换（跨文件统一专名）
 

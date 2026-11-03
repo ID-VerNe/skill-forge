@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -214,7 +215,9 @@ def t_rollback_byte_identical():
 
         d = ro.run_dir(r.wd, stamp)
         want_ass = sha(os.path.join(d, "r02.ass"))
-        want_log = sha(os.path.join(d, "logs", "r02.jsonl"))
+        m = ro.load_manifest(r.wd, stamp)
+        r02 = next(x for x in m["rounds"] if x["id"] == "r02")
+        want_log = sha(os.path.join(d, ro._log_snapshot_of(m, r02)))
 
         ro.rollback_to(r.wd, stamp, "r02")
         assert sha(r.ass) == want_ass, "ASS 没有逐字节还原"
@@ -432,6 +435,191 @@ def t_bad_verdict_rejected():
         r.close()
 
 
+def t_snapshot_name_has_batch():
+    """B4：快照文件名带 batch_id，`_none` 让「这轮没改动」在文件名上可见。"""
+    r = Run()
+    try:
+        stamp = r.init()
+        r.touch("改一句")
+        r.log([_entry("B1", 1, "旧", "新")])
+        ro.record_round(r.wd, stamp, "r01", batch_id="B1", n_fixes=1)
+        ro.record_round(r.wd, stamp, "r02", n_fixes=0)
+
+        m = ro.load_manifest(r.wd, stamp)
+        r01 = next(x for x in m["rounds"] if x["id"] == "r01")
+        r02 = next(x for x in m["rounds"] if x["id"] == "r02")
+        assert r01["log_snapshot"] == os.path.join("logs", "r01_B1.jsonl"), r01
+        assert r02["log_snapshot"] == os.path.join("logs", "r02_none.jsonl"), r02
+        d = ro.run_dir(r.wd, stamp)
+        assert os.path.exists(os.path.join(d, r01["log_snapshot"]))
+        assert os.path.exists(os.path.join(d, r02["log_snapshot"]))
+    finally:
+        r.close()
+
+
+def t_late_record_rejected():
+    """B4：r11 落盘后再补记 r09，必须拒绝并点名越过者。"""
+    r = Run()
+    try:
+        stamp = r.init(with_low=True, with_inclusive=True)
+        ro.record_round(r.wd, stamp, "r11", batch_id="B11", n_fixes=0)
+        r.touch("晚轮改的")
+        try:
+            ro.record_round(r.wd, stamp, "r09", batch_id="B09", n_fixes=1)
+        except SystemExit as e:
+            assert "r09 的台账快照已被 r11 越过，无法补记" in str(e), e
+        else:
+            raise AssertionError("更晚轮次落盘后，r09 竟然还能补记")
+        d = ro.run_dir(r.wd, stamp)
+        assert not os.path.exists(os.path.join(d, "logs", "r09_B09.jsonl")), \
+            "被拒绝的补记不该写快照"
+    finally:
+        r.close()
+
+
+def t_record_twice_rejected():
+    """B4：同一轮记两次必须拒绝，快照不允许覆盖。"""
+    r = Run()
+    try:
+        stamp = r.init()
+        r.touch("改一句")
+        r.log([_entry("B1", 1, "旧", "新")])
+        ro.record_round(r.wd, stamp, "r01", batch_id="B1", n_fixes=1)
+        try:
+            ro.record_round(r.wd, stamp, "r01", batch_id="B1", n_fixes=1)
+        except SystemExit as e:
+            assert "只允许写一次" in str(e), e
+        else:
+            raise AssertionError("同一轮被重复记账并覆盖快照")
+    finally:
+        r.close()
+
+
+def t_rollback_preview_numbers():
+    """B4：--rollback-to 预演必须给出「将还原到 X 行 / 当前 Y 行 / 影响 Z 条」。"""
+    r = Run()
+    try:
+        r.init()
+        r.touch("改一句")
+        r.log([_entry("B1", 1, "旧", "新")])
+        p = subprocess.run([PY, os.path.join(SCRIPTS, "round_orchestrator.py"),
+                            "--run", "T1", "--work-dir", r.wd,
+                            "--record", "r01", "--batch-id", "B1", "--n-fixes", "1"],
+                           capture_output=True, text=True, encoding="utf-8")
+        assert p.returncode == 0, p.stderr
+
+        origin = sha(r.ass)
+        p = subprocess.run([PY, os.path.join(SCRIPTS, "round_orchestrator.py"),
+                            "--run", "T1", "--work-dir", r.wd,
+                            "--rollback-to", "r00"],
+                           capture_output=True, text=True, encoding="utf-8")
+        assert p.returncode != 0, "不带 --yes 的整轮回滚竟然成功"
+        assert re.search(r"将还原到 \d+ 行 / 当前 \d+ 行 / 影响 \d+ 条", p.stdout), \
+            f"预演数字缺失：{p.stdout!r}"
+        assert sha(r.ass) == origin, "预演不该改动 ASS"
+    finally:
+        r.close()
+
+
+def t_structural_without_batch_rejected():
+    """B2：结构性改动缺 batch 条目 → --record 拒绝，并给出 --manual-log 正确写法。"""
+    r = Run()
+    try:
+        stamp = r.init()
+        r.touch("删了一行")
+        e = _entry("", 2, "旧", "新")
+        e["action"] = "delete"
+        r.log([e])
+        try:
+            ro.record_round(r.wd, stamp, "r01", batch_id="B1", n_fixes=1)
+        except SystemExit as ex:
+            msg = str(ex)
+            assert "结构性改动缺少 batch" in msg, msg
+            assert "--manual-log" in msg, msg
+        else:
+            raise AssertionError("缺 batch 的结构性改动被记账通过了")
+        m = ro.load_manifest(r.wd, stamp)
+        r01 = next(x for x in m["rounds"] if x["id"] == "r01")
+        assert r01["verdict"] == "pending", "被拒绝的轮次不该落成 keep"
+        d = ro.run_dir(r.wd, stamp)
+        assert not os.path.exists(os.path.join(d, "logs", "r01_B1.jsonl"))
+    finally:
+        r.close()
+
+
+def t_structural_requires_record_batch():
+    """B2：结构性改动有 batch，但 --record 没带 --batch-id → 也要拒绝。"""
+    r = Run()
+    try:
+        stamp = r.init()
+        r.touch("删了一行")
+        e = _entry("B1", 2, "旧", "新")
+        e["action"] = "retime_curve"
+        r.log([e])
+        try:
+            ro.record_round(r.wd, stamp, "r01", n_fixes=1)
+        except SystemExit as ex:
+            assert "必须带 --batch-id" in str(ex), ex
+        else:
+            raise AssertionError("有结构性改动却不带 --batch-id 也通过了")
+    finally:
+        r.close()
+
+
+def t_optional_pending_is_advisory():
+    """A1：产出 optional-fixes 但未 promote → verdict=advisory，报告单列一节。"""
+    r = Run()
+    try:
+        stamp = r.init()
+        r.touch("改一句")
+        r.log([_entry("B1", 1, "旧", "新")])
+        os.makedirs(os.path.join(r.wd, "reports"), exist_ok=True)
+        with open(os.path.join(r.wd, "reports", "optional-fixes.json"),
+                  "w", encoding="utf-8") as f:
+            json.dump({"items": [{
+                "id": "L1", "srt_id": 1, "track": "中文",
+                "current": "这就是菲尔的地盘", "suggested_new": "这是菲尔的包",
+                "category": "第7类"}]}, f, ensure_ascii=False)
+
+        ro.record_round(r.wd, stamp, "r01", batch_id="B1", n_fixes=1)
+        m = ro.load_manifest(r.wd, stamp)
+        r01 = next(x for x in m["rounds"] if x["id"] == "r01")
+        assert r01["verdict"] == "advisory", r01
+        assert r01["optional_pending"] == 1, r01
+
+        md = ro.render_report(r.wd, stamp)
+        assert "## 建议未落盘（advisory）" in md, md
+        assert "本轮 1 条建议未落盘" in md, md
+
+        # 文件没变 → 下一轮不能把上一轮的建议重复记成 advisory
+        ro.record_round(r.wd, stamp, "r02", n_fixes=0)
+        m = ro.load_manifest(r.wd, stamp)
+        assert next(x for x in m["rounds"] if x["id"] == "r02")["verdict"] \
+            == "no_finding"
+    finally:
+        r.close()
+
+
+def t_report_commands_are_real():
+    """B3：报告命令来自本次实际使用的解释器/脚本/run/批次，且区分 batch= 与 id=。"""
+    r = Run()
+    try:
+        stamp = r.init()
+        r.touch("改一句")
+        r.log([_entry("B1", 2, "旧", "新")])
+        ro.record_round(r.wd, stamp, "r01", batch_id="B1", n_fixes=1)
+        md = ro.render_report(r.wd, stamp)
+
+        assert "<skill>" not in md, "报告里还有模板占位符 <skill>"
+        assert "--rollback batch=B1" in md, md
+        assert '--rollback id=2 --file' in md, md
+        assert f"--run {stamp} --rollback-to r01 --yes" in md, md
+        assert os.path.join(SCRIPTS, "apply_fixes.py") in md, \
+            "报告命令没用本次实际脚本路径"
+    finally:
+        r.close()
+
+
 if __name__ == "__main__":
     print("轮次编排：计划 / 快照回滚 / 定格 / 报告")
     for n, fn in (
@@ -454,6 +642,14 @@ if __name__ == "__main__":
         ("定格信息在顶栏", t_report_frozen_at_top),
         ("CLI 端到端", t_cli_end_to_end),
         ("非法 verdict 拒绝", t_bad_verdict_rejected),
+        ("快照名带 batch_id", t_snapshot_name_has_batch),
+        ("更晚轮次落盘后拒绝补记", t_late_record_rejected),
+        ("同一轮重复记账拒绝", t_record_twice_rejected),
+        ("回滚预演三数字", t_rollback_preview_numbers),
+        ("结构性改动缺 batch 拒绝", t_structural_without_batch_rejected),
+        ("结构性改动要求 --batch-id", t_structural_requires_record_batch),
+        ("建议未落盘记 advisory", t_optional_pending_is_advisory),
+        ("报告命令来自实际路径", t_report_commands_are_real),
     ):
         test(n, fn)
 

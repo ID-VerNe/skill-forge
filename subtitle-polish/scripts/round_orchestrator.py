@@ -13,6 +13,12 @@
   「回到第 N 轮末」这个语义一一对应。
 - **log 快照必须跟着 ASS 一起还原**。只还原 ASS 不还原 log.jsonl，后续
   `verify_fixes --all` / `regression_check` 会看到已被撤销的改动，台账就不干净了。
+- **快照只写一次**。`logs/rNN_<batch_or_none>.jsonl` 在 `--record rNN` 时封存；
+  更晚轮次落盘后再补记早期轮次会被拒绝。
+- **结构性改动必须入账**。`retime_curve` / `delete` / 手工兜底缺 batch 条目时
+  `--record` 拒绝通过；手工兜底只能走 `apply_fixes --manual-log`。
+- **建议未落盘要单列**。本轮产出 `optional-fixes.json` 但未 promote →
+  `verdict=advisory`，报告写「本轮 N 条建议未落盘」。
 
 用法:
   # 1. 看这次会跑哪几轮（不建任何目录，纯计划）
@@ -28,8 +34,9 @@
   # 4. 出总账
   python round_orchestrator.py --run <stamp> --report
 
-  # 5. 整轮回退
+  # 5. 整轮回退（先预演，确认后加 --yes）
   python round_orchestrator.py --run <stamp> --rollback-to r03
+  python round_orchestrator.py --run <stamp> --rollback-to r03 --yes
 
 退出码（与 lib/verdict.py 一致）:
   0  正常
@@ -40,6 +47,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -93,7 +101,14 @@ MAX_CHURN = 0.30
 #: 同一行连续被改几轮 → 冻结
 FREEZE_AFTER = 3
 
-VERDICTS = ("pending", "keep", "rollback", "skip", "no_finding")
+VERDICTS = ("pending", "keep", "rollback", "skip", "no_finding", "advisory")
+
+#: 会产生快照的 verdict。advisory（A1：本轮有建议未落盘）内容改动照样落盘，
+#: 所以与 keep/no_finding 同等对待；区别只在报告里单列一节。
+SNAPSHOT_VERDICTS = ("keep", "no_finding", "advisory")
+
+#: 结构性改动：这类动作绕过 fixes.json 的撞车预检，**必须**带 batch 条目才能记轮次（B2）。
+STRUCTURAL_ACTIONS = ("retime_curve", "delete", "manual_edit", "structural_change")
 
 
 # ── 计划 ────────────────────────────────────────────────────────────────────
@@ -253,7 +268,8 @@ def init_run(wd: str, ass: str, srt: str, plan: list, *,
         "frozen_rows": [],
         "rounds": [{"id": r["id"], "name": r["name"], "scope": r["scope"],
                     "batch_id": "", "n_fixes": 0, "verdict": "pending",
-                    "snapshot": "", "note": ""} for r in plan],
+                    "snapshot": "", "log_snapshot": "", "optional_pending": 0,
+                    "note": ""} for r in plan],
     }
     save_manifest(wd, stamp, m)
     with open(os.path.join(d, "round-plan.json"), "w", encoding="utf-8") as f:
@@ -264,26 +280,182 @@ def init_run(wd: str, ass: str, srt: str, plan: list, *,
 # ── 记账 ────────────────────────────────────────────────────────────────────
 
 def latest_snapshot(m: dict) -> str:
-    """当前有效的快照文件名（最后一个 keep/no_finding 轮，没有则 r00）。"""
+    """当前有效的快照文件名（最后一个 keep/no_finding/advisory 轮，没有则 r00）。"""
     for r in reversed(m["rounds"]):
-        if r["verdict"] in ("keep", "no_finding") and r.get("snapshot"):
+        if r["verdict"] in SNAPSHOT_VERDICTS and r.get("snapshot"):
             return r["snapshot"]
     return "r00.ass"
 
 
+def _snap_stem(rid: str, batch_id: str) -> str:
+    """快照文件名主干：`r09_<batch_or_none>`。
+
+    B4：文件名必须让「这一轮到底改没改」一眼可见——有 batch = 有改动，
+    `_none` = 该轮没产出 batch（通常是 no_finding）。同时它也是写一次守卫的
+    唯一标识：同一个 stem 对应的 ledger 快照不允许被第二次写入。
+    """
+    bid = (batch_id or "").strip() or "none"
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in bid)
+    return f"{rid}_{safe}"
+
+
+def _log_snapshot_rel(rid: str, batch_id: str) -> str:
+    return os.path.join("logs", _snap_stem(rid, batch_id) + ".jsonl")
+
+
+def _log_snapshot_of(m: dict, r: dict) -> str:
+    """某轮 manifest 条目对应的 log 快照相对路径。"""
+    if r.get("log_snapshot"):
+        return r["log_snapshot"]
+    # 旧 run 没有 log_snapshot 字段：按老命名 logs/rNN.jsonl 找。
+    return os.path.join("logs", r["id"] + ".jsonl")
+
+
 def _log_snapshot_for(m: dict, snap: str) -> str:
-    """快照名字（r03.ass）→ 对应的 log 快照（logs/r03.jsonl）。"""
-    stem = os.path.splitext(snap)[0]
-    return os.path.join("logs", stem + ".jsonl")
+    """快照名字（r03.ass / r00.ass）→ 对应的 log 快照路径。"""
+    if not snap or snap == "r00.ass":
+        return os.path.join("logs", "r00.jsonl")
+    hit = next((r for r in m["rounds"] if r.get("snapshot") == snap), None)
+    if hit is not None:
+        return _log_snapshot_of(m, hit)
+    stem = os.path.splitext(os.path.basename(snap))[0]
+    rid = stem.split("_")[0]
+    return os.path.join("logs", f"{rid}.jsonl")
+
+
+def _read_jsonl(p: str) -> list:
+    """读 JSONL，坏行跳过（台账可能被手工追加过，不能让一行坏数据阻断记账）。"""
+    out = []
+    if not os.path.exists(p):
+        return out
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def _entry_key(e: dict) -> tuple:
+    return (e.get("file", ""), e.get("srt_id"), e.get("track", ""),
+            e.get("old_text", ""), e.get("new_text", ""), e.get("ts", ""))
+
+
+def _count_dialogue(path: str) -> int:
+    """数 ASS 的 Dialogue 行（回滚预演里的「行」）。"""
+    n = 0
+    if not os.path.exists(path):
+        return n
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.lstrip().startswith("Dialogue:"):
+                n += 1
+    return n
+
+
+def _guard_snapshot(m: dict, rid: str) -> None:
+    """B4-1/B4-2：快照只允许在 `--record rNN` 那一刻写一次。
+
+    - 更晚的轮次已经落盘（有快照）→ 拒绝补记，并指出是被哪一轮越过；
+    - 本轮已有快照 → 拒绝二次写入。
+    """
+    idx = next(i for i, r in enumerate(m["rounds"]) if r["id"] == rid)
+    later = [r for r in m["rounds"][idx + 1:] if r.get("snapshot")]
+    if later:
+        raise SystemExit(
+            f"[x] {rid} 的台账快照已被 {later[0]['id']} 越过，无法补记。\n"
+            f"    快照只允许在 --record {rid} 那一刻写一次；要重来请用 --init 开新 run。")
+    target = m["rounds"][idx]
+    if target.get("snapshot"):
+        raise SystemExit(
+            f"[x] {rid} 的快照已存在（{target['snapshot']}），只允许写一次；"
+            f"要改判请用 --rollback-to，或 --init 开新 run。")
+
+
+def _apply_advisory(wd: str, m: dict, verdict: str) -> tuple:
+    """A1 尾巴：本轮产出过 optional-fixes.json 且未 promote → verdict=advisory。
+
+    返回 (verdict, 未落盘条数)。用内容 sha 判断「这一轮产出的」：同一个文件
+    在两轮之间没变过，就不能把上一轮的建议重复记到这一轮头上。
+    """
+    if verdict not in ("keep", "no_finding"):
+        return verdict, 0
+    p = OPT.optional_json_path(wd)
+    if not os.path.exists(p):
+        m.pop("optional_sha", None)
+        return verdict, 0
+    with open(p, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    changed = sha != m.get("optional_sha")
+    m["optional_sha"] = sha
+    pending = [x for x in OPT.load_optional(wd) if not x.get("batch_id")]
+    if pending and changed:
+        return "advisory", len(pending)
+    return verdict, 0
+
+
+def _assert_structural_accounted(wd: str, d: str, m: dict, rid: str,
+                                 batch_id: str) -> None:
+    """B2：retime_curve / delete / 手工兜底必须有 batch 条目，否则拒绝记账。
+
+    取「本轮窗口」= 当前台账（主 + working）里、本轮之前快照中不存在的条目。
+    只读，不先写入任何东西——校验失败时不能留下半截状态。
+    """
+    main = _read_jsonl(os.path.join(wd, "log.jsonl"))
+    working = _read_jsonl(os.path.join(d, "working", "log.jsonl"))
+    current, seen = [], set()
+    for e in main + working:
+        k = _entry_key(e)
+        if k in seen:
+            continue
+        seen.add(k)
+        current.append(e)
+
+    prev_snap = latest_snapshot(m)
+    prev = {_entry_key(e) for e in
+            _read_jsonl(os.path.join(d, _log_snapshot_for(m, prev_snap)))}
+    window = [e for e in current if _entry_key(e) not in prev]
+    structural = [e for e in window if e.get("action") in STRUCTURAL_ACTIONS]
+    if not structural:
+        return
+
+    no_batch = [e for e in structural if not str(e.get("batch_id") or "").strip()]
+    if no_batch:
+        detail = "\n".join(
+            "      action=%s srt_id=%s batch=(空)" % (e.get("action"), e.get("srt_id"))
+            for e in no_batch[:10])
+        raise SystemExit(
+            f"[x] {rid} 有 {len(no_batch)} 条结构性改动缺少 batch 条目，拒绝记账。\n"
+            f"    retime_curve / delete / 手工兜底都必须带 batch_id：\n"
+            f"      · retime_curve 由 align_patch --write 自动记（不要手补）\n"
+            f"      · delete 由 apply_fixes --accept 自动记（不要手补）\n"
+            f"      · 手工兜底只能走 --manual-log（唯一手工入口）：\n"
+            f"      python <skill>/scripts/apply_fixes.py --manual-log --batch-id <batch> "
+            f"--file \"<ass>\" --srt-id <id> --track 中文 --old \"<原文本>\" --new \"<新文本>\" "
+            f"--reason \"<为什么破例>\"\n"
+            f"    涉及条目：\n{detail}")
+    if not batch_id:
+        raise SystemExit(
+            f"[x] {rid} 有 {len(structural)} 条结构性改动，--record 必须带 --batch-id，否则"
+            f"这一轮无法在报告里按批回滚。\n"
+            f"      python <skill>/scripts/round_orchestrator.py --run <stamp> "
+            f"--record {rid} --batch-id <batch> --n-fixes <N> --verdict keep")
 
 
 def record_round(wd: str, stamp: str, rid: str, *,
                  batch_id: str = "", n_fixes: int = 0, verdict: str = "",
                  note: str = "", freeze_rows=None) -> dict:
-    """记一轮的结果。keep/no_finding 时把当前 ASS 存成本轮快照。
+    """记一轮的结果。keep/no_finding/advisory 时把当前 ASS 存成本轮快照。
 
     `verdict` 不传时按 n_fixes 推断（0 → no_finding，>0 → keep），
     但 **rollback / skip 必须显式传**——这两种状态不能让调用方猜。
+
+    B4：快照只允许写一次。更晚的轮次已落盘后再补记早期轮次会被拒绝，
+    不再出现「r09 的台账快照被 r11 之后的改动覆盖」。
     """
     m = load_manifest(wd, stamp)
     if verdict and verdict not in VERDICTS:
@@ -297,18 +469,38 @@ def record_round(wd: str, stamp: str, rid: str, *,
     if not verdict:
         verdict = "no_finding" if n_fixes == 0 else "keep"
 
+    # B4-1/B4-2：补记与覆盖守卫，必须在任何写盘动作之前。
+    _guard_snapshot(m, rid)
+
     target["batch_id"] = batch_id or target["batch_id"]
     target["n_fixes"] = int(n_fixes)
-    target["verdict"] = verdict
     target["note"] = note
 
-    if verdict in ("keep", "no_finding"):
+    if verdict in SNAPSHOT_VERDICTS:
+        # A1 尾巴：本轮产出过建议但未 promote → advisory（报告必须单列）。
+        verdict, pending = _apply_advisory(wd, m, verdict)
+        target["verdict"] = verdict
+        target["optional_pending"] = pending
+
+        # B2：结构性改动必须有 batch 条目，否则拒绝记账（读校验，先于写盘）。
+        _assert_structural_accounted(wd, d, m, rid, target["batch_id"])
+
         # B1：先把 working 台账归并回主台账，再拷快照。顺序不能反——先拷快照
         # 会把「还没归并」的 working 当成唯一证据，主台账依旧是空的。
         _merge_working_log(wd, d)
+
+        # B4-3：快照文件名带 batch_id（rNN_<batch_or_none>），写一次即封存。
+        stem = _snap_stem(rid, target["batch_id"])
         snap = f"{rid}.ass"
-        shutil.copy2(m["ass"], os.path.join(d, snap))
-        target["snapshot"] = snap
+        log_rel = _log_snapshot_rel(rid, target["batch_id"])
+        ass_dst = os.path.join(d, snap)
+        log_dst = os.path.join(d, log_rel)
+        for p in (ass_dst, log_dst):
+            if os.path.exists(p):
+                raise SystemExit(
+                    f"[x] 快照已存在，拒绝覆盖：{p}\n"
+                    f"    一个轮次的快照只允许写一次；要重来请 --init 开新 run。")
+        shutil.copy2(m["ass"], ass_dst)
         # log 快照：working/log.jsonl 是本轮执行后的台账（--auto 隔离模式），
         # 没有 working 副本时（逐步模式）直接整本拷主 log。
         #
@@ -318,16 +510,20 @@ def record_round(wd: str, stamp: str, rid: str, *,
         # 这里只读归并后的主 log。
         working = os.path.join(d, "working", "log.jsonl")
         src = working if os.path.exists(working) else os.path.join(wd, "log.jsonl")
-        dst = os.path.join(d, "logs", f"{rid}.jsonl")
         if os.path.exists(src):
-            shutil.copy2(src, dst)
+            shutil.copy2(src, log_dst)
         else:
-            open(dst, "w", encoding="utf-8").close()
-    elif verdict == "rollback":
-        # 回滚到上一轮有效快照；本轮不产生新快照
-        prev = latest_snapshot(m)
-        _restore(m, d, prev)
-        target["note"] = (target["note"] + " | rolled back to " + prev).strip(" |")
+            open(log_dst, "w", encoding="utf-8").close()
+        target["snapshot"] = snap
+        target["log_snapshot"] = log_rel
+    else:
+        target["verdict"] = verdict
+        target["optional_pending"] = 0
+        if verdict == "rollback":
+            # 回滚到上一轮有效快照；本轮不产生新快照
+            prev = latest_snapshot(m)
+            _restore(m, d, prev)
+            target["note"] = (target["note"] + " | rolled back to " + prev).strip(" |")
 
     if freeze_rows:
         rows = [int(x) for x in freeze_rows]
@@ -377,40 +573,47 @@ def _restore(m: dict, d: str, snap: str) -> None:
     src = os.path.join(d, snap)
     if not os.path.exists(src):
         raise SystemExit(f"[!] 缺快照文件：{src}")
-    shutil.copy2(src, m["ass"])
     log_src = os.path.join(d, _log_snapshot_for(m, snap))
+    if not os.path.exists(log_src):
+        raise SystemExit(
+            f"[!] 缺台账快照：{log_src}\n"
+            f"    只还原 ASS 不还原 log 会让后续校验看到已撤销的改动，拒绝半还原。")
     # 主 log 位置 = <work_dir>/log.jsonl；d = <work_dir>/runs/<stamp>
     log_dst = os.path.join(os.path.dirname(os.path.dirname(d)), "log.jsonl")
-    if os.path.exists(log_src):
-        shutil.copy2(log_src, log_dst)
+    shutil.copy2(src, m["ass"])
+    shutil.copy2(log_src, log_dst)
+
+
+def _resolve_snapshot(m: dict, rid: str) -> str:
+    """把轮 id 解析成 ASS 快照文件名（回滚预演与执行共用同一套判定）。"""
+    if rid in ("", "r00"):
+        return "r00.ass"
+    hit = next((r for r in m["rounds"] if r["id"] == rid), None)
+    if hit is None:
+        raise SystemExit(f"[!] 计划里没有 {rid}")
+    if not hit.get("snapshot"):
+        raise SystemExit(
+            f"[!] {rid} 没有快照（verdict={hit['verdict']}）。"
+            f"只能退到有快照的轮次："
+            f"{', '.join(r['id'] for r in m['rounds'] if r.get('snapshot')) or 'r00'}")
+    return hit["snapshot"]
 
 
 def rollback_to(wd: str, stamp: str, rid: str) -> dict:
     """把 ASS 与 log.jsonl 整本还原到第 `rid` 轮末。"""
     m = load_manifest(wd, stamp)
     d = run_dir(wd, stamp)
-    if rid in ("", "r00"):
-        snap = "r00.ass"
-    else:
-        hit = next((r for r in m["rounds"] if r["id"] == rid), None)
-        if hit is None:
-            raise SystemExit(f"[!] 计划里没有 {rid}")
-        if not hit.get("snapshot"):
-            raise SystemExit(
-                f"[!] {rid} 没有快照（verdict={hit['verdict']}）。"
-                f"只能退到有快照的轮次："
-                f"{', '.join(r['id'] for r in m['rounds'] if r.get('snapshot')) or 'r00'}")
-        snap = hit["snapshot"]
+    snap = _resolve_snapshot(m, rid)
     _restore(m, d, snap)
-    _sync_working(d, snap if rid not in ("", "r00") else "r00")
+    _sync_working(d, _log_snapshot_for(m, snap))
     m["rolled_back_to"] = {"at": snap, "ts": datetime.now().isoformat(timespec="seconds")}
     save_manifest(wd, stamp, m)
     return m
 
 
-def _sync_working(d: str, stem: str) -> None:
+def _sync_working(d: str, log_snapshot: str) -> None:
     """把 log 快照同步到 working/，让下一轮的起始台账是干净的那一份。"""
-    src = os.path.join(d, "logs", stem + ".jsonl")
+    src = os.path.join(d, log_snapshot)
     dst = os.path.join(d, "working", "log.jsonl")
     if os.path.exists(src):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -541,23 +744,31 @@ def _parse_ledger(entries: list) -> list:
     return sorted(rows.values(), key=lambda r: (r["file"], r["srt_id"]))
 
 
-def _rollback_cmd(ass: str, batch_id: str = "", srt_id=None) -> str:
+def _script(name: str) -> str:
+    """同目录脚本的实际路径（报告里的命令用真实路径，不写 `<skill>` 模板）。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+
+def _rollback_cmd(ass: str, batch_id: str = "", srt_id=None,
+                  work_dir: str = "") -> str:
     """生成回滚命令。**两个粒度不能混用**（B3）。
 
     以前这里写的是 `--rollback id=<batch_id> --file <ass>`：把批次标识填进了
     `id=`（那是 srt_id 的位置），生成的命令必然回滚错行——而且看起来还很正常，
     因为 `id=` 确实存在，只是语义错了。
 
-    现在按粒度分开：
+    现在按粒度分开，且命令来自**本次实际使用的解释器与脚本路径**（不是
+    `python <skill>/...` 这种模板）：
       - 整批：`--rollback batch=<batch_id>`（一次回滚这一轮的全部改动）
       - 单条：`--rollback id=<srt_id> --file <ass>`（精确到行，需限定文件）
     """
+    py = sys.executable or "python"
+    script = _script("apply_fixes.py")
+    wd_part = f' --work-dir "{work_dir}"' if work_dir else ""
     if batch_id:
-        return ("python <skill>/scripts/apply_fixes.py --rollback batch=%s"
-                % batch_id)
+        return f'"{py}" "{script}" --rollback batch={batch_id}{wd_part}'
     if srt_id is not None:
-        return ("python <skill>/scripts/apply_fixes.py --rollback id=%s --file \"%s\""
-                % (srt_id, ass))
+        return (f'"{py}" "{script}" --rollback id={srt_id} --file "{ass}"{wd_part}')
     return "# 无可用回滚标识"
 
 
@@ -714,7 +925,8 @@ def _render_single_report(wd: str, stamp: str) -> str:
     d = run_dir(wd, stamp)
     rounds = m["rounds"]
     done = [r for r in rounds if r["verdict"] != "pending"]
-    kept = [r for r in rounds if r["verdict"] in ("keep", "no_finding")]
+    kept = [r for r in rounds if r["verdict"] in SNAPSHOT_VERDICTS]
+    advisory = [r for r in rounds if r["verdict"] == "advisory"]
     rolled = [r for r in rounds if r["verdict"] == "rollback"]
     skipped = [r for r in rounds if r["verdict"] == "skip"]
     total = sum(r["n_fixes"] for r in kept)
@@ -731,6 +943,8 @@ def _render_single_report(wd: str, stamp: str) -> str:
         top.append(f"回滚 {len(rolled)}")
     if skipped:
         top.append(f"skip {len(skipped)}")
+    if advisory:
+        top.append(f"建议未落盘 {sum(r.get('optional_pending', 0) for r in advisory)} 条")
     top.append(f"净改动 {total} 条")
     top.append(_timeline_top_text(tl))
     if m.get("frozen"):
@@ -759,7 +973,7 @@ def _render_single_report(wd: str, stamp: str) -> str:
             # B3：这一列以前硬写着 `--rollback id=N`，但只有 srt_id 没有 file，
             # 照着抄会回滚到**同号的所有文件**。走 _rollback_cmd() 统一生成，
             # 顺带把 file 带上。
-            cmd = _rollback_cmd(c.get("file") or m["ass"], srt_id=sid)
+            cmd = _rollback_cmd(c.get("file") or m["ass"], srt_id=sid, work_dir=wd)
             L.append("| %s | %s | %s | %s | `%s` |" % (
                 sid, c["key"][2], c["n_rounds"], trail, cmd))
         L += ["", "> 这一节是给人裁的，不是结论。改回去有时是对的（上一轮确实改错了）。", ""]
@@ -791,7 +1005,8 @@ def _render_single_report(wd: str, stamp: str) -> str:
         L += ["| srt_id | 轨道 | 原译 | 终译 | 类别 | 轮次 | 回滚 |",
               "|---|---|---|---|---|---|---|"]
         for r in ledger:
-            cmd = _rollback_cmd(r.get("file") or m["ass"], srt_id=r["srt_id"])
+            cmd = _rollback_cmd(r.get("file") or m["ass"], srt_id=r["srt_id"],
+                                work_dir=wd)
             L.append("| %s | %s | %s | %s | %s | %s | `%s` |" % (
                 r["srt_id"], r["track"], _md_cell(r["old"]) or "—", _md_cell(r["new"]) or "—",
                 r["category"] or "—", len(r["batches"]), cmd))
@@ -807,15 +1022,34 @@ def _render_single_report(wd: str, stamp: str) -> str:
                     continue
                 seen_b.add(r["batch_id"])
                 L.append("%s  # %s %s，%d 条" % (
-                    _rollback_cmd(m["ass"], batch_id=r["batch_id"]),
+                    _rollback_cmd(m["ass"], batch_id=r["batch_id"], work_dir=wd),
                     r["id"], r["name"], r["n_fixes"]))
             L += ["```", ""]
+        # B3：整轮回退的目标取自**本次实际记到的最后一轮**，不再硬写 r03；
+        # 命令里的解释器、脚本、run、work-dir 都是本次实际使用的值。
+        last = kept[-1]["id"] if kept else "r00"
         L += ["整轮回退（ASS 与 log 一起退回某轮末，需 `--yes` 确认）：",
               "```bash",
-              f"python <skill>/scripts/round_orchestrator.py --run {stamp} --rollback-to r03",
+              f'"{sys.executable or "python"}" "{_script("round_orchestrator.py")}" '
+              f'--run {stamp} --rollback-to {last} --yes --work-dir "{wd}"',
               "```", ""]
     else:
         L += ["台账为空（本次没有改动）。", ""]
+
+    # A1 尾巴：advisory 轮必须单列，写清「本轮 N 条建议未落盘」。
+    # 只靠下面的「建议改动」一节不够——那一节不区分是哪一轮产出的，也不写
+    # 「这些建议不在净改动里」，读报告的人会把建议数当成改动数。
+    if advisory:
+        n_all = sum(r.get("optional_pending", 0) for r in advisory)
+        L += ["## 建议未落盘（advisory）", "",
+              "| 轮 | 名称 | 建议条数 | batch_id |", "|---|---|---|---|"]
+        for r in advisory:
+            L.append("| %s | %s | %s | %s |" % (
+                r["id"], r["name"], r.get("optional_pending", 0),
+                r["batch_id"] or "—"))
+        L += ["", "> 本轮 %d 条建议未落盘（verdict=advisory）：它们**不在「净改动」里**，"
+                  "也**没有被写进 ASS**（本轮已执行的内容改动照常计入净改动）。采纳方式："
+                  "`--promote <id>`，再 `apply_fixes --apply-batch <batch>`。" % n_all, ""]
 
     # 建议改动（A1）：必须单列，且必须说明「不在净改动里」。以前建议和被执行的
     # 改动混在一起，报告写「净改动 21 条」而 ASS 只改了 3 条。
@@ -997,7 +1231,7 @@ def _render_cross_run(sums) -> list:
             sum(1 for r in rounds if r["verdict"] == "rollback"),
             sum(1 for r in rounds if r["verdict"] == "skip"),
             sum(r["n_fixes"] for r in rounds
-                if r["verdict"] in ("keep", "no_finding")),
+                if r["verdict"] in SNAPSHOT_VERDICTS),
             "是" if m.get("frozen") else "—"))
     L += [""]
 
@@ -1042,7 +1276,7 @@ def main():
     ap.add_argument("--record", default="", help="记一轮结果，如 --record r03")
     ap.add_argument("--batch-id", default="")
     ap.add_argument("--n-fixes", type=int, default=0)
-    ap.add_argument("--verdict", default="", help="keep|rollback|skip|no_finding")
+    ap.add_argument("--verdict", default="", help="keep|rollback|skip|no_finding|advisory")
     ap.add_argument("--note", default="")
     ap.add_argument("--freeze-rows", default="", help="冻结的 srt_id，逗号分隔")
     ap.add_argument("--freeze", action="store_true", help="整体定格（--record 时生效）")
@@ -1126,8 +1360,11 @@ def main():
             print(f"[*] 定格于 {args.record}：{reason}（后续轮次标 skip）")
             print(write_report(wd, args.run))
             return V.FAIL
-        print(f"[*] {args.record} → "
-              f"{next(r for r in m['rounds'] if r['id'] == args.record)['verdict']}")
+        hit = next(r for r in m['rounds'] if r['id'] == args.record)
+        print(f"[*] {args.record} → {hit['verdict']}")
+        if hit["verdict"] == "advisory":
+            print(f"[!] 本轮 {hit.get('optional_pending', 0)} 条建议未落盘"
+                  f"（verdict=advisory，报告会单列）")
         return 0
 
     if args.freeze:
@@ -1140,12 +1377,20 @@ def main():
     if args.rollback_to:
         # B4：整轮回退是不可逆的（ASS 与 log 一起被覆盖），先打印影响面再要 --yes。
         m = load_manifest(wd, args.run)
+        d = run_dir(wd, args.run)
+        snap = _resolve_snapshot(m, args.rollback_to)
+        x = _count_dialogue(os.path.join(d, snap))
+        y = _count_dialogue(m["ass"])
+        cur_log = _read_jsonl(os.path.join(wd, "log.jsonl"))
+        old_log = _read_jsonl(os.path.join(d, _log_snapshot_for(m, snap)))
+        z = max(0, len(cur_log) - len(old_log))
+        print(f"[!] 将还原到 {x} 行 / 当前 {y} 行 / 影响 {z} 条",
+              f"（{snap} → {os.path.basename(m['ass'])}；台账 {len(cur_log)} → {len(old_log)} 条）")
         eff = [r for r in m["rounds"]
-               if r["verdict"] in ("keep", "no_finding")
+               if r["verdict"] in SNAPSHOT_VERDICTS
                and r["id"] > args.rollback_to]
         n_fix = sum(r["n_fixes"] for r in eff)
-        print(f"[!] 将回滚到 {args.rollback_to}，以下 {len(eff)} 轮的改动会被撤销"
-              f"（合计 {n_fix} 条）：")
+        print(f"[!] 以下 {len(eff)} 轮的改动会被撤销（合计 {n_fix} 条）：")
         for r in eff:
             print(f"      {r['id']} {r['name']}  {r['n_fixes']} 条  batch={r['batch_id'] or '—'}")
         if not args.yes:
