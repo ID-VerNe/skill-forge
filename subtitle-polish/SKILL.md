@@ -95,6 +95,14 @@ ass 与 srt 可以是目录或单文件:
 **类别专轮一律全量出片,不切片取样。** token 不是本项目的稀缺资源,精确才是目标。
 详见 `references/rounds-spec.md` §2,这条是硬约束。
 
+**记账是硬门,不是记录**:
+- `--record rNN` 时快照只写一次(`logs/rNN_<batch_or_none>.jsonl`);更晚轮次已落盘后
+  补记早期轮次会被拒绝,重跑请 `--init` 开新 run。
+- `retime_curve` / `delete` / 手工兜底必须先有 batch 条目,否则 `--record` 拒绝通过;
+  手工兜底只能走 `apply_fixes --manual-log`。
+- 本轮产出 `optional-fixes.json` 但未 `--promote` → `verdict=advisory`,
+  `final-report.md` 单列「本轮 N 条建议未落盘」,不许静默。
+
 ## 回滚(三种模式共用)
 
 ```bash
@@ -105,18 +113,21 @@ python <skill>/scripts/apply_fixes.py --rollback id=<srt_id> --file <ass_path>
 # 按时间点(回滚该时间之前所有)
 python <skill>/scripts/apply_fixes.py --rollback before=<ts>
 # 按轮次(自动审校模式专用,整文件快照还原,ASS 与 log 一起还原)
+# 先预演:打印「将还原到 X 行 / 当前 Y 行 / 影响 Z 条」
 python <skill>/scripts/round_orchestrator.py --run <stamp> --rollback-to r03
+# 确认执行(不带 --yes 不写盘、退出码非 0)
+python <skill>/scripts/round_orchestrator.py --run <stamp> --rollback-to r03 --yes
 ```
 
 所有操作都留 log.jsonl 记录,支持单条/整 batch/时间点三种粒度回滚。**global_replace 与 precheck_punct 当前不单独支持 `--rollback`**(argparse 未注册),其改动靠 `.bak` 文件手动还原,或用 `apply_fixes.py --rollback batch=<它们的 batch_id>`(若该 action 被认)。详见 `references/pipeline-spec.md` 回滚节与 `references/batch-ordering.md`。
 
 **多轮叠加后不要用 `--rollback batch=` 逐轮往回退**:会撞上 retime 浮点残差、delete 无法重建、
-global_replace 交叉三个限制。回退轮次用 `round_orchestrator.py --rollback-to rNN`,
+global_replace 交叉三个限制。回退轮次用 `round_orchestrator.py --rollback-to rNN --yes`,
 它是整字节快照。详见 `references/rounds-spec.md` §5.3。
 
 ## 破例 Edit 兜底(三种模式共用)
 
-脚本 `_find_dialogue` 在相邻 srt 块时间差 < 0.5s 时取最近也分不开(dry-run 会报"撞车预警")。撞车场景下允许破例 Edit ASS,但必须用脚本补记 log:
+脚本 `_find_dialogue` 在相邻 srt 块时间差 < 0.5s 时取最近也分不开(dry-run 会报"撞车预警")。撞车场景下允许破例 Edit ASS,但必须用脚本补记 log。**`--manual-log` 是破例 Edit 的唯一入口**(`retime_curve` 由 `align_patch --write`、`delete` 由 `apply_fixes --accept` 自动记,都不要手补):
 
 ```bash
 python <skill>/scripts/apply_fixes.py --manual-log \

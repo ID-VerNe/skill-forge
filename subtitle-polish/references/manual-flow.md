@@ -115,6 +115,11 @@ python <skill>/scripts/extract_slice.py <ass> [<srt>] --out .subtitle-polish/sli
 4. **verify 兜底**：`verify_fixes.py --batch-id <ts>_manual` 验 manual_edit 条目（按 new_text fallback 定位核对）。
 5. **回滚**：`--rollback batch=<ts>_manual` 同样支持。
 
+**`--manual-log` 是手工兜底的唯一入口**：破例 Edit 这类结构性改动如果没有 batch 条目，
+`round_orchestrator.py --record` 会拒绝记账并给出正确写法。`retime_curve` / `delete`
+的条目分别由 `align_patch --write` / `apply_fixes --accept` 自动写入，不要手补。
+不要手写 log.jsonl，也不要指望事后补记——快照只写一次。
+
 规约"修复手段都只调脚本"在撞车场景下有这条例外条款。**首选仍是脚本**，Edit 是 last resort。
 
 ## M3. 构造 fixes.json
