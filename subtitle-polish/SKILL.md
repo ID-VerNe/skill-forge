@@ -148,6 +148,11 @@ python <skill>/scripts/timeline_gate.py <ass> --media <片源>        # 凭据�
 前两条都不读时间字段,**文本全对、时间轴整集偏 2.9 秒的成品照样全绿**(skill-forge issue #8)。
 第三条也不能用「对本片内嵌字幕流」代替——内嵌流自己可能就错轴。详见 `references/align-audit.md`。
 
+审计的离群明细会带 `isolation` / `outlier_kind`:**`isolated` 只是提示**「可能为 forced-aligner
+单字锚定噪声,建议抽查音频确认」,不下「一定是错轴」的结论;`clustered`(连续多行离群)才更像
+真实的剪辑点阶跃。这两个字段不改变剔除口径,也不影响 PASS/FAIL;二次复核只给提示,不自动重转写。
+详见 `references/align-audit.md` §7。
+
 无片源时第三条跑不了,但必须在报告里写明「本次未验时间轴」,不能默认它是对的。
 
 `cross_check` 会输出撞车预警(新译文 ≈ ±3 邻块现有中文)。误报率实测为 0,
@@ -217,7 +222,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 | `cross_check.py` | 中英对照复核 + 撞车预警 + 动到历史结论 | 三模式 |
 | `regression_check.py` | 跨轮次台账/连续改动/批次沉住度(只读 log,不跑模型) | 三模式 |
 | `extract_subs.py` | 列/抽片源内嵌字幕流(判轴的前置) | 对轴 |
-| `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎);qwen 分块按显存规划并跑两档,跨档不一致报 AMBIGUOUS | 对轴 |
+| `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎);qwen 分块按显存规划并跑两档,跨档不一致报 AMBIGUOUS;离群点带 `isolation`/`outlier_kind` 判别提示 | 对轴 |
 | `align_patch.py` | 按偏移量改时间轴(线性/曲线/重定时);写 log、`--revert` 撤销 | 对轴 |
 | `timeline_gate.py` | 读凭据判时间轴能否用于开工(不跑模型) | 对轴 + 自动审校阶段 0 |
 | `precheck_timeline.py` | L0 结构哨兵:秒级时间轴体检(不加载模型) | 前置 |
