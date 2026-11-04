@@ -205,7 +205,7 @@ def _norm_sub_text(text: str) -> str:
     return t
 
 
-def srt_same_source(ass: str, srt: str, *, min_ratio: float = 0.95,
+def srt_same_source(ass: str, srt: str, *, min_ratio: float = 0.995,
                     min_rows: int = 10) -> dict:
     """判断外挂 SRT 是否只是 ASS 英文轨的**派生副本**（issue #54）。
 
@@ -217,11 +217,32 @@ def srt_same_source(ass: str, srt: str, *, min_ratio: float = 0.95,
     同一份 ASR 文本换了个容器。结果 319「Yeah. ,,,and look at that.」、
     649「Ooh, t's getting busy now.」这类 ASR 错字整集无人审。
 
+    ## 门槛为什么是 0.995（不是 0.95）
+
+    「派生」不等于「低相似」：人工校对过的 SRT 是从同一份 ASR 文本改出来的，
+    大部分行仍然逐字相同，同源率通常在 0.93–0.98。0.95 会把这类**确实被
+    人改过**的 SRT 误判成派生，从而把它降级成 ASR 文本，反而否定了人工审校。
+
+    取 0.995 的理由（以整集 750 行为例）：
+
+    - 纯派生副本只差在容器/打码上：S06E04 实测 2 行（0.9973），仍在门槛之上；
+    - 0.995 在第 750 行只允许 **≤3 行**不同。一次真正的人工校对不可能只碰
+      3 行——ASR 错字是分散的（S06E04 的 319/649 之外还有很多同类），任何
+      有意义的校对都会改到 ≥4 行，于是同源率 ≤0.9947，落到门槛之下；
+    - 因此 0.995 是「几乎逐字相同才算派生」的语义，而不是「像就算」。
+      若某 SRT 只差 ≤3 行，它本来就还是 ASR 文本，把它当派生只是把第 6 类
+      打开（SRT 从不被覆盖，那 3 行改动不会丢），这是更安全的方向。
+
+    注意短样本：`min_rows=10` 且 0.995 时，20 行的片头样本必须 0 行不同才算
+    派生；生产集通常是上百行，按整集口径校准。
+
     判定口径：按起点排序后逐行比较归一化文本，同源率 ≥ `min_ratio` 且
-    行数 ≥ `min_rows` 才算派生。返回 `{"same", "ratio", "n", "n_srt"}`，
+    行数 ≥ `min_rows` 才算派生。返回
+    `{"same", "ratio", "n", "n_srt", "n_same", "n_diff"}`；
     读不出文件时 `same=False`（宁可退回旧口径，也不误开第 6 类）。
     """
-    out = {"same": False, "ratio": 0.0, "n": 0, "n_srt": 0}
+    out = {"same": False, "ratio": 0.0, "n": 0, "n_srt": 0,
+           "n_same": 0, "n_diff": 0}
     if not (ass and srt) or not os.path.exists(ass) or not os.path.exists(srt):
         return out
     try:
@@ -244,6 +265,8 @@ def srt_same_source(ass: str, srt: str, *, min_ratio: float = 0.95,
     n = min(len(en), len(sr))
     same = sum(1 for a, b in zip(en[:n], sr[:n])
                if _norm_sub_text(a.text) == _norm_sub_text(b.text))
+    out["n_same"] = same
+    out["n_diff"] = n - same
     out["ratio"] = round(same / float(n), 4)
     out["same"] = out["ratio"] >= min_ratio
     return out
@@ -386,6 +409,8 @@ def init_run(wd: str, ass: str, srt: str, plan: list, *,
             # 只是派生副本，不能当作「独立人工审校源」来关掉第 6 类。
             "srt_same_source": bool(same["same"]),
             "srt_match_ratio": same["ratio"],
+            "srt_n_same": same.get("n_same", 0),
+            "srt_n_diff": same.get("n_diff", 0),
         },
         "created": datetime.now().isoformat(timespec="seconds"),
         "frozen": None,

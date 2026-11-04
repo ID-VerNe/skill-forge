@@ -258,6 +258,56 @@ def t_srt_same_source_detection():
         r.close()
 
 
+def _write_ass_srt_pair(root, n, overrides=()):
+    """造一份 ASS 英文轨 + 同数 SRT，并让指定行在 SRT 侧被改写。"""
+    import pysubs2
+    ass = os.path.join(root, "pair.ass")
+    srt = os.path.join(root, "pair.srt")
+    subs = pysubs2.SSAFile()
+    for i in range(n):
+        subs.append(pysubs2.SSAEvent(
+            start=int(i * 2000), end=int(i * 2000 + 1800),
+            text="Line %03d base text" % i, style="英文"))
+    subs.save(ass)
+    for i in overrides:
+        subs[i].text = "Line %03d human corrected" % i
+    subs.save(srt)
+    return ass, srt
+
+
+def t_srt_same_source_threshold_protects_human():
+    """门槛 0.995：极端同源算派生；人工改过的 SRT 不能被误判成派生。
+
+    750 行时 0.995 只允许 ≤3 行不同。S06E04 的纯派生副本是 2 行不同
+    （0.9973）→ 仍判派生；人工校对至少改 4 行 → ≤0.9947 → 不判派生。
+    """
+    root = tempfile.mkdtemp(prefix="sf_same_")
+    try:
+        ass, srt = _write_ass_srt_pair(root, 750, overrides=(2, 700))
+        d = ro.srt_same_source(ass, srt)
+        assert d["same"] is True and d["ratio"] == 0.9973, d
+        assert d["n"] == 750 and d["n_diff"] == 2, d
+
+        for n_diff in (8, 20):
+            ass2, srt2 = _write_ass_srt_pair(root, 750,
+                                             overrides=tuple(range(n_diff)))
+            h = ro.srt_same_source(ass2, srt2)
+            assert h["same"] is False, (n_diff, h)
+            assert h["n_diff"] == n_diff, h
+
+        # 短样本更保守：40 行改 2 行 = 0.95，低于 0.995 → 判人工，不判派生
+        ass3, srt3 = _write_ass_srt_pair(root, 40, overrides=(0, 1))
+        s = ro.srt_same_source(ass3, srt3)
+        assert s["same"] is False and s["ratio"] == 0.95, s
+
+        # 逐字相同仍是派生（旧 0.95 门槛也能过，新门槛不能误伤）
+        ass4, srt4 = _write_ass_srt_pair(root, 20)
+        e = ro.srt_same_source(ass4, srt4)
+        assert e["same"] is True and e["ratio"] == 1.0, e
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def t_derived_srt_manifest_recorded():
     """issue #54：init 把同源实测写进 manifest，供报告/事后核对。"""
     r = Run()
@@ -777,6 +827,7 @@ if __name__ == "__main__":
         ("--no-with-spelling 可关 ASR 默认", t_no_with_spelling_overrides_asr),
         ("CLI 第 6 类开关判定", t_cli_plan_spelling_switch),
         ("派生 SRT 同源率实测", t_srt_same_source_detection),
+        ("同源门槛 0.995 不误判人工 SRT", t_srt_same_source_threshold_protects_human),
         ("派生 SRT 写进 manifest", t_derived_srt_manifest_recorded),
         ("第 7 类固定 R9", t_low_is_r09),
         ("第 8 类独立 R11", t_inclusive_is_r11),

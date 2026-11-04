@@ -175,6 +175,102 @@ def t_real_episode_metrics():
                for c in xc.evaluate(mb)[1]), xc.evaluate(mb)[1]
 
 
+def t_borrowed_tokens_not_comparable():
+    """借来的词不能进可比行（issue #55）。
+
+    rows 之间有 1 s 空隙；把 b 路第 3 行的词挪到空隙里。旧逻辑的 ≤1 s
+    近邻回退会把它认领给第 3 行，新逻辑必须标成 borrowed、排除出可比行。
+    """
+    rows = [(i * 3, i * 3 + 2, "word%02d here" % (i + 1)) for i in range(12)]
+
+    def own(shift):
+        out = []
+        for i in range(12):
+            out.append([i * 3 + shift, i * 3 + shift + 0.8, "word%02d" % (i + 1)])
+            out.append([i * 3 + shift + 0.9, i * 3 + shift + 1.9, "here"])
+        return out
+
+    a, b = own(0.1), own(0.1)
+    # 第 3 行（i=3）两词挪到 [8, 9] 空隙：距行 2 尾 0.6 / 行 3 头 0.4
+    b[6][0], b[6][1] = 8.6, 9.3
+    b[7][0], b[7][1] = 8.7, 9.0
+
+    det = xc._assign_tokens_detailed(rows, b)
+    assert 3 not in det["own"], det["own"]
+    assert det["borrowed"][3][0][0][2] == "word04", det["borrowed"]
+    assert xc.row_starts(rows, b).get(3) is None, xc.row_starts(rows, b)
+
+    st = {"n_pairs": 12, "median": 0.1, "slope": 0.0, "window_span": 0.0,
+          "verdict": "PASS", "ok": True}
+    r = xc.compare(rows, a, b, stats_a=dict(st), stats_b=dict(st))
+    assert r["n_compared"] == 11, r["n_compared"]
+    assert r["n_borrowed"] == 1, r["coverage"]
+    assert r["coverage"]["b"]["borrowed_only_rows"] == [3], r["coverage"]["b"]
+    assert r["coverage"]["b"]["n_borrowed_tokens"] == 2, r["coverage"]["b"]
+    text = "\n".join(xc.render_section(r))
+    assert "借词行" in text, text
+
+
+def t_zero_token_row_counted():
+    """区间内一个词都没有的行单列 n_zero_token，且不进可比行。"""
+    rows = [(i * 10, i * 10 + 8, "word%02d here" % (i + 1)) for i in range(12)]
+
+    def own(shift, skip=None):
+        out = []
+        for i in range(12):
+            if i == skip:
+                continue
+            out.append([i * 10 + shift, i * 10 + shift + 0.8, "word%02d" % (i + 1)])
+            out.append([i * 10 + shift + 0.9, i * 10 + shift + 1.7, "here"])
+        return out
+
+    a, b = own(0.1), own(0.1, skip=4)
+    st = {"n_pairs": 12, "median": 0.1, "slope": 0.0, "window_span": 0.0,
+          "verdict": "PASS", "ok": True}
+    r = xc.compare(rows, a, b, stats_a=dict(st), stats_b=dict(st))
+    assert r["coverage"]["b"]["zero_token_rows"] == [4], r["coverage"]["b"]
+    assert r["coverage"]["b"]["n_zero_token_rows"] == 1, r["coverage"]["b"]
+    assert r["n_zero_token"] == 1, r["coverage"]
+    assert r["n_compared"] == 11, r["n_compared"]
+    assert r["n_borrowed"] == 0, r["coverage"]
+
+
+def t_real_own_divergence_not_washed():
+    """反向测试：真·本行 token 的分歧不能被归行修复洗白。
+
+    - 整体逐行晚 1.5 s（全部是本行 token）→ 仍须 divergent；
+    - 只有两行偏 4.0 s、中位差 0（本行 token）→ 仍须 spread_only，不能升格
+      corroborated。
+    """
+    rows = [(i * 10, i * 10 + 9, "word%02d here" % (i + 1)) for i in range(12)]
+
+    def own(shift, jumps=()):
+        out = []
+        for i in range(12):
+            s = i * 10 + shift + (4.0 if i in jumps else 0.0)
+            out.append([s, s + 0.8, "word%02d" % (i + 1)])
+            out.append([s + 0.9, s + 1.7, "here"])
+        return out
+
+    st = {"n_pairs": 12, "median": 0.1, "slope": 0.0, "window_span": 0.0,
+          "verdict": "PASS", "ok": True}
+
+    a, b = own(0.5), own(2.0)          # 每行差 1.5 s，但都在本行跨度内
+    r = xc.compare(rows, a, b, stats_a=dict(st), stats_b=dict(st))
+    assert r["n_compared"] == 12, r["n_compared"]
+    assert r["n_borrowed"] == 0 and r["n_zero_token"] == 0, r["coverage"]
+    assert r["status"] == "divergent", r
+    assert r["metrics"]["bias_median"] > xc.THRESHOLDS["bias_median_s"], r["metrics"]
+
+    a2, b2 = own(0.5), own(0.5, jumps=(10, 11))
+    r2 = xc.compare(rows, a2, b2, stats_a=dict(st), stats_b=dict(st))
+    assert r2["status"] == "spread_only", r2
+    assert r2["metrics"]["row_p90"] > xc.THRESHOLDS["row_p90_s"], r2["metrics"]
+    assert r2["metrics"]["outlier_share"] > xc.THRESHOLDS["row_outlier_share"], r2["metrics"]
+    assert r2["worst_rows"], r2
+
+
+
 def t_single_source_not_claiming():
     rows = _rows()
     a = _tokens(shift=0.1)
@@ -372,6 +468,9 @@ if __name__ == "__main__":
     test("两路都不足 → no_data", t_no_data)
     test("token 清洗：说话人/超长/反向", t_sanitize)
     test("行起点按 token 起点归行", t_row_start_uses_token_start)
+    test("借来的词不计入可比行", t_borrowed_tokens_not_comparable)
+    test("零 token 行单列计数", t_zero_token_row_counted)
+    test("真·本行 token 的分歧不被洗白", t_real_own_divergence_not_washed)
     test("文本不同但时间戳一致仍互证", t_text_not_primary)
     test("互证不改调用方 stats", t_stats_dicts_untouched)
     test("时间轴判定不被双对齐器改动", t_align_audit_verdict_unchanged)

@@ -20,6 +20,12 @@
 > 两个引擎只是在做「文本 ↔ 音频」的强制对齐。whisper 一侧由 whisperX 的
 > wav2vec2 对齐器承担，不是 faster-whisper 的 ASR 转写。
 
+> **归行只认本行的词（issue #55 修正）**。token 起点必须落在该行时间跨度内
+> 才算本行的词；旧逻辑的 ≤1 s 近邻回退会把邻行/行间空隙的词借过来，制造
+> 「假的可比行」。借词现在只记 `borrowed_from` 与 `n_borrowed`，**不进入**
+> P90 / 中位 / >0.70 s 占比的分母；区间内一个词都没有的行单列 `n_zero_token`
+> （whisperX 在静音/吞词处会这样）。可比行 = 两路都只用自己的 token。
+
 ## 四态
 
 判据不再看「斜率差绝对值」（两路斜率口径本就不同，直接比绝对值只会放大
@@ -166,38 +172,134 @@ def load_tokens(path: str) -> list:
     return out
 
 
-def _assign_tokens(rows, tokens) -> dict:
-    """把每个 token 归到**它的起点所在**的行。
+#: 归行容差（秒）。0 = token 起点必须严格落在本行 `[start, end]` 内。
+#: 只对行尾留一点余量（对齐器常在句末给 `start == end` 的零长 token）；
+#: 起点落在行外的一律不算本行的词。
+OWN_TOL_S = 0.0
 
-    返回 `{row_index: [token, ...]}`。按时间归位，不按文本匹配，否则
-    「两路时间戳差得远」的行会先被文本筛掉，正好丢掉要看的证据。
+#: 旧逻辑的近邻回退半径（秒）。现在只用来**识别**哪些 token 会被旧逻辑
+#: 借走，用于诊断计数；它们**不参与**行起点与逐行差。
+BORROW_RADIUS_S = 1.0
+
+
+def _assign_tokens_detailed(rows, tokens, *, tol=OWN_TOL_S,
+                            borrow_radius=BORROW_RADIUS_S) -> dict:
+    """按**起点**归行，并把「本行的词」与「借来的词」显式分开。
+
+    返回：
+
+    - `own: {row: [token, ...]}`：起点落在本行 `[start, end]`（含 `tol`）内；
+    - `borrowed: {row: [(token, gap), ...]}`：起点在本行跨度外，但旧逻辑的
+      ≤`borrow_radius` 近邻回退会认领给它；**只作证据，不进入可比行**；
+    - `n_far`：距最近行超过 `borrow_radius` 的 token（旧逻辑也会丢弃）。
+
+    issue #55：旧实现把上述 borrowed 也塞进 `by_row`，于是「行间空隙的词」
+    变成本行起点。S06E04 实测：273 在 whisperX 侧本行区间内无词，起点
+    1003.909 来自行后空隙；139 的 qwen 起点 453.595 落在本行起点 453.960
+    之前，旧口径把它的差值从 −1.409 s 放大到 −2.369 s。现在可比行只由
+    own 构成，borrowed 单列成 `n_borrowed`。
+
+    注意：314/4/320 这类行的首词**时间上落在本行跨度内**、文本上却是后一行
+    的词（B 路整体滞后）。那不是归行借词，而是真分歧，本规则不会把它洗掉
+    ——这正是「修归行不能顺手把真分歧变白」的边界。
 
     **必须用起点而不是「最大重叠」判定**：实测 whisperX 会把句末词的 end
     拉到下一句开头（`details. 41.734→62.241`），按重叠归行会让这一行
     认领下一行的词，把行起点前移十几秒——那不是对齐器分歧，是归行错误。
     """
+    own: dict = {}
+    borrowed: dict = {}
+    n_far = 0
+    if not rows:
+        return {"own": own, "borrowed": borrowed, "n_far": len(tokens),
+                "stats": {"n_in": len(tokens), "n_own_tokens": 0, "n_own_rows": 0,
+                          "n_borrowed_tokens": 0, "n_any_borrowed_rows": 0,
+                          "n_far": len(tokens)}}
     starts = [r[0] for r in rows]
-    by_row: dict = {}
     for t in tokens:
-        s, _, _ = t
+        s = t[0]
         i = bisect.bisect_right(starts, s) - 1
-        if 0 <= i < len(rows) and s < rows[i][1]:
-            by_row.setdefault(i, []).append(t)
+        if 0 <= i < len(rows) and s <= rows[i][1] + tol:
+            own.setdefault(i, []).append(t)
             continue
-        # 起点落在行间空隙或首行之前：只在距行边界 ≤1s 时归入最近一行，
-        # 否则丢弃（例如片头静音被并成 token 时，起点 0.0 离首行 23s）。
+        # 起点落在行间空隙或首行之前：算出旧逻辑会把它认领给谁。
         near = min(range(len(rows)),
                    key=lambda j: min(abs(s - rows[j][1]), abs(s - rows[j][0])))
         gap = max(rows[near][0] - s, s - rows[near][1], 0.0)
-        if gap <= 1.0:
-            by_row.setdefault(near, []).append(t)
-    return by_row
+        if gap <= borrow_radius:
+            borrowed.setdefault(near, []).append((t, round(gap, 3)))
+        else:
+            n_far += 1
+    stats = {
+        "n_in": len(tokens),
+        "n_own_tokens": sum(len(v) for v in own.values()),
+        "n_own_rows": len(own),
+        "n_borrowed_tokens": sum(len(v) for v in borrowed.values()),
+        "n_any_borrowed_rows": len(borrowed),
+        "n_far": n_far,
+    }
+    return {"own": own, "borrowed": borrowed, "n_far": n_far, "stats": stats}
+
+
+def _assign_tokens(rows, tokens) -> dict:
+    """只返回**本行自己的** token（`{row: [token, ...]}`）。
+
+    借来的词不在这里出现——保留这个窄接口，避免调用方无意间又把借词
+    当成证据。需要诊断时用 `_assign_tokens_detailed`。
+    """
+    return _assign_tokens_detailed(rows, tokens)["own"]
 
 
 def row_starts(rows, tokens) -> dict:
-    """每行在该路对齐结果下的起点：归到该行最早一个 token 的 start。"""
+    """每行在该路对齐结果下的起点：归到该行**自己的**最早 token 的 start。"""
     by_row = _assign_tokens(rows, tokens)
     return {i: min(t[0] for t in ts) for i, ts in by_row.items()}
+
+
+def _coverage_stats(rows, detail_a, detail_b) -> dict:
+    """可比行 / 借词行 / 零 token 行的分类计数。
+
+    - `n_compared`：两路都有**本行自己的** token 的行；
+    - `n_borrowed`：至少一路**只有借词、没有本行词**的行（旧逻辑会把这些
+      行算成可比行，是污染源）；
+    - `n_zero_token`：至少一路在该行区间内**一个 token 都没有**的行
+      （whisperX 在静音/吞词处会这样）。
+    """
+    n = len(rows)
+    own_a, own_b = detail_a["own"], detail_b["own"]
+    bor_a, bor_b = detail_a["borrowed"], detail_b["borrowed"]
+
+    def per_source(own, bor):
+        borrowed_only = [i for i in bor if i not in own]
+        zero = [i for i in range(n) if i not in own and i not in bor]
+        return {
+            "n_own_rows": len(own),
+            "n_own_tokens": sum(len(v) for v in own.values()),
+            "n_borrowed_rows": len(borrowed_only),
+            "n_borrowed_tokens": sum(len(v) for v in bor.values()),
+            "n_zero_token_rows": len(zero),
+            "borrowed_only_rows": sorted(borrowed_only),
+            "zero_token_rows": sorted(zero),
+        }
+
+    sa, sb = per_source(own_a, bor_a), per_source(own_b, bor_b)
+    borrowed_union = sorted(set(sa["borrowed_only_rows"]) | set(sb["borrowed_only_rows"]))
+    zero_union = sorted(set(sa["zero_token_rows"]) | set(sb["zero_token_rows"]))
+    own_only_a = sorted(set(own_a) - set(own_b))
+    own_only_b = sorted(set(own_b) - set(own_a))
+    return {
+        "a": sa,
+        "b": sb,
+        "n_compared": len(set(own_a) & set(own_b)),
+        "n_own_only_a": len(own_only_a),
+        "n_own_only_b": len(own_only_b),
+        "n_borrowed": len(borrowed_union),
+        "n_zero_token": len(zero_union),
+        "borrowed_rows": borrowed_union,
+        "zero_token_rows": zero_union,
+        "note": ("n_borrowed / n_zero_token 是并集：任一路借词/无词即计入；"
+                 "两者可能重叠（一路借词、另一路无词）。"),
+    }
 
 
 def _row_text(tokens) -> str:
@@ -237,10 +339,22 @@ def compare(rows, tokens_a, tokens_b, *, label_a="aligner-a",
     n_rows = len(rows)
     toks_a, filter_a = sanitize(tokens_a) if tokens_a else ([], {"n_in": 0, "n_kept": 0})
     toks_b, filter_b = sanitize(tokens_b) if tokens_b else ([], {"n_in": 0, "n_kept": 0})
-    ta = row_starts(rows, toks_a) if toks_a else {}
-    tb = row_starts(rows, toks_b) if toks_b else {}
+    det_a = (_assign_tokens_detailed(rows, toks_a) if toks_a
+             else {"own": {}, "borrowed": {}, "n_far": 0,
+                   "stats": {"n_in": 0, "n_own_tokens": 0, "n_own_rows": 0,
+                             "n_borrowed_tokens": 0, "n_any_borrowed_rows": 0,
+                             "n_far": 0}})
+    det_b = (_assign_tokens_detailed(rows, toks_b) if toks_b
+             else {"own": {}, "borrowed": {}, "n_far": 0,
+                   "stats": {"n_in": 0, "n_own_tokens": 0, "n_own_rows": 0,
+                             "n_borrowed_tokens": 0, "n_any_borrowed_rows": 0,
+                             "n_far": 0}})
+    # 可比行只由**本行自己的** token 构成；借词（旧 ≤1 s 近邻回退）不进分母。
+    ta = {i: min(t[0] for t in ts) for i, ts in det_a["own"].items()}
+    tb = {i: min(t[0] for t in ts) for i, ts in det_b["own"].items()}
     common = sorted(set(ta) & set(tb))
     uncovered = n_rows - len(common)
+    coverage = _coverage_stats(rows, det_a, det_b)
     deltas = [ta[i] - tb[i] for i in common]
     adeltas = [abs(x) for x in deltas]
 
@@ -274,6 +388,9 @@ def compare(rows, tokens_a, tokens_b, *, label_a="aligner-a",
         "n_rows": n_rows,
         "n_compared": len(common),
         "n_uncovered": uncovered,
+        "n_borrowed": coverage["n_borrowed"],
+        "n_zero_token": coverage["n_zero_token"],
+        "coverage": coverage,
         "timestamp_delta": dist(adeltas),
         "thresholds": dict(THRESHOLDS),
         "threshold_text": dict(THRESHOLD_TEXT),
@@ -281,8 +398,10 @@ def compare(rows, tokens_a, tokens_b, *, label_a="aligner-a",
         "note": ("只比对两路对齐器的时间戳：不比对转写文本，不自动改写英文轨，"
                  "不参与时间轴 PASS/FAIL 数值计算（divergent 仅可升格为 AMBIGUOUS）。"),
         "sources": {
-            "a": dict(_src_view(label_a, stats_a, n_a, tol_a), filter=filter_a),
-            "b": dict(_src_view(label_b, stats_b, n_b, tol_b), filter=filter_b),
+            "a": dict(_src_view(label_a, stats_a, n_a, tol_a), filter=filter_a,
+                      **coverage["a"]),
+            "b": dict(_src_view(label_b, stats_b, n_b, tol_b), filter=filter_b,
+                      **coverage["b"]),
         },
     }
 
@@ -299,8 +418,7 @@ def compare(rows, tokens_a, tokens_b, *, label_a="aligner-a",
     ]
 
     # 文本只留极次要的 sanity 计数（不参与状态判定）
-    ba = _assign_tokens(rows, toks_a) if toks_a else {}
-    bb = _assign_tokens(rows, toks_b) if toks_b else {}
+    ba, bb = det_a["own"], det_b["own"]
     same = diff = 0
     for i in common:
         wa = ac.words_of(_row_text(ba.get(i, [])))
@@ -475,11 +593,20 @@ def render_section(dual) -> list:
          "- 路 A：`%s`；路 B：`%s`" % (dual["label_a"], dual["label_b"]),
          "- 行数 %d；两路可比 %d；单路缺覆盖 %d"
          % (dual["n_rows"], dual["n_compared"], dual["n_uncovered"]),
+         "- 归行口径：可比行只由**本行自己的** token 构成；"
+         "借词行 %s（旧 ≤1 s 近邻回退会误算成可比行）、零 token 行 %s"
+         % (dual.get("n_borrowed", "—"), dual.get("n_zero_token", "—")),
          "- 阈值：%s" % dual.get("threshold_status", THRESHOLD_STATUS), ""]
 
     sa, sb = dual["sources"]["a"], dual["sources"]["b"]
     L += ["| 指标 | 路 A | 路 B |", "|---|---|---|",
           "| 锚点数 | %s | %s |" % (sa.get("n_pairs", "—"), sb.get("n_pairs", "—")),
+          "| 本行 token 行数 | %s | %s |"
+          % (sa.get("n_own_rows", "—"), sb.get("n_own_rows", "—")),
+          "| 只有借词的行 | %s | %s |"
+          % (sa.get("n_borrowed_rows", "—"), sb.get("n_borrowed_rows", "—")),
+          "| 零 token 行 | %s | %s |"
+          % (sa.get("n_zero_token_rows", "—"), sb.get("n_zero_token_rows", "—")),
           "| 偏移中位 (s) | %s | %s |"
           % (("%+.3f" % sa["median"]) if sa.get("usable") else "不可用",
              ("%+.3f" % sb["median"]) if sb.get("usable") else "不可用"),

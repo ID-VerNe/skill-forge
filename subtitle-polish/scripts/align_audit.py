@@ -755,9 +755,10 @@ def main():
                 print("  vs %-28s 中位 %s  斜率 %+.6f  %s"
                       % (args.aligner_b_label, _fmt(stats_b["median"]),
                          stats_b["slope"], stats_b["verdict"]))
-            print("  [dual] %s：可比 %d 行，起点差中位 %.3f s / P90 %.3f s / 最大 %.3f s"
-                  "（仅标可信度，不改判定）"
+            print("  [dual] %s：可比 %d 行，借词行 %d / 零 token 行 %d，"
+                  "起点差中位 %.3f s / P90 %.3f s / 最大 %.3f s（仅标可信度，不改判定）"
                   % (dual["status"], dual["n_compared"],
+                     dual.get("n_borrowed", 0), dual.get("n_zero_token", 0),
                      dual["timestamp_delta"]["median"],
                      dual["timestamp_delta"]["p90"],
                      dual["timestamp_delta"]["max"]))
