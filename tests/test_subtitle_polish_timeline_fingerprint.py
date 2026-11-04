@@ -165,7 +165,11 @@ def test_many_text_edits_keep_pass():
 
 
 def test_style_edit_keeps_pass():
-    """样式不属于「什么时候出现」：改样式名不该失效。"""
+    """样式/轨归属不属于「什么时候出现」：改 Style（即换轨）不该失效。
+
+    对应 references/timeline-credential.md「为什么 track 不参与指纹」：指纹只取
+    (start, end, layer)。这里把整轨从 Default 换到 Alt、时间一字不改，必须 PASS。
+    """
     d = tempfile.mkdtemp()
     try:
         ass = os.path.join(d, "S06E06.eng.ass")
@@ -177,6 +181,8 @@ def test_style_edit_keeps_pass():
         _write_ass(ass, rows, style="Alt")
         res = cred.check(ass)
         assert res["verdict"] == V.PASS, res
+        # 只换轨、文本没动：不该误报「文本已改 N 条」
+        assert not _text_notes(res), res.get("notes")
     finally:
         shutil.rmtree(d)
 
