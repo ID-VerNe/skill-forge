@@ -47,6 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import align_core as ac
 from lib import align_cross as xc
+from lib import align_device as ad
 from lib import axis as ax
 from lib import credential as cred
 from lib import verdict as V
@@ -332,6 +333,8 @@ def _qwen_runs_subprocess(args, chunks):
         cmd += ["--track", args.track]
     if args.single_chunk:
         cmd += ["--single-chunk"]
+    if getattr(args, "allow_cpu", False):
+        cmd += ["--allow-cpu"]
     proc = subprocess.run(cmd)
     if proc.returncode != 0 or not os.path.exists(out):
         raise SystemExit("qwen 独立环境对齐失败（退出码 %d）：%s"
@@ -382,7 +385,7 @@ def print_summary(name, stats, n_rows, engine):
 
 
 def build_report(args, stats, n_rows, engine, compare, axis_res=None,
-                 dual=None):
+                 dual=None, device_info=None):
     L = ["# 对齐审计 · %s" % os.path.basename(args.sub), ""]
     if args.media_path.startswith("("):
         L.append("- 音频：%s（仅用缓存的词级时间戳）" % args.media_path)
@@ -392,6 +395,8 @@ def build_report(args, stats, n_rows, engine, compare, axis_res=None,
         if dur:
             L.append("- 时长：%.1f s" % dur)
     L.append("- 引擎：%s" % engine)
+    if device_info:
+        L.append("- " + ad.fmt_line(device_info))
     L.append("- 锚点：%d/%d（%.1f%%），剔除离群 %d 条（|delta−中位| > %.2f）"
              % (stats["n_pairs"], n_rows,
                 100.0 * stats["n_pairs"] / n_rows if n_rows else 0.0,
@@ -592,6 +597,9 @@ def main():
     ap.add_argument("--qwen-python", default=os.environ.get("QWEN_PYTHON", ""),
                     help="qwen 独立环境的 python.exe。给了就走子进程读词级 JSON，"
                          "主环境不再需要 qwen_asr（也可用环境变量 QWEN_PYTHON）")
+    ap.add_argument("--allow-cpu", action="store_true",
+                    help="显式允许在没有 CUDA 的解释器上跑对齐（默认硬失败）。"
+                         "只用于接线验证；CPU 上的耗时/结果不能当校准证据")
     ap.add_argument("--tol", type=float, default=None,
                     help="分时段中位极差阈值（秒）。默认按引擎取：qwen 0.3 / whisper 0.5")
     ap.add_argument("--min-n", type=int, default=5, help="时段最少样本数")
@@ -627,6 +635,7 @@ def main():
 
     # 1) 词级时间戳
     alt_runs = []          # [(chunk, tokens), ...]：qwen 的跨分块复核
+    device_info = None     # 对齐设备（只有真正跑模型时才探测得到）
     if args.asr_words:
         with open(args.asr_words, encoding="utf-8") as f:
             tokens = [tuple(x) for x in json.load(f)]
@@ -650,12 +659,18 @@ def main():
                 chunks = [c1] + ([c2] if c2 else [])
                 print("  分块规划：%ds + %s（%s）"
                       % (c1, ("%ds" % c2) if c2 else "无副档（已在最小档）", why))
+            # 设备硬门：没有 CUDA 直接失败，不静默在 CPU 上算。
+            # 主环境是 torch 2.15.0+cpu，只要走到它会无声变慢 10 倍且结果不可比。
+            if not args.qwen_python:
+                args.qwen_python = ad.find_qwen_python()
+            device_info = ad.require_cuda(args.qwen_python or None,
+                                          allow_cpu=args.allow_cpu,
+                                          purpose="qwen 强制对齐",
+                                          require_qwen=True)
+            print("  " + ad.fmt_line(device_info), flush=True)
             if args.qwen_python:
                 runs = _qwen_runs_subprocess(args, chunks)
             else:
-                print("  [warn] 未给 --qwen-python：qwen 将在当前解释器里加载模型。"
-                      "建议用独立环境跑（主环境不必装 qwen_asr），见 "
-                      "references/align-audit.md §7.6", file=sys.stderr)
                 runs = tokens_qwen_dual(args.media_path, rows, args.model, chunks)
             tokens = runs[0][1]
             alt_runs = runs[1:]
@@ -805,7 +820,7 @@ def main():
     if args.report:
         os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
         text = build_report(args, stats, len(rows), engine, compare, axis_res,
-                            dual=dual)
+                            dual=dual, device_info=device_info)
         with open(args.report, "w", encoding="utf-8") as f:
             f.write(text + "\n")
         print("\n[report] %s" % args.report)
@@ -836,6 +851,8 @@ def main():
             "reject": rej_info,
             "verdict": stats["verdict"],
             "axis": axis_res,
+            # 对齐设备：谁跑的、什么 torch、是不是 CUDA。没有跑模型时为 None。
+            "device_info": ad.record(device_info) if device_info else None,
             # 双对齐器时间戳互证：只做可信度标注。这里写进 json 但不进 stats，
             # 下游若只看 verdict/curve，行为与旧版完全一致。
             "dual_aligner": dual,
