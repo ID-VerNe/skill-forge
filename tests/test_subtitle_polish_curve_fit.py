@@ -211,9 +211,10 @@ def test_patch_invalidates_credential():
                                 "--write", "--work-dir", wd])
         res = cred.check(ass)
         assert res["verdict"] == 3, res
-        assert any("改过时间轴但未复测" in r for r in res["reasons"]), res["reasons"]
+        # 新口径：吊销凭据的是轴指纹，不是 patched_at；理由要能定位到哪几条变了。
+        assert any("时间轴已变" in r for r in res["reasons"]), res["reasons"]
         assert not any("内容已变" in r for r in res["reasons"]), \
-            "touch_patch 应同步 sha1，否则会报错原因"
+            "touch_patch 后不该再按整文件报「内容已变」"
     finally:
         shutil.rmtree(d)
 
