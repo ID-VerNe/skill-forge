@@ -570,6 +570,10 @@ def record_round(wd: str, stamp: str, rid: str, *,
         rows = [int(x) for x in freeze_rows]
         m["frozen_rows"] = sorted(set(m.get("frozen_rows", [])) | set(rows))
 
+    # 台账折算：回滚后「净改动」会小于「Σn_fixes」，差额记在本轮。
+    # 这一步必须在 log 归并之后（否则读到的是上一轮的盘面）。
+    _reconcile_ledger(m, wd, rid)
+
     save_manifest(wd, stamp, m)
     return m
 
@@ -807,6 +811,82 @@ def _effective_net(ledger: list) -> int:
                if (r.get("new") or "") != (r.get("old") or ""))
 
 
+def _ledger_total(rounds: list, only_kept: bool = False) -> int:
+    """台账累计 = 各轮 n_fixes + 折算项（负值抵消被回滚的轮次）。
+
+    `ledger_adjust` 由 `_reconcile_ledger()` 在每轮 `--record` 时写入：快照
+    封存后不能再改早期轮次的 n_fixes（那是历史事实），但账要能对得上——把
+    差额记成一条折算项，而不是回头篡改。
+    """
+    src = [r for r in rounds if r["verdict"] in SNAPSHOT_VERDICTS] if only_kept else rounds
+    return sum(int(r.get("n_fixes") or 0) + int(r.get("ledger_adjust") or 0)
+               for r in src)
+
+
+def _reconcile_ledger(m: dict, wd: str, rid: str) -> None:
+    """把「净改动」与「台账累计」的差额记到本轮，避免报告长期背着不一致告警。
+
+    典型场景：r01 记了 8 条，随后整批回滚，`--record` 的 r01 快照已封存，
+    不能改；于是每份报告都写「台账 11 / 净改动 3」。这里在**当前轮**记一条
+    折算项（负数），让 `Σn_fixes + Σledger_adjust == 净改动`。
+
+    本轮的 n_fixes 是「本轮实际写过几条」，不能拿折算去掩盖它；折算只吸收
+    **不属于本轮**的历史差额（回滚、外部 apply、手工改盘）。
+    """
+    target = next(r for r in m["rounds"] if r["id"] == rid)
+    target["ledger_adjust"] = 0
+    net = _effective_net(_parse_ledger(read_log(wd)))
+    total = _ledger_total(m["rounds"])
+    target["ledger_adjust"] = net - total
+
+
+def _ledger_suffix(net: int, total: int, base_total: int, carried: int) -> str:
+    """顶栏「台账」那半句：净改动与台账必须对得上。
+
+    对不上的唯一合法来源是「回滚折算」——早期轮次的 n_fixes 随快照封存，
+    不能改，差额记成当前轮的 `ledger_adjust`。若折算之后仍对不上（回滚后
+    直接出报告、没有新 `--record`），报告层按盘面折算一次并标明，**不写回
+    manifest**（快照是历史事实，不篡改）。
+    """
+    if net == total:
+        if carried:
+            return "（台账 %d 条，含回滚折算 %+d 条）" % (total, carried)
+        return ""
+    return ("（台账 %d 条 = 原始累计 %d 条 + 回滚折算 %+d 条，已按盘面对齐）"
+            % (net, base_total, net - base_total))
+
+
+def _round_cell(row: dict, b2r: dict) -> str:
+    """总账「轮次」列：真实轮次集合 + 非轮次批次/净零标注。
+
+    以前这里写 `len(batches)`——那是「被几个批次碰过」，不是轮次号。
+    一行被 r01 改过、又被两个回滚批次撤销，会显示 3，读起来像「第 3 轮」。
+    """
+    ids = []
+    for b in row.get("batches") or []:
+        rid = b2r.get(b)
+        if rid and rid not in ids:
+            ids.append(rid)
+    stray = any(b and b not in b2r for b in row.get("batches") or [])
+    txt = ", ".join(ids) if ids else "—"
+    if stray:
+        txt += "*"
+    if (row.get("new") or "") == (row.get("old") or ""):
+        txt += "（净零）"
+    return txt
+
+
+def _path_differs(a: str, b: str) -> bool:
+    """两个路径是否指向不同文件（用于标注跨 run 的历史日志路径）。"""
+    if not a or not b:
+        return False
+    try:
+        return (os.path.normcase(os.path.abspath(a))
+                != os.path.normcase(os.path.abspath(b)))
+    except Exception:       # noqa: BLE001
+        return True
+
+
 def _script(name: str) -> str:
     """同目录脚本的实际路径（报告里的命令用真实路径，不写 `<skill>` 模板）。"""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
@@ -1019,7 +1099,9 @@ def _render_single_report(wd: str, stamp: str) -> str:
     advisory = [r for r in rounds if r["verdict"] == "advisory"]
     rolled = [r for r in rounds if r["verdict"] == "rollback"]
     skipped = [r for r in rounds if r["verdict"] == "skip"]
-    total = sum(r["n_fixes"] for r in kept)
+    total = _ledger_total(rounds, only_kept=True)
+    base_total = sum(int(r.get("n_fixes") or 0) for r in kept)
+    carried = total - base_total
 
     churn = _churn_by_batch(wd)
     conflicts = _conflicts(wd)
@@ -1041,17 +1123,13 @@ def _render_single_report(wd: str, stamp: str) -> str:
         top.append(f"skip {len(skipped)}")
     if advisory:
         top.append(f"建议未落盘 {sum(r.get('optional_pending', 0) for r in advisory)} 条")
-    top.append(f"净改动 {net} 条" + (f"（台账 {total} 条）" if net != total else ""))
+    top.append(f"净改动 {net} 条" + (_ledger_suffix(net, total, base_total, carried)))
     top.append(_timeline_top_text(tl))
     if m.get("frozen"):
         top.append(f"**已定格于 {m['frozen']['at']}：{m['frozen']['reason']}**")
     L += ["> " + " / ".join(top), ""]
     if tl.get("notes"):
         L += ["> 注：" + "；".join(tl["notes"]), ""]
-    if net != total:
-        L += ["> ⚠ 台账与日志不一致：台账累计 %d 条，按日志（含 rollback）折算的"
-              "净改动只有 %d 条。多半是回滚后没更新轮次台账——以日志为准，"
-              "别把台账当盘面。" % (total, net), ""]
     if "verify-fixes.md" in vnames:
         L += ["> ⚠ 验证结论已作废：%s。回滚改变了盘面，旧的「通过」不再代表当前状态，"
               "必须重跑 `verify_fixes --all`。" % (vst.get("reason") or "回滚"), ""]
@@ -1081,7 +1159,7 @@ def _render_single_report(wd: str, stamp: str) -> str:
             # B3：这一列以前硬写着 `--rollback id=N`，但只有 srt_id 没有 file，
             # 照着抄会回滚到**同号的所有文件**。走 _rollback_cmd() 统一生成，
             # 顺带把 file 带上。
-            cmd = _rollback_cmd(c.get("file") or m["ass"], srt_id=sid, work_dir=wd)
+            cmd = _rollback_cmd(m["ass"], srt_id=sid, work_dir=wd)
             L.append("| %s | %s | %s | %s | `%s` |" % (
                 sid, c["key"][2], c["n_rounds"], trail, cmd))
         L += ["", "> 这一节是给人裁的，不是结论。改回去有时是对的（上一轮确实改错了）。", ""]
@@ -1110,15 +1188,36 @@ def _render_single_report(wd: str, stamp: str) -> str:
 
     L += ["## 改动总账", ""]
     if ledger:
+        # batch_id -> 轮 id。这一列要写**真正的轮次号**，不是「被几个批次
+        # 碰过」：R1 的 8 条改动还被两个回滚批次碰过，按批次数会显示 3，
+        # 而它们其实只属于 r01。
+        b2r = {r["batch_id"]: r["id"] for r in rounds if r.get("batch_id")}
+        stray_files = []
         L += ["| srt_id | 轨道 | 原译 | 终译 | 类别 | 轮次 | 回滚 |",
               "|---|---|---|---|---|---|---|"]
         for r in ledger:
-            cmd = _rollback_cmd(r.get("file") or m["ass"], srt_id=r["srt_id"],
-                                work_dir=wd)
+            # 单条回滚必须指向**本次实际在用的** ASS：历史日志里的 file 是
+            # 上一次 run 的路径，跨 run 复用时会回滚到别的目录。
+            cmd = _rollback_cmd(m["ass"], srt_id=r["srt_id"], work_dir=wd)
+            hist = r.get("file") or ""
+            if hist and _path_differs(hist, m["ass"]):
+                stray_files.append((r["srt_id"], hist))
             L.append("| %s | %s | %s | %s | %s | %s | `%s` |" % (
                 r["srt_id"], r["track"], _md_cell(r["old"]) or "—", _md_cell(r["new"]) or "—",
-                r["category"] or "—", len(r["batches"]), cmd))
+                r["category"] or "—", _round_cell(r, b2r), cmd))
         L.append("")
+        has_star = any(b and b not in b2r for r in ledger for b in r["batches"])
+        has_zero = any((r.get("new") or "") == (r.get("old") or "") for r in ledger)
+        if has_star or has_zero:
+            L += ["> 「轮次」列：`*` = 该行另经过非轮次批次（回滚或外部 apply_fixes）；"
+                  "「净零」= 终译与首稿相同（典型是已回滚）。", ""]
+        if stray_files:
+            L += ["> 注：单条回滚命令已统一改用**本次运行的文件** `%s`。"
+                  "以下改动的历史日志记录在另一个文件，照抄旧路径会回滚到别的目录："
+                  % os.path.basename(m["ass"]), ""]
+            for sid, hist in stray_files[:20]:
+                L.append("- srt_id %s：日志文件 `%s`" % (sid, hist))
+            L += [""]
         # B3：整批回滚给的是 batch_id，不是轮 id——两者长得像（都在 --run 上下文里），
         # 混用会回滚错一整轮。这里按「每轮一行」列出来，抄一行就是一轮。
         bt = [r for r in kept if r["batch_id"]]
@@ -1347,8 +1446,7 @@ def _render_cross_run(sums) -> list:
             len(rounds), len(done),
             sum(1 for r in rounds if r["verdict"] == "rollback"),
             sum(1 for r in rounds if r["verdict"] == "skip"),
-            sum(r["n_fixes"] for r in rounds
-                if r["verdict"] in SNAPSHOT_VERDICTS),
+            _ledger_total(rounds, only_kept=True),
             "是" if m.get("frozen") else "—"))
     L += [""]
 

@@ -10,14 +10,21 @@
     1. 凭据不存在                        -> UNVERIFIED
     2. 凭据绑定了片源但没给 --media        -> UNVERIFIED   无法确认没换片
     3. media.sha1 与当前片源不符           -> UNVERIFIED   换片了
-    4. files[].sha1 与当前文件不符         -> UNVERIFIED   文件被外部改过
-    5. files[].patched_at > computed_at   -> UNVERIFIED   改过时间轴但没复测
-    6. axis.verdict 不是 PASS            -> 按原样透传 FAIL(2) / AMBIGUOUS(4)
-    7. 其余                               -> PASS
+    4. 时间轴指纹与当前文件不符            -> UNVERIFIED   轴变了
+       （改 start/end、增删行、调序、换层；旧凭据没有指纹时退回 sha1/patched_at）
+    5. axis.verdict 不是 PASS            -> 按原样透传 FAIL(2) / AMBIGUOUS(4)
+    6. 其余                               -> PASS
 
-**顺序有意义**：陈旧性（2~5）必须排在 verdict（6）前面。一份写着 PASS 的凭据，
+**顺序有意义**：陈旧性（2~4）必须排在 verdict（5）前面。一份写着 PASS 的凭据，
 如果文件之后又被改过，它描述的是过去的状态——此时原来 PASS 还是 FAIL 都不作数。
 顺序写反会得到「凭据过期了但照样放行」。
+
+**第 4 条绑的是「时间轴事实」，不是整份文件**：文本轮（翻译、润色）每天都在改
+文案，样式轮也可能调样式，它们都不改变「字幕在什么时候出现」。按整文件 sha1
+绑定会让一次纯文本修改就把对齐证据作废（R2–R3 实测里每一轮门禁都 UNVERIFIED）。
+指纹只取每条事件的 (起点, 终点, 层) 与事件顺序，另存每行文本短哈希仅用于
+报「文本已改 N 条」。`patched_at` 只是元数据，不参与判定；真正的时间轴改动
+会被指纹本身抓到。
 """
 from __future__ import annotations
 
@@ -89,6 +96,93 @@ def content_digest(path: str) -> str:
         h.update(("%d|%d|%s|%s\n" % (ev.start, ev.end, ev.style, ev.text))
                  .encode("utf-8"))
     return h.hexdigest()
+
+
+def timeline_rows(path: str) -> list:
+    """按**磁盘顺序**取每条事件的「时间轴事实」：起点、终点、层、文本短哈希。
+
+    指纹刻意**不含**文本内容与样式：
+      - 文本轮（翻译/润色）天天在改文案，改完轴一点没动；
+      - 样式轮可能调整样式名，同样不影响「字幕在什么时候出现」。
+
+    把文本算进指纹，一次纯文本修改就会把整份对齐证据判成过期（R2–R3 实测：
+    每轮门禁都 UNVERIFIED）。文本短哈希只用于诊断「文本已改 N 条」，不参与
+    指纹比较。
+
+    层的意义：ASS 同一时段可能有多条事件叠加，`layer` 决定谁盖住谁；层变了
+    等于「观众看到的那条字幕换了」，属于时间轴/轨归属的变化。
+    """
+    try:
+        import pysubs2
+        subs = pysubs2.load(path, encoding="utf-8-sig")
+    except Exception:
+        return []
+    rows = []
+    for ev in subs:
+        th = hashlib.sha1((ev.text or "").encode("utf-8")).hexdigest()[:8]
+        rows.append([int(ev.start), int(ev.end), int(getattr(ev, "layer", 0) or 0), th])
+    return rows
+
+
+def timeline_digest(rows: list) -> str:
+    """时间轴指纹：只对 (起点, 终点, 层) 按磁盘顺序做哈希。
+
+    顺序也在哈希里——调序会让指纹变化，这是必须的（调序会改变字幕与语音的
+    对应关系），但它不属于「文本改动」。
+    """
+    h = hashlib.sha1()
+    for r in rows:
+        h.update(("%d|%d|%d\n" % (r[0], r[1], r[2])).encode("utf-8"))
+    return h.hexdigest()
+
+
+def timeline_snapshot(path: str) -> dict:
+    """写进凭据的时间轴快照：条数 + 指纹 + 逐行事实（用于定位哪几条变了）。"""
+    rows = timeline_rows(path)
+    return {"n": len(rows), "digest": timeline_digest(rows), "rows": rows}
+
+
+def _hms(ms) -> str:
+    ms = int(ms)
+    sign = "-" if ms < 0 else ""
+    ms = abs(ms)
+    h, rem = divmod(ms, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, msv = divmod(rem, 1000)
+    return "%s%02d:%02d:%02d.%03d" % (sign, h, m, s, msv)
+
+
+def _text_changed_rows(rec_rows: list, cur_rows: list) -> int:
+    """行数相同的前提下，文本短哈希不同的条数。行数变了返回 0（轴已先判失效）。"""
+    if len(rec_rows) != len(cur_rows):
+        return 0
+    return sum(1 for a, b in zip(rec_rows, cur_rows) if a[3] != b[3])
+
+
+def _timeline_drift_reasons(name: str, rec: dict, cur: dict) -> list:
+    """把「轴变了」翻译成能定位的理由：行数变化，或第几条的起止时间变了。"""
+    rn, cn = rec.get("n"), cur.get("n")
+    if rn != cn:
+        return ["时间轴行数已变（%s：%s → %s 条），凭据描述的是旧版本" % (name, rn, cn)]
+    rr, cr = rec.get("rows") or [], cur.get("rows") or []
+    diffs = []
+    for i, (a, b) in enumerate(zip(rr, cr)):
+        if a[0] == b[0] and a[1] == b[1] and a[2] == b[2]:
+            continue
+        parts = []
+        if a[0] != b[0]:
+            parts.append("起点 %s → %s" % (_hms(a[0]), _hms(b[0])))
+        if a[1] != b[1]:
+            parts.append("终点 %s → %s" % (_hms(a[1]), _hms(b[1])))
+        if a[2] != b[2]:
+            parts.append("层 %s → %s" % (a[2], b[2]))
+        diffs.append((i + 1, "，".join(parts)))
+    if not diffs:
+        return ["时间轴指纹与当前文件不符（%s），但逐行事实一致——"
+                "请重存凭据后再验" % name]
+    head = "；".join("第 %d 条 %s" % (i, t) for i, t in diffs[:6])
+    tail = ("（共 %d 条时间轴差异）" % len(diffs)) if len(diffs) > 6 else ""
+    return ["时间轴已变（%s）：%s%s" % (name, head, tail)]
 
 
 def probe_duration(path: str) -> Optional[float]:
@@ -216,6 +310,8 @@ def build(sub_path: str, stats: dict, engine: str, media: Optional[str] = None,
             "sha1": sha1_of(sub_path),
             # 事件级摘要：raw sha1 会因为表头/序列化重写而变化，摘要不会。
             "digest": content_digest(sub_path),
+            # 时间轴指纹：判定「这条轴还成不成立」的真正依据。
+            "timeline": timeline_snapshot(sub_path),
             "patched_at": None,
             "max_shift": 0.0,
             "patches": 0,
@@ -230,10 +326,23 @@ def build(sub_path: str, stats: dict, engine: str, media: Optional[str] = None,
         if not os.path.exists(full):
             continue
         if f.get("sha1") and sha1_of(full) != f["sha1"]:
-            continue          # 已经变了，别把旧结论带进新凭据
+            # 同一个 episode 的 ASS 与 SRT 共用一份 sidecar。另一份文件被文本轮
+            # 改过时 sha1 会变，但那条轴没动——此时丢弃旧条目等于把它的对齐
+            # 证据一起删掉。只有轴指纹也变了才丢弃。
+            rec_tl = f.get("timeline") or {}
+            cur_tl = timeline_snapshot(full)
+            if rec_tl.get("digest") and rec_tl["digest"] == cur_tl.get("digest"):
+                f["sha1"] = sha1_of(full)
+                f["digest"] = content_digest(full)
+                f["timeline"] = cur_tl
+            else:
+                continue      # 轴变了，别把旧结论带进新凭据
         if not f.get("digest"):
             # 旧凭据没记摘要：文件此刻与旧 sha1 一致，补算即可。
             f["digest"] = content_digest(full)
+        if not f.get("timeline"):
+            # 旧凭据没记轴指纹：文件此刻逐字节未变，补算即等价于原来的绑定。
+            f["timeline"] = timeline_snapshot(full)
         files.append(f)
     data = {
         "version": SCHEMA_VERSION,
@@ -279,10 +388,14 @@ def build(sub_path: str, stats: dict, engine: str, media: Optional[str] = None,
 
 
 def touch_patch(sub_path: str, max_shift: float, n_events: int = 0) -> Optional[str]:
-    """记一次时间轴改动：写 patched_at 并同步文件 sha1。
+    """记一次时间轴改动：写 patched_at、同步文件 sha1，但**不动轴指纹**。
 
-    同步 sha1 是必须的：`align_patch` 改完盘面，凭据里的旧 sha1 立刻不符，
-    否则就会先触发「文件被外部改过」而不是更准确的「改过没复测」。
+    `patched_at` 只是元数据，判定不再依赖它（见模块 docstring）。真正让凭据
+    失效的是轴指纹——这里刻意**保留**旧的 `timeline`，于是下次 `check()` 会
+    发现「起点/终点和凭据里记的不一样」，直接给出「第 N 条时间变了」而不是
+    只写一句「改过没复测」。复测后 `build()` 会写入新指纹，状态自动恢复。
+
+    同步 sha1 是为了让报告/日志里的文件绑定不漂移；它不参与判定。
 
     没有凭据时静默返回 None —— 翻译前的第 0 步本来就没有审计结果，
     不该因为「还没有凭据」而挡住建轴。
@@ -393,7 +506,7 @@ def check(sub_path: str, media: Optional[str] = None) -> dict:
                                "且本次片源哈希不符，无法复核"
                                % (os.path.basename(rec_full) or "（未记录路径）"))
 
-    # --- 3/4. 文件与复测时间
+    # --- 3/4. 时间轴事实（新口径）与旧凭据兜底
     files = data.get("files") or []
     if not files:
         stale = True
@@ -405,16 +518,43 @@ def check(sub_path: str, media: Optional[str] = None) -> dict:
             stale = True
             reasons.append("凭据记录的文件不存在：%s" % p)
             continue
+
+        rec_tl = f.get("timeline") or {}
+        if rec_tl.get("digest"):
+            # 绑的是「时间轴事实」：只比 (起点, 终点, 层) 与顺序。
+            # 文本/样式改动不失效（文本轮天天在改），轴变了才失效。
+            cur_tl = timeline_snapshot(full)
+            detail.setdefault("timeline", {})[p] = {
+                "recorded_n": rec_tl.get("n"), "current_n": cur_tl.get("n")}
+            if cur_tl.get("digest") == rec_tl.get("digest"):
+                n_text = _text_changed_rows(rec_tl.get("rows") or [],
+                                            cur_tl.get("rows") or [])
+                detail["timeline"][p]["verdict"] = "same"
+                detail["timeline"][p]["text_changed"] = n_text
+                if n_text:
+                    notes.append("%s 文本已改（%d 条），时间轴证据沿用" % (p, n_text))
+                elif (f.get("sha1") and os.path.exists(full)
+                      and sha1_of(full) != f["sha1"]):
+                    notes.append("%s 被重写但事件内容未变（时间轴与文本均未变，"
+                                 "表头/序列化差异），按未变处理" % p)
+            else:
+                stale = True
+                detail["timeline"][p]["verdict"] = "drifted"
+                reasons.extend(_timeline_drift_reasons(p, rec_tl, cur_tl))
+            # patched_at 是元数据：轴指纹一致就不影响判定，一致地不写告警。
+            continue
+
+        # 旧凭据（没有轴指纹）：退回整文件 sha1 / 事件摘要 / patched_at。
+        # 保守兜底——旧凭据无法区分「文本变了」和「轴变了」，只能按整文件判。
         if f.get("sha1") and sha1_of(full) != f["sha1"]:
-            # raw sha1 变了，再比事件级摘要：只变了表头/序列化（典型是 pysubs2
-            # 回滚重存）就按「未变」处理；摘要也对不上才是实质改动。
             rec_digest = f.get("digest") or ""
             cur_digest = content_digest(full)
             if rec_digest and cur_digest and rec_digest == cur_digest:
                 notes.append("%s 被重写但事件内容未变（表头/序列化差异），按未变处理" % p)
             else:
                 stale = True
-                reasons.append("文件内容已变（%s），凭据描述的是旧版本" % p)
+                reasons.append("文件内容已变（%s），凭据描述的是旧版本"
+                               "（旧凭据无轴指纹，请重验后重建）" % p)
         patched, computed = f.get("patched_at"), data.get("computed_at")
         if patched and computed and _newer(patched, computed):
             stale = True

@@ -196,13 +196,19 @@ def test_file_content_changed():
             f.write("\n61\n00:45:01.000 --> 00:45:03.000\nzz\n")
         res = cred.check(srt)
         assert res["verdict"] == V.UNVERIFIED, res
-        assert any("内容已变" in r for r in res["reasons"]), res["reasons"]
+        # 新口径：绑的是时间轴事实，增行属于轴变，理由要能定位到「行数变了」。
+        assert any("时间轴行数已变" in r for r in res["reasons"]), res["reasons"]
     finally:
         shutil.rmtree(d)
 
 
 def test_patched_without_reaudit():
-    """改过时间轴、没复测 —— 这是本次实测里最容易犯的一条。"""
+    """改过时间轴、没复测 —— 这是本次实测里最容易犯的一条。
+
+    新口径下 `patched_at` 只是元数据，不参与判定；让凭据失效的是**轴指纹**。
+    这里追加一行（轴真的变了），因此必须 UNVERIFIED，且理由要说清是哪里的轴
+    变了，而不是一句「改过没复测」。
+    """
     d = tempfile.mkdtemp()
     try:
         srt = os.path.join(d, "S01E06.srt")
@@ -218,9 +224,26 @@ def test_patched_without_reaudit():
 
         res = cred.check(srt)
         assert res["verdict"] == V.UNVERIFIED, res
-        assert any("改过时间轴但未复测" in r for r in res["reasons"]), res["reasons"]
+        assert any("时间轴行数已变" in r for r in res["reasons"]), res["reasons"]
         # sha1 已被 touch_patch 同步，不该再报「内容已变」
         assert not any("内容已变" in r for r in res["reasons"]), res["reasons"]
+    finally:
+        shutil.rmtree(d)
+
+
+def test_patched_metadata_only_stays_pass():
+    """`patched_at` 只是元数据：文件没变时，touch_patch 不得让判定失效。"""
+    d = tempfile.mkdtemp()
+    try:
+        srt = os.path.join(d, "S01E08.srt")
+        _srt(srt)
+        ok = {"n_pairs": 60, "mad": 0.1, "drift": 0.0, "window_span": 0.1,
+              "tol": 0.3, "ok": True}
+        cred.save(srt, cred.build(srt, ok, "qwen"))
+        assert cred.check(srt)["verdict"] == V.PASS
+        assert cred.touch_patch(srt, max_shift=0.0, n_events=0) is not None
+        res = cred.check(srt)
+        assert res["verdict"] == V.PASS, res
     finally:
         shutil.rmtree(d)
 
@@ -405,6 +428,7 @@ if __name__ == "__main__":
     test("A4 绑定片源但没给 --media -> UNVERIFIED", test_media_declared_but_not_given)
     test("A5 文件内容变 -> UNVERIFIED", test_file_content_changed)
     test("A6 改过时间轴未复测 -> UNVERIFIED", test_patched_without_reaudit)
+    test("A6b 仅写 patched_at 元数据 -> 仍 PASS", test_patched_metadata_only_stays_pass)
     test("A7 陈旧性优先于 verdict", test_stale_beats_verdict)
     test("A8 凭据 json 往返一致", test_roundtrip_json)
     test("B1 align_audit 退出码 0/2", test_audit_exit_codes)

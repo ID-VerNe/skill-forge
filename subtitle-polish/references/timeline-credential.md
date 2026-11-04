@@ -39,6 +39,8 @@
                              "offset_diff": 0.12, "slope_diff": 0.0004,
                              "verdict_agree": true } },
  "files":  [ { "path": "S06E01.ass", "sha1": "9c14…",
+               "timeline": { "n": 763, "digest": "1e09…",
+                             "rows": [[0, 2000, 0, "ab12cd34"], …] },
                "patched_at": null, "max_shift": 0.0, "patches": 0 } ],
  "computed_at": "2026-10-31T14:00:12.881"
 }
@@ -51,11 +53,33 @@
 | `media.sha1` | 片源换了（重压/换版），轴跟着失效 |
 | `source.index` / `family` | 用的是 UK 还是 US，白纸黑字，不靠记忆 |
 | `axis.verdict` | 没有 PASS 就不许进门 |
-| `patched_at > computed_at` | **改过时间轴但没复测**，凭据自动失效 |
-
-最后一条是实测里最容易犯的：E03 一轮修正后如果不复测，凭据就成了「上一版」的结论。
+| `files[].timeline` | **时间轴事实变了**（改 start/end、增删行、调序、换层） |
+| `files[].patched_at` | 只作元数据：改过时间轴的审计记录，不单独判失效 |
 
 `files[]` 是数组而不是单个对象，因为 ASS 与 SRT 可能各自被 `align_patch` 施加过。
+同一 episode 的 ASS 与 SRT 共用一份 sidecar：另一份文件被文本轮改写时，只要它的
+时间轴指纹没变，条目会被保留（只刷新 sha1），不会把它的对齐证据一起删掉。
+
+## 为什么 track 不参与指纹
+
+轴事实只回答一个问题：**这条字幕在什么时候出现、持续多久、在几层可见**。
+所以指纹取 `(start_ms, end_ms, layer)` 三项，`track`（ASS 的 Style/Name、SRT 的
+来源语言）不在里面。
+
+`track` 决定的是「这一行写的是什么话」，不是「这一行出现在什么时候」。把它放进
+指纹会带来一个错误后果：第 6 类改英文轨、或把一条字幕从中英轨之间挪动而时间不变，
+整集轴证据会失效——可这时时间轴一毫秒都没动。
+
+| 操作 | 时间轴 | 判定 | 理由 |
+|---|---|---|---|
+| 一条字幕换轨，时间不变 | 未变 | **PASS** +「文本已改 N 条，时间轴证据沿用」 | 轴没动，只是内容换了位置；内容正确性归 `verify_fixes` / `cross_check` |
+| 换轨同时改了时间（真正的轨错位） | 变了 | **UNVERIFIED** | 指纹抓到 start/end 变化，强制重测 |
+
+所以「文本已改、轴证据沿用」在换轨场景下**仍然成立**——前提是时间没跟着动。
+边界由 `layer` 兜住：如果换轨导致「同一时刻谁盖住谁」变了，layer 会变，指纹照样失效。
+
+需要更强约束时（比如要求「某句台词必须落在某条音轨上」），那是内容契约，应写进
+`SKILL.md` 并由 `verify_fixes` 检查，不该塞进时间轴指纹。
 
 ## 双对齐器可信度（`axis.confidence`）
 
@@ -91,17 +115,20 @@ qwen3-forced-aligner，两路各自产出词级时间戳，再比逐行起点差
 1. 凭据不存在                        -> UNVERIFIED  3
 2. 凭据绑定了片源但没给 --media       -> UNVERIFIED  3   不能假装验过
 3. media.sha1 ≠ 当前片源              -> UNVERIFIED  3   换片了
-4. files[].sha1 ≠ 当前文件            -> UNVERIFIED  3   文件被外部改过
-5. files[].patched_at > computed_at  -> UNVERIFIED  3   改过没复测
-6. axis.verdict = FAIL               -> FAIL        2
-7. axis.verdict = PASS 且 confidence.divergent -> AMBIGUOUS 4  未获双对齐器印证
-8. 其余                              -> PASS        0
+4. files[].timeline.digest ≠ 当前指纹  -> UNVERIFIED  3   时间轴事实变了
+5. axis.verdict = FAIL               -> FAIL        2
+6. axis.verdict = PASS 且 confidence.divergent -> AMBIGUOUS 4  未获双对齐器印证
+7. 其余                              -> PASS        0
 ```
 
-第 7 条只拦 `divergent`，不拦 `spread_only`：后者整体一致，只是少数行离散，
+第 6 条只拦 `divergent`，不拦 `spread_only`：后者整体一致，只是少数行离散，
 按 PASS 放行并在报告里点名 `worst_rows`。
 
-**陈旧性必须排在 verdict 前面。** 一份写着 PASS 的凭据，如果文件之后又被改过，它描述的是过去的状态——此时原来 PASS 还是 FAIL 都不作数。顺序写反会得到「凭据过期了但照样放行」。
+**旧凭据（没有 `timeline` 字段）退回保守版本**：`files[].sha1 ≠ 当前文件` 或
+`files[].patched_at > computed_at` 都判 UNVERIFIED。旧凭据一旦被 `build()` 重建，
+会自动补算 `timeline`，之后按新口径走。
+
+**陈旧性必须排在 verdict 前面。** 一份写着 PASS 的凭据，如果时间轴之后又被改过，它描述的是过去的状态——此时原来 PASS 还是 FAIL 都不作数。顺序写反会得到「凭据过期了但照样放行」。
 
 第 2 条是同一个道理：凭据声明了什么，就必须验证什么。记了 `media.sha1` 却没给片源，就不能假装验过了。
 
@@ -155,12 +182,18 @@ python <skill>/scripts/timeline_gate.py ./subs --json gate.json
 
 ## 与修复动作的联动
 
-`align_patch` 改完时间轴后调 `credential.touch_patch()`：
+**文本轮**（改译文、改错别字、换轨内文案）不改时间轴：指纹不变，闸门保持 PASS，
+`check()` 在 notes 里写「文本已改 N 条，时间轴证据沿用」。文本对不对由
+`verify_fixes` / `cross_check` 负责，不需要重跑对齐器。
 
-- 同步 `files[].sha1`（否则会先撞上「文件被外部改过」，报错指向错误的原因）
-- 写 `patched_at`（于是 `patched_at > computed_at` 生效，闸门立刻转 UNVERIFIED）
+**轴修复**（`align_patch` 平移/缩放时间）才会动指纹：
 
-这个顺序保证了「改完必须复测」是**自动的**，不依赖任何人记得。
+- `touch_patch()` 只刷新 `sha1` / `digest` / `patched_at` / `patches`，**不覆盖 `timeline`**
+- 于是 `files[].timeline.digest` 立刻和磁盘对不上，下次 `check()` 直接报
+  「时间轴已变（第 N 条 起点 a → b）」，强制复测
+
+这个设计让「改完必须复测」是**自动的**，不依赖任何人记得；同时不会因为改了一句
+译文就把整集的轴证据废掉。
 
 ## 常见问题
 
@@ -171,4 +204,7 @@ A：`--write-credential` 是 `align_audit` 的一个开关，审计本来就要�
 A：要。它记录的是「这一集的轴被验过、用的是哪条流」，是交付物的一部分。`.bak` 不进 git，凭据进。
 
 **Q：字幕改了一句译文，文件 sha1 就变了，凭据不也失效了？**
-A：会失效，这是对的——但只在你**直接改文件**时。正常走 `apply_fixes` 的话，文本改动不该让时间轴凭据失效。目前的实现偏保守（任何内容变化都判 stale），后续可以改为「只比对时间字段的 sha1」。在那之前，文本改完重跑一次审计即可（有 `--asr-words` 缓存时是秒级）。
+A：不会。凭据绑的是 `files[].timeline`（时间轴指纹），不是整文件 sha1。改译文、改样式、甚至整份文件被 pysubs2 重写表头，只要每个事件的 `(start, end, layer)` 没动，就是 PASS，note 写「文本已改 N 条，时间轴证据沿用」。只有改 start/end、增删行、调序、换 layer 才判 UNVERIFIED。
+
+**Q：改 track（换轨）算轴事实变更吗？**
+A：不算。track 决定「这一行写的是什么话」，不决定「什么时候出现」，所以不在指纹里。换轨但时间不变 → PASS + 沿用说明；换轨同时改了时间 → 指纹变化 → UNVERIFIED。见上文「为什么 track 不参与指纹」。

@@ -225,7 +225,13 @@ def test_header_rewrite_is_not_content_change():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_real_content_change_still_fails():
+def test_text_change_keeps_pass():
+    """改文本不再作废轴证据 —— 这是批次 5 的核心口径变化。
+
+    旧口径按整文件 sha1 绑定，改一个中文字就 UNVERIFIED，文本轮每天都在
+    改文案，等于把对齐证据废掉。新口径只绑「时间轴事实」：文本改了要
+    **保持 PASS**，并写明「文本已改 N 条，时间轴证据沿用」。
+    """
     tmp = tempfile.mkdtemp()
     try:
         ass, _wd = make_env(tmp)
@@ -235,8 +241,9 @@ def test_real_content_change_still_fails():
         with open(ass, "w", encoding="utf-8") as f:
             f.write(text)
         r = cred.check(ass, media=None)
-        assert r["verdict"] == V.UNVERIFIED, "真改动被放过"
-        assert any("文件内容已变" in x for x in r["reasons"]), r["reasons"]
+        assert r["verdict"] == V.PASS, "文本改动不该作废轴证据：%s" % r["reasons"]
+        assert any("文本已改" in n and "时间轴证据沿用" in n for n in r["notes"]), \
+            r["notes"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -249,7 +256,7 @@ def main():
     test("R4 同一路径换片仍判 UNVERIFIED", test_media_same_path_replaced)
     test("R5 派生音频不报换片", test_media_derived_audio_is_not_swap)
     test("R6a 表头重写不算内容变更", test_header_rewrite_is_not_content_change)
-    test("R6b 实质改动仍判 UNVERIFIED", test_real_content_change_still_fails)
+    test("R6b 改文本不再作废轴证据（PASS + 沿用说明）", test_text_change_keeps_pass)
     print("\n通过 %d / 失败 %d" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1
 

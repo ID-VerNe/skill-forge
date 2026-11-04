@@ -208,7 +208,8 @@ def t_stale_credential_says_reason():
             f.write("Dialogue: 0,9:59:00.00,9:59:02.00,中文,,0,0,0,,外挂改过\n")
         md = ro.render_report(r.wd, stamp)
         assert "时间轴 UNVERIFIED（凭据失效：" in _top(md), _top(md)
-        assert "文件内容已变" in md, md
+        # 外挂追加一行 = 轴的行数变了；新口径按轴指纹判失效，理由写行数变化。
+        assert "时间轴行数已变" in md, md
     finally:
         r.close()
 

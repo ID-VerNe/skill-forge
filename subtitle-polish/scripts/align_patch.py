@@ -275,7 +275,8 @@ def _after_write(path, st, spec, work_dir, batch_id, fit=None, action="retime_cu
 
     1. 记 log.jsonl —— 否则 `--rollback batch=` 回滚完文本、时间还错着，
        回滚本身变成一次新的错误
-    2. 让时间轴凭据失效 —— patched_at > computed_at，闸门立刻转 UNVERIFIED
+    2. 让时间轴凭据失效 —— touch_patch 写 patched_at，但**不更新轴指纹**；
+       下次 check() 会发现起点/终点与凭据记录不同，直接给「第 N 条时间变了」
     3. 记备份索引 —— .bak 不进 git，误删就没了，至少要能枚举出来
     """
     bak = st.get("backup")
