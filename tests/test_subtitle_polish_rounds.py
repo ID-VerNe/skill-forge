@@ -69,11 +69,31 @@ Style: 中文,Arial,16,&H00FFFFFF,&H000000FF,0,0,0,0,100,100,0,0,1,1,0,2,10,10,1
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
-ASS_BODY = """Dialogue: 0,0:00:00.00,0:00:02.00,英文,,0,0,0,,This is Phil's bag.
-Dialogue: 0,0:00:00.00,0:00:02.00,中文,,0,0,0,,这就是菲尔的地盘
-Dialogue: 0,0:00:02.00,0:00:04.00,英文,,0,0,0,,Right, walk me through this.
-Dialogue: 0,0:00:02.00,0:00:04.00,中文,,0,0,0,,好了 再讲一遍
-"""
+# 12 行英文轨：同源检测的默认最少行数是 10，夹具必须够长才能测到派生判定。
+_EN_LINES = [
+    "This is Phil's bag.",
+    "Right, walk me through this.",
+    "So the deal is simple.",
+    "You bring the car in.",
+    "I tell you what it needs.",
+    "Then we agree on a price.",
+    "No haggling after that.",
+    "That is the whole point.",
+    "Most folks hate that part.",
+    "But it saves everyone time.",
+    "So sign here, please.",
+    "And we are done for today.",
+]
+ASS_BODY = "".join(
+    "Dialogue: 0,0:00:%02d.00,0:00:%02d.00,英文,,0,0,0,,%s\n"
+    "Dialogue: 0,0:00:%02d.00,0:00:%02d.00,中文,,0,0,0,,中文第%d句\n"
+    % (i * 2, i * 2 + 2, t, i * 2, i * 2 + 2, i + 1)
+    for i, t in enumerate(_EN_LINES))
+
+
+def _srt_of(lines):
+    return "".join("%d\n00:00:%02d,000 --> 00:00:%02d,000\n%s\n\n"
+                   % (i + 1, i * 2, i * 2 + 2, t) for i, t in enumerate(lines))
 
 
 def sha(path):
@@ -90,11 +110,17 @@ class Run:
         os.makedirs(self.wd, exist_ok=True)
         self.ass = os.path.join(self.root, "e04.ass")
         self.srt = os.path.join(self.root, "e04.srt")
+        # 同源 SRT（逐字等于 ASS 英文轨）。issue #54：这不是「人工 SRT」，
+        # 而是派生副本，第 6 类应按 ASR 素材默认开。
         with open(self.ass, "w", encoding="utf-8") as f:
             f.write(ASS_HEADER + ASS_BODY)
         with open(self.srt, "w", encoding="utf-8") as f:
-            f.write("1\n00:00:00,000 --> 00:00:02,000\nThis is Phil's bag.\n\n"
-                    "2\n00:00:02,000 --> 00:00:04,000\nRight, walk me through this.\n")
+            f.write(_srt_of(_EN_LINES))
+        # 独立人工 SRT：内容与 ASS 英文轨明显不同（这里模拟人工润色过的文本）。
+        self.human_srt = os.path.join(self.root, "e04.human.srt")
+        with open(self.human_srt, "w", encoding="utf-8") as f:
+            f.write(_srt_of(["Human rewrite %d: the bag story." % (i + 1)
+                             for i in range(len(_EN_LINES))]))
 
     def log(self, entries):
         with open(os.path.join(self.wd, "log.jsonl"), "w", encoding="utf-8") as f:
@@ -182,7 +208,13 @@ def t_no_with_spelling_overrides_asr():
 
 
 def t_cli_plan_spelling_switch():
-    """CLI 判定：无 SRT 默认开；有 SRT 默认关；两个显式开关都能覆盖。"""
+    """CLI 判定：无 SRT 默认开；**派生 SRT** 也默认开；独立人工 SRT 默认关。
+
+    issue #54：旧断言是「有 SRT 文件 → 默认关」。S06E04 实测那份 SRT 与 ASS
+    英文轨 748/750 行逐字相同，是派生副本；按旧口径关掉第 6 类，319/649 这类
+    ASR 错字就整集无人审。新口径：有 SRT 但同源率 ≥95% → 仍按 ASR 素材默认开；
+    只有内容确实不同（人工审校）才默认关。
+    """
     r = Run()
     try:
         script = os.path.join(SCRIPTS, "round_orchestrator.py")
@@ -196,12 +228,45 @@ def t_cli_plan_spelling_switch():
 
         out = run()
         assert "ASR 素材默认开" in out, out
+        # 派生 SRT：开了，并标明「逐字同源=派生」
         out = run("--srt", r.srt)
+        assert "逐字同源" in out and "默认开" in out, out
+        # 独立人工 SRT：仍然默认关
+        out = run("--srt", r.human_srt)
         assert "有独立 SRT 默认关闭" in out, out
-        out = run("--srt", r.srt, "--with-spelling")
+        out = run("--srt", r.human_srt, "--with-spelling")
         assert "--with-spelling 强制开" in out, out
         out = run("--no-with-spelling")
         assert "--no-with-spelling 显式关闭" in out, out
+    finally:
+        r.close()
+
+
+def t_srt_same_source_detection():
+    """issue #54：同源率实测能把「派生 SRT」和「人工 SRT」分开。"""
+    r = Run()
+    try:
+        d = ro.srt_same_source(r.ass, r.srt)
+        assert d["same"] is True and d["ratio"] == 1.0, d
+        assert d["n"] == len(_EN_LINES), d
+        h = ro.srt_same_source(r.ass, r.human_srt)
+        assert h["same"] is False and h["ratio"] == 0.0, h
+        # 缺失文件不能误判成同源（否则会误开第 6 类）
+        miss = ro.srt_same_source(r.ass, os.path.join(r.root, "nope.srt"))
+        assert miss["same"] is False, miss
+    finally:
+        r.close()
+
+
+def t_derived_srt_manifest_recorded():
+    """issue #54：init 把同源实测写进 manifest，供报告/事后核对。"""
+    r = Run()
+    try:
+        stamp = r.init()
+        m = ro.load_manifest(r.wd, stamp)
+        assert m["opts"]["srt_same_source"] is True, m["opts"]
+        assert m["opts"]["srt_match_ratio"] == 1.0, m["opts"]
+        assert ro._is_asr_transcribed(m) is True, "派生 SRT 没被当作 ASR 源"
     finally:
         r.close()
 
@@ -662,6 +727,48 @@ def t_report_commands_are_real():
         r.close()
 
 
+def t_report_no_stale_paths():
+    """issue #54：跨 run 的净零历史日志不进总账，报告不打印旧 run 路径。"""
+    r = Run()
+    try:
+        stamp = r.init()
+        old = os.path.join("C:\\old_run_20261104_131806", "S06E04.eng.ass")
+        entries = []
+        for sid in range(1, 9):
+            e = _entry("B_old", sid, "same", "same")
+            e["file"] = old            # 旧 run 的日志路径
+            entries.append(e)
+        entries.append(_entry("B1", 2, "旧", "新"))
+        r.log(entries)
+        ro.record_round(r.wd, stamp, "r01", batch_id="B1", n_fixes=1)
+        md = ro.render_report(r.wd, stamp)
+        assert "131806" not in md, "报告里仍打印了旧 run 路径（会被当成可照抄的命令）"
+        assert "跨运行目录的历史日志" in md, md
+        assert "8 条" in md, md
+        assert "旧" in md and "新" in md, "真实改动不该被过滤掉"
+    finally:
+        r.close()
+
+
+def t_report_srt_sync_list():
+    """issue #54：英文轨改动单列 SRT 同步清单，且明确 skill 不写 SRT。"""
+    r = Run()
+    try:
+        stamp = r.init()           # 派生 SRT → srt_same_source=True
+        e = _entry("B1", 1, "Yeah. ,,,and look at that.",
+                   "Yeah. And look at that.")
+        e["track"] = "英文"
+        r.log([e])
+        ro.record_round(r.wd, stamp, "r01", batch_id="B1", n_fixes=1)
+        md = ro.render_report(r.wd, stamp)
+        assert "SRT 需人工同步" in md, md
+        assert "Yeah. ,,,and look at that." in md, md
+        assert "本 skill 不会写它" in md, md
+        assert "同源率" in md, md
+    finally:
+        r.close()
+
+
 if __name__ == "__main__":
     print("轮次编排：计划 / 快照回滚 / 定格 / 报告")
     for n, fn in (
@@ -669,6 +776,8 @@ if __name__ == "__main__":
         ("ASR 素材默认开第 6 类", t_asr_source_defaults_spelling_on),
         ("--no-with-spelling 可关 ASR 默认", t_no_with_spelling_overrides_asr),
         ("CLI 第 6 类开关判定", t_cli_plan_spelling_switch),
+        ("派生 SRT 同源率实测", t_srt_same_source_detection),
+        ("派生 SRT 写进 manifest", t_derived_srt_manifest_recorded),
         ("第 7 类固定 R9", t_low_is_r09),
         ("第 8 类独立 R11", t_inclusive_is_r11),
         ("第 6 类并入 R1-R3/R10", t_spelling_merges),
@@ -695,6 +804,8 @@ if __name__ == "__main__":
         ("结构性改动要求 --batch-id", t_structural_requires_record_batch),
         ("建议未落盘记 advisory", t_optional_pending_is_advisory),
         ("报告命令来自实际路径", t_report_commands_are_real),
+        ("报告不打印旧 run 路径", t_report_no_stale_paths),
+        ("报告单列 SRT 同步清单", t_report_srt_sync_list),
     ):
         test(n, fn)
 

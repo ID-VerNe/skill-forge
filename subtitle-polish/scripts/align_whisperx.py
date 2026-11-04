@@ -23,9 +23,13 @@ whisperX 及其 wav2vec2 模型通常装在**独立环境**里（本机已有）
 解释器直接跑本脚本，产物落到仓库/工作目录，再由仓库侧 `align_audit.py` 读取：
 
   <whisperx-python> align_whisperx.py \
-      --audio clip.wav --sub clip.en.srt --out wx_words.json \
-      --model-name jonatasgrosman/wav2vec2-large-xlsr-53-english \
-      --model-dir <hf-hub 缓存目录>
+      --audio clip.wav --sub clip.en.srt --out wx_words.json
+
+默认会**先找本地 HF hub 缓存**（`SUBTITLE_POLISH_HF_CACHE` / `HF_HUB_CACHE` /
+`HF_HOME/hub` / `~/.cache/huggingface/hub` / whisperX 环境旁的 `hf_cache/hub`），
+找到就置 `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` 离线跑；找不到才联网下载
+（issue #54：以前默认在线，1.2 GB 模型在弱网下 320 s 超时×2、加载 337 s）。
+要强制联网/重新校验缓存时加 `--online`。
 
 不要求把 whisperX 装进仓库的 Python 环境；本脚本只依赖 whisperx + pysubs2。
 
@@ -155,6 +159,94 @@ def _words_of(result: dict) -> list:
     return words
 
 
+def _repo_dir(root: str, model_name: str) -> str:
+    """HF hub 缓存里某个模型的目录名：`org/name` -> `models--org--name`。"""
+    return os.path.join(root, "models--" + (model_name or "").replace("/", "--"))
+
+
+_WEIGHT_FILES = ("model.safetensors", "pytorch_model.bin", "model.safetensors.index.json")
+_MIN_WEIGHT_BYTES = 1 << 20      # 1 MB：真权重都在几十~几百 MB，1 MB 只是下限
+
+
+def _cache_has_weights(root: str, model_name: str) -> bool:
+    """缓存目录里是否真有**下载完成**的权重。
+
+    只看目录存在不够：坏掉的快照会留下 `models--org--name/` 目录，但权重只有
+    `*.incomplete`（本机 `~/.cache/huggingface/hub` 实测如此）。把它当命中会
+    以离线模式加载失败（`could not be found`）。所以要求至少有一个大小达标的
+    完整权重文件。
+    """
+    d = _repo_dir(root, model_name)
+    if not os.path.isdir(d):
+        return False
+    for dirpath, _dirs, files in os.walk(d):
+        for f in files:
+            if f.endswith(".incomplete"):
+                continue
+            if f not in _WEIGHT_FILES:
+                continue
+            try:
+                if os.path.getsize(os.path.join(dirpath, f)) >= _MIN_WEIGHT_BYTES:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _whisperx_pkg_dir() -> str:
+    """只定位 whisperx 包目录，不导入它（导入会拉起 torch，也会读死离线开关）。"""
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("whisperx")
+        if spec and spec.submodule_search_locations:
+            return os.path.abspath(list(spec.submodule_search_locations)[0])
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _candidate_caches() -> list:
+    """本机可能存在的 HF hub 缓存目录，按优先级排列（去重后返回）。"""
+    c = []
+    for k in ("SUBTITLE_POLISH_HF_CACHE", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        v = (os.environ.get(k) or "").strip()
+        if v:
+            c.append(v)
+    hf_home = (os.environ.get("HF_HOME") or "").strip()
+    if hf_home:
+        c.append(os.path.join(hf_home, "hub"))
+    c.append(os.path.expanduser(os.path.join("~", ".cache", "huggingface", "hub")))
+    # 本机 whisperX 独立环境的常见布局：<whisperX>/python_embed + <whisperX>/hf_cache/hub
+    pkg = _whisperx_pkg_dir()
+    if pkg:
+        # .../python_embed/Lib/site-packages/whisperx：上溯 3 级到 python_embed，4 级到 whisperX
+        up3 = os.path.dirname(os.path.dirname(os.path.dirname(pkg)))
+        up4 = os.path.dirname(up3)
+        c.append(os.path.join(up4, "hf_cache", "hub"))
+        c.append(os.path.join(up3, "hf_cache", "hub"))
+    seen, out = set(), []
+    for x in c:
+        k = os.path.normcase(os.path.abspath(x))
+        if k not in seen:
+            seen.add(k)
+            out.append(x)
+    return out
+
+
+def find_model_cache(model_name: str) -> str:
+    """找含指定模型的本地缓存；找不到返回 ""（由调用方决定联网）。
+
+    issue #54：默认在线会在弱网/断网时卡在 1.2 GB 权重下载（实测两次 320 s
+    超时）。这里只认「目录里确实有**完整权重**」的缓存：坏快照会留下
+    `models--org--name/` 但只有 `*.incomplete`，把它当命中会让离线加载直接
+    `could not be found`（本机 `~/.cache/huggingface/hub` 实测如此）。
+    """
+    for root in _candidate_caches():
+        if _cache_has_weights(root, model_name):
+            return os.path.abspath(root)
+    return ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="whisperX wav2vec2 强制对齐（输入现成字幕文本，不跑 ASR）")
@@ -166,7 +258,10 @@ def main() -> int:
                     default="jonatasgrosman/wav2vec2-large-xlsr-53-english",
                     help="wav2vec2 对齐模型名（本机缓存里已有的那个）")
     ap.add_argument("--model-dir", default=None,
-                    help="模型缓存目录（HF hub 格式）；与 --model-name 配套")
+                    help="模型缓存目录（HF hub 格式）；与 --model-name 配套。"
+                         "缺省先自动找本地缓存，找到即离线跑")
+    ap.add_argument("--online", action="store_true",
+                    help="跳过本地缓存自动探测，强制联网（默认不联网）")
     ap.add_argument("--language", default="en")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--start", type=float, default=None, help="只对齐该秒之后的音频")
@@ -180,6 +275,21 @@ def main() -> int:
     if not rows_all:
         print("[!] 字幕里没有可用英文行：%s" % args.sub, file=sys.stderr)
         return 2
+
+    # issue #54：先定离线/在线，再 import whisperx。HF 的离线开关在 import 时
+    # 被读进常量，导入之后再改环境变量已经来不及——这正是以前默认联网、
+    # 弱网下卡 320 s×2 的原因。
+    model_dir = args.model_dir
+    if model_dir is None and not args.online:
+        model_dir = find_model_cache(args.model_name)
+    if model_dir:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        print("[*] 本地模型缓存：%s（离线）" % model_dir, file=sys.stderr)
+    else:
+        print("[*] 未找到本地模型缓存，将联网加载（可用 --model-dir 指定）",
+              file=sys.stderr)
+
     try:
         import torch
         import whisperx
@@ -218,8 +328,8 @@ def main() -> int:
     try:
         model, meta = whisperx.load_align_model(
             language_code=args.language, device=device,
-            model_name=args.model_name, model_dir=args.model_dir,
-            model_cache_only=bool(args.model_dir))
+            model_name=args.model_name, model_dir=model_dir,
+            model_cache_only=bool(model_dir))
     except Exception as e:  # noqa: BLE001
         print("[!] 加载对齐模型失败：%s" % e, file=sys.stderr)
         return 2

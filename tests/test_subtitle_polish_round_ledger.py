@@ -149,7 +149,16 @@ def t_multi_round_column_lists_ids():
 # ---------------------------------------------------------------- P3
 
 def t_rollback_cmd_uses_current_ass():
-    """历史日志的 file 指向别的目录：命令必须用当前 run 的 ASS，并标注来源。"""
+    """issue #54：历史日志的 file 指向别的目录。
+
+    两条硬要求：
+      1. 表里每一行的回滚命令必须用**当前 run 的 ASS**，不能把历史路径
+         当成能照抄的命令打印出来；
+      2. 若该行确有改动、必须留在表里，只用一句摘要说明「历史日志在另一个
+         运行目录、旧目录不可照抄」，**不打印旧路径**（旧路径照抄会滚到别处）。
+    净零的跨目录条目另有独立测试（`test_subtitle_polish_rounds.py`
+    的 `t_report_no_stale_paths`）。
+    """
     r = Env()
     try:
         stamp = r.init()
@@ -160,12 +169,12 @@ def t_rollback_cmd_uses_current_ass():
         ledger = md.split("## 改动总账")[1]
         assert '--file "%s"' % r.ass in ledger, \
             "单条回滚命令没用当前 ASS：\n%s" % ledger
-        assert '--file "%s"' % hist not in md, \
-            "命令里还写着历史路径：\n%s" % ledger
-        assert "历史日志记录在另一个文件" in ledger, \
+        assert "old-run" not in ledger, \
+            "旧目录路径还被打印出来了：\n%s" % ledger
+        assert "历史日志记录在另一个运行目录" in ledger, \
             "没有标注来源差异：\n%s" % ledger
-        assert os.path.basename(hist) in ledger, \
-            "没列出具体是哪条改动的历史路径"
+        assert "旧目录不可照抄" in ledger, \
+            "没说明旧路径不能拿来跑：\n%s" % ledger
     finally:
         r.close()
 
@@ -253,7 +262,7 @@ if __name__ == "__main__":
     print("=" * 70)
     test("P2-1 轮次列写真实轮次（R1 的 8 条不再显示 3）", t_round_column_is_round_id)
     test("P2-2 多轮碰过的行列全轮次", t_multi_round_column_lists_ids)
-    test("P3-1 单条回滚命令用当前 ASS 并标注来源", t_rollback_cmd_uses_current_ass)
+    test("P3-1 单条回滚命令用当前 ASS、不打印旧路径（#54）", t_rollback_cmd_uses_current_ass)
     test("P4-1 回滚后 record 折算 -> 台账=净改动", t_ledger_reconciles_after_rollback)
     test("P4-2 没有新 record 时报告层折算", t_report_level_reconcile_without_record)
     test("P4-3 无回滚时不产生折算项", t_no_adjust_when_consistent)
