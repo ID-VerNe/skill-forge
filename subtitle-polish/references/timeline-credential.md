@@ -68,18 +68,21 @@ qwen3-forced-aligner，两路各自产出词级时间戳，再比逐行起点差
 
 | `confidence.status` | 含义 | 怎么用 |
 |---|---|---|
-| `corroborated` | 两路偏移结论一致 | 该 PASS/FAIL 属高置信结论 |
-| `divergent` | 时间戳或结论明显不一致 | 现有 PASS/FAIL 不可全信，报 AMBIGUOUS 或抽查音频 |
+| `corroborated` | 三条判据全过（系统偏差、端点漂移、行级离散） | 该 PASS/FAIL 属高置信结论 |
+| `spread_only` | 整体一致，只有少数行离散 | **保持 PASS**；报告附 `worst_rows`，人工抽查那几行 |
+| `divergent` | 系统偏差或端点漂移超阈值 | 单源 PASS 升格为 AMBIGUOUS，阻止静默放行 |
 | `single_source` | 只有一路可用 | **不冒充双证**，按单源结论使用 |
 | `no_data` | 两路都没有足够锚点 | 没有可信度信息 |
 
-阈值（保守默认，待真实样片校准，见 `align-audit.md` §7.5）：逐行起点差中位
-≤0.25 s、P90 ≤0.60 s、两路偏移中位之差 ≤0.25 s、斜率之差 ≤0.002 /s、每路至少
-10 个锚点。
+判据（当前值，**待校准，见 issue #39**）：系统偏差 = 逐行起点差中位 ≤ 0.20 s；
+端点漂移差 = `|Δ斜率| × 跨度` ≤ 0.50 s；行级离散 = P90 ≤ 0.70 s 且
+`|差| > 0.70 s` 的行占比 ≤ 10%。每路至少 10 个锚点。详细依据见
+`align-audit.md` §7.5。
 
-**判定顺序里没有 `confidence`。** 凭据是否可用于结案仍只看 `axis.verdict`；
-`confidence` 只被 `round_orchestrator --report` 读去给时间轴结论加一句附注
-（`divergent` 时写「未获双对齐器印证」，但不改 PASS/FAIL 的 code）。
+**判定顺序里 `confidence` 只挡一种情况**：`axis.verdict` 是 PASS，但
+`confidence.status` 是 `divergent` → 返回 AMBIGUOUS(4)。`spread_only` 不改变
+判定，仍按 PASS 放行。`round_orchestrator --report` 会给时间轴结论加一句附注
+（`divergent` 写「未获双对齐器印证」，`spread_only` 写「少数行离散，见 worst_rows」）。
 缺省（没跑第二路）就是 `null`，不写成 `corroborated` 冒充验过。
 
 ## 判定顺序（不要改）
@@ -91,8 +94,12 @@ qwen3-forced-aligner，两路各自产出词级时间戳，再比逐行起点差
 4. files[].sha1 ≠ 当前文件            -> UNVERIFIED  3   文件被外部改过
 5. files[].patched_at > computed_at  -> UNVERIFIED  3   改过没复测
 6. axis.verdict = FAIL               -> FAIL        2
-7. 其余                              -> PASS        0
+7. axis.verdict = PASS 且 confidence.divergent -> AMBIGUOUS 4  未获双对齐器印证
+8. 其余                              -> PASS        0
 ```
+
+第 7 条只拦 `divergent`，不拦 `spread_only`：后者整体一致，只是少数行离散，
+按 PASS 放行并在报告里点名 `worst_rows`。
 
 **陈旧性必须排在 verdict 前面。** 一份写着 PASS 的凭据，如果文件之后又被改过，它描述的是过去的状态——此时原来 PASS 还是 FAIL 都不作数。顺序写反会得到「凭据过期了但照样放行」。
 

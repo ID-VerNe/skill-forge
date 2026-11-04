@@ -873,8 +873,9 @@ def _timeline_state(m: dict) -> dict:
         "has_credential": bool(res.get("data")),
         "media": media,
         "sidecar": (res.get("detail") or {}).get("sidecar", ""),
-        # 双对齐器互证的可信度附注。**不改变 code**：PASS 仍是 PASS，
-        # 只是把「有没有第二路印证」写清楚，交给人决定要不要抽查。
+        # 双对齐器互证的可信度附注。`spread_only` 不改变 code（PASS 仍是 PASS）；
+        # `divergent` 已在凭据侧升格为 AMBIGUOUS，这里只把成因写清楚，
+        # 交给人决定要不要抽查。
         "confidence": (res.get("detail") or {}).get("axis_confidence"),
     }
 
@@ -886,6 +887,9 @@ def _confidence_suffix(conf) -> str:
     status = conf.get("status")
     if status == "corroborated":
         return "；双对齐器已印证"
+    if status == "spread_only":
+        return ("；双对齐器整体一致，但少数行离散（P90 %s s），"
+                "需抽查 worst_rows" % (conf.get("ts_p90", "—")))
     if status == "divergent":
         return ("；⚠ 未获双对齐器印证（divergent：%s），现有 PASS/FAIL 不可全信，"
                 "建议抽查音频" % (conf.get("reason") or "两路结论不一致"))

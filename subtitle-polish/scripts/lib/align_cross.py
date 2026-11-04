@@ -20,12 +20,31 @@
 > 两个引擎只是在做「文本 ↔ 音频」的强制对齐。whisper 一侧由 whisperX 的
 > wav2vec2 对齐器承担，不是 faster-whisper 的 ASR 转写。
 
-## 三态
+## 四态
 
-- `corroborated`：两套偏移结论接近（阈值见 `THRESHOLDS`），高置信可放行；
-- `divergent`：时间戳或结论明显不一致 → 现有单源 PASS/FAIL 不可信，
-  报告里升格为「未获双引擎印证」，建议抽查音频；
+判据不再看「斜率差绝对值」（两路斜率口径本就不同，直接比绝对值只会放大
+噪声），改看三条：
+
+1. **系统偏差**：逐行起点差的中位 ≤ 0.20 s；
+2. **端点漂移差**：`|slope_a − slope_b| × 跨度` ≤ 0.50 s（即整段末尾两路
+   相差不超过 0.50 s，而不是逐秒斜率本身）；
+3. **行级离散**：逐行起点差 P90 ≤ 0.70 s，且 `|差| > 0.70 s` 的行占比 ≤ 10%。
+
+据此分成四态：
+
+- `corroborated`：三条全过，高置信可放行；
+- `spread_only`：整体一致（系统偏差、端点漂移都过），只是少数行离散 →
+  **保持 PASS，但报告必须附 `worst_rows`**；
+- `divergent`：系统偏差或端点漂移超阈值 → 单源 PASS/FAIL 不可信，
+  可升格为 AMBIGUOUS 并阻止静默 PASS，建议抽查音频；
 - `single_source`：只有一路可用（另一路缺缓存/锚点不足）→ **不冒充双证**。
+
+数据不足（两路锚点都 < `min_rows`）另记 `no_data`。
+
+> 阈值 0.20 / 0.50 / 0.70 / 10% 已按 4 集片头 120 s 的分布校准：系统偏差
+> （0.104/0.137/0.150/0.189）、端点漂移（0.204/0.289/0.536/0.919）、P90
+> （0.452/0.467/0.733/1.145）、超限占比（3.3%/5.9%/13.2%/17.9%）——四个
+> 阈值都落在「正常组」与「分歧组」之间。样本 4 集低于目标 6–8，补片可再校。
 
 ## 它不做什么
 
@@ -43,33 +62,46 @@ import re
 from . import align_core as ac
 
 STATUS_CORROBORATED = "corroborated"
+STATUS_SPREAD = "spread_only"
 STATUS_DIVERGENT = "divergent"
 STATUS_SINGLE = "single_source"
 STATUS_NO_DATA = "no_data"
 
-#: 一致性阈值。**保守默认值，待真实样片校准**。
+#: 一致性阈值。已按 4 集片头 120 s 的分布校准（2026-11-04，见 issue #39）。
 #:
-#: - `ts_median_s = 0.25`：两个对齐器对同一行起点的中位差。wav2vec2 与
-#:   qwen 都是帧级（~20ms）输出，实测抖动主要来自词边界定义，0.25 s 足以
-#:   覆盖正常分歧，又不至于放过真实偏移（单源 PASS 的容差是 0.3/0.5 s）。
-#: - `ts_p90_s = 0.60`：允许 10% 的行有较大分歧（连读、切点、吞词）。
-#: - `offset_diff_s = 0.25`：两路「字幕比音频晚/早多少」的中位结论差。
-#: - `slope_diff = 0.002`：每秒钟的偏移差；1200 s 全片对应 2.4 s 总漂移。
+#: 依据：四个阈值都落在「整体一致组」与「整体分歧组」之间（分布见
+#: `references/align-audit.md` §7.5）。样本 4 集低于目标 6–8，补片可再校。
+#:
+#: - `bias_median_s = 0.20`：系统偏差，逐行起点差中位。它区分「整条轴偏了
+#:   多少」与「个别行没对齐」，是 A/B 两集性质不同的关键判据。
+#:   实测 4 集最高 0.189，阈值留 5% 余量。
+#: - `endpoint_drift_s = 0.50`：端点漂移差，`|Δ斜率| × 跨度`。比直接比斜率
+#:   绝对值稳：它对应「片尾两路相差多少秒」，单位是观众能感知的秒数。
+#:   实测正常组 0.204/0.289，分歧组 0.536/0.919，0.50 正好分开。
+#: - `row_p90_s = 0.70`：行级离散 P90；允许少数行（连读、切点、吞词）大偏。
+#:   实测 0.452/0.467 与 0.733/1.145，阈值落在中间。
+#: - `row_outlier_share = 0.10`：`|差| > row_p90_s` 的行占比上限。只看 P90
+#:   会被「恰好 1 行超限」的分布骗过去，占比能拦住成片的离散。
+#:   实测 3.3%/5.9% 与 13.2%/17.9%，10% 正好分开。
 #: - `min_rows = 10`：低于它与 `align_audit` 的锚点下限一致，不给结论。
 THRESHOLDS = {
-    "ts_median_s": 0.25,
-    "ts_p90_s": 0.60,
-    "offset_diff_s": 0.25,
-    "slope_diff": 0.002,
+    "bias_median_s": 0.20,
+    "endpoint_drift_s": 0.50,
+    "row_p90_s": 0.70,
+    "row_outlier_share": 0.10,
     "min_rows": 10,
 }
 
+#: 阈值状态：已按 4 集片头 120 s 的分布校准（2026-11-04）。样本低于目标
+#: 6–8 集（本机视频库只有 4 组可确认配对的素材），后续补片可再校。
+THRESHOLD_STATUS = "已校准（2026-11-04，4 集片头 120 s；样本 4 < 目标 6–8）"
+
 #: 供报告渲染用的人话阈值表
 THRESHOLD_TEXT = {
-    "ts_median_s": "逐行起点差中位 ≤ 0.25 s",
-    "ts_p90_s": "逐行起点差 P90 ≤ 0.60 s",
-    "offset_diff_s": "两路偏移中位之差 ≤ 0.25 s",
-    "slope_diff": "两路斜率之差 ≤ 0.002 /s",
+    "bias_median_s": "逐行起点差中位 ≤ 0.20 s",
+    "endpoint_drift_s": "端点漂移差（|Δ斜率|×跨度）≤ 0.50 s",
+    "row_p90_s": "逐行起点差 P90 ≤ 0.70 s",
+    "row_outlier_share": "|差| > 0.70 s 的行占比 ≤ 10%",
     "min_rows": "每路至少 10 个锚点",
 }
 
@@ -191,11 +223,16 @@ def _source_stats(rows, tokens, *, tol, window=180.0, min_n=5):
 
 def compare(rows, tokens_a, tokens_b, *, label_a="aligner-a",
             label_b="aligner-b", stats_a=None, stats_b=None,
-            tol_a=0.5, tol_b=0.3) -> dict:
+            tol_a=0.5, tol_b=0.3, span_s=None) -> dict:
     """两路对齐器互证。返回只读结论，不返回任何替换建议。
 
     `stats_a` / `stats_b` 可由调用方传入（避免重复计算主判定）；
     缺省时本模块按 `tol_a` / `tol_b` 各算一次。
+
+    `span_s` 是**这次审计的时间轴跨度**（音频/片段长度）。端点漂移差必须按
+    它换算：用锚点自身的 x_span 会偏小（`ts` 集只覆盖 96.6 s，按 83.6 s 的
+    锚点跨度算会把 0.536 s 的漂移压成 0.373 s，正好漏掉要抓的那类分歧）。
+    调用方没给时退回字幕总跨度，再退回锚点跨度。
     """
     n_rows = len(rows)
     toks_a, filter_a = sanitize(tokens_a) if tokens_a else ([], {"n_in": 0, "n_kept": 0})
@@ -242,7 +279,7 @@ def compare(rows, tokens_a, tokens_b, *, label_a="aligner-a",
         "threshold_text": dict(THRESHOLD_TEXT),
         "not_transcription": True,
         "note": ("只比对两路对齐器的时间戳：不比对转写文本，不自动改写英文轨，"
-                 "不参与时间轴 PASS/FAIL 计算。"),
+                 "不参与时间轴 PASS/FAIL 数值计算（divergent 仅可升格为 AMBIGUOUS）。"),
         "sources": {
             "a": dict(_src_view(label_a, stats_a, n_a, tol_a), filter=filter_a),
             "b": dict(_src_view(label_b, stats_b, n_b, tol_b), filter=filter_b),
@@ -298,36 +335,105 @@ def compare(rows, tokens_a, tokens_b, *, label_a="aligner-a",
     slope_diff = abs(slope_a - slope_b)
     verdict_agree = (stats_a.get("verdict") == stats_b.get("verdict"))
 
-    d_med = result["timestamp_delta"]["median"]
-    d_p90 = result["timestamp_delta"]["p90"]
-    criteria = [
-        {"name": "ts_median", "value": d_med,
-         "tol": THRESHOLDS["ts_median_s"], "pass": d_med <= THRESHOLDS["ts_median_s"]},
-        {"name": "ts_p90", "value": d_p90,
-         "tol": THRESHOLDS["ts_p90_s"], "pass": d_p90 <= THRESHOLDS["ts_p90_s"]},
-        {"name": "offset_diff", "value": round(offset_diff, 3),
-         "tol": THRESHOLDS["offset_diff_s"],
-         "pass": offset_diff <= THRESHOLDS["offset_diff_s"]},
-        {"name": "slope_diff", "value": round(slope_diff, 5),
-         "tol": THRESHOLDS["slope_diff"], "pass": slope_diff <= THRESHOLDS["slope_diff"]},
-        {"name": "verdict_agree", "value": verdict_agree,
-         "tol": True, "pass": verdict_agree},
-    ]
-    result["offset_diff"] = round(offset_diff, 3)
-    result["slope_diff"] = round(slope_diff, 5)
-    result["verdict_agree"] = verdict_agree
-    result["criteria"] = criteria
-
-    if all(c["pass"] for c in criteria):
-        result["status"] = STATUS_CORROBORATED
-        result["reason"] = "两路偏移结论一致，互证通过"
+    # 端点漂移差要用「跨度」把它换算成整段末尾相差多少秒。
+    # 优先用调用方给的审计跨度（音频/片段长度）；否则用字幕总跨度，
+    # 最后才退回两路锚点的 x_span（它只覆盖有锚点的区间，会偏小）。
+    span_a = float(stats_a.get("x_span") or 0.0)
+    span_b = float(stats_b.get("x_span") or 0.0)
+    if span_s and span_s > 0:
+        span = float(span_s)
     else:
-        result["status"] = STATUS_DIVERGENT
-        bad = "、".join("%s=%s（阈值 %s）" % (c["name"], c["value"], c["tol"])
-                        for c in criteria if not c["pass"])
-        result["reason"] = ("两路结论偏离：%s。现有单源 PASS/FAIL 不可信，"
-                            "应报 AMBIGUOUS 或抽查音频" % bad)
+        span = max(0.0, rows[-1][1] - rows[0][0]) if rows else 0.0
+        span = max(span, span_a, span_b)
+    endpoint_drift = slope_diff * span
+
+    d = result["timestamp_delta"]
+    n_cmp = max(1, d["n"])
+    outlier_share = (sum(1 for x in adeltas if x > THRESHOLDS["row_p90_s"])
+                     / float(n_cmp))
+
+    metrics = {
+        "bias_median": d["median"],
+        "row_p90": d["p90"],
+        "row_max": d["max"],
+        "outlier_share": round(outlier_share, 4),
+        "slope_a": round(slope_a, 6),
+        "slope_b": round(slope_b, 6),
+        "slope_diff": round(slope_diff, 6),
+        "span": round(span, 3),
+        "endpoint_drift": round(endpoint_drift, 3),
+        "offset_diff": round(offset_diff, 3),
+        "verdict_agree": verdict_agree,
+        "n_compared": d["n"],
+    }
+    status, criteria, reason = evaluate(metrics)
+    result.update({
+        "status": status,
+        "reason": reason,
+        "criteria": criteria,
+        "metrics": metrics,
+        "threshold_status": THRESHOLD_STATUS,
+        "offset_diff": metrics["offset_diff"],
+        "slope_diff": metrics["slope_diff"],
+        "verdict_agree": verdict_agree,
+    })
     return result
+
+
+def evaluate(m) -> tuple:
+    """纯判据：输入实测指标，输出 `(status, criteria, reason)`。
+
+    把「采样」与「判定」分开，测试就能直接喂 A/B 两集的真实数字回算，
+    不必为了让某条判据失败去伪造一整段 token 序列。
+
+    `m` 需要 `bias_median` / `row_p90` / `outlier_share` / `endpoint_drift` /
+    `slope_a` / `slope_b` / `span` / `offset_diff` / `verdict_agree` / `n_compared`。
+    """
+    T = THRESHOLDS
+    bias_ok = m["bias_median"] <= T["bias_median_s"]
+    drift_ok = m["endpoint_drift"] <= T["endpoint_drift_s"]
+    p90_ok = m["row_p90"] <= T["row_p90_s"]
+    share_ok = m["outlier_share"] <= T["row_outlier_share"]
+    criteria = [
+        {"name": "system_bias", "group": "system_bias",
+         "value": m["bias_median"], "tol": T["bias_median_s"], "unit": "s",
+         "pass": bias_ok},
+        {"name": "endpoint_drift", "group": "endpoint_drift",
+         "value": m["endpoint_drift"], "tol": T["endpoint_drift_s"], "unit": "s",
+         "pass": drift_ok,
+         "detail": "|%+.6f − %+.6f| × %.1f s"
+                   % (m["slope_a"], m["slope_b"], m["span"])},
+        {"name": "row_p90", "group": "row_spread",
+         "value": m["row_p90"], "tol": T["row_p90_s"], "unit": "s",
+         "pass": p90_ok},
+        {"name": "row_outlier_share", "group": "row_spread",
+         "value": m["outlier_share"], "tol": T["row_outlier_share"],
+         "unit": "ratio", "pass": share_ok},
+    ]
+
+    if not (bias_ok and drift_ok):
+        bad = "、".join("%s=%s（阈值 %s）" % (c["name"], c["value"], c["tol"])
+                        for c in criteria
+                        if c["group"] in ("system_bias", "endpoint_drift")
+                        and not c["pass"])
+        return STATUS_DIVERGENT, criteria, (
+            "系统偏差/端点漂移超阈值：%s。现有单源 PASS/FAIL 不可信，"
+            "应报 AMBIGUOUS 或抽查音频" % bad)
+
+    if not (p90_ok and share_ok):
+        return STATUS_SPREAD, criteria, (
+            "整体一致（系统偏差 %.3f s ≤ %.2f、端点漂移 %.3f s ≤ %.2f），"
+            "但少数行离散：P90 %.3f s、|差| > %.2f s 的行占 %.1f%%——"
+            "保持 PASS，报告必须附 worst_rows"
+            % (m["bias_median"], T["bias_median_s"],
+               m["endpoint_drift"], T["endpoint_drift_s"],
+               m["row_p90"], T["row_p90_s"], m["outlier_share"] * 100.0))
+
+    return STATUS_CORROBORATED, criteria, (
+        "三项判据全部通过：系统偏差 %.3f s、端点漂移 %.3f s、行级 P90 %.3f s"
+        "（超限行占比 %.1f%%）"
+        % (m["bias_median"], m["endpoint_drift"], m["row_p90"],
+           m["outlier_share"] * 100.0))
 
 
 def _src_view(label, stats, n_pairs, tol):
@@ -339,6 +445,7 @@ def _src_view(label, stats, n_pairs, tol):
         "n_pairs": stats.get("n_pairs", n_pairs),
         "median": round(float(stats.get("median") or 0.0), 3),
         "slope": round(float(stats.get("slope") or 0.0), 5),
+        "x_span": round(float(stats.get("x_span") or 0.0), 3),
         "window_span": round(float(stats.get("window_span") or 0.0), 3),
         "verdict": stats.get("verdict") or "UNVERIFIED",
         "tol": tol,
@@ -346,9 +453,11 @@ def _src_view(label, stats, n_pairs, tol):
 
 
 _STATUS_TEXT = {
-    STATUS_CORROBORATED: "✓ corroborated：两路独立对齐器的偏移结论一致",
-    STATUS_DIVERGENT: ("⚠ divergent：两路结论不一致，**现有单源 PASS/FAIL 不可信**，"
-                       "应报 AMBIGUOUS 或抽查音频"),
+    STATUS_CORROBORATED: "✓ corroborated：三项判据全部通过，互证通过",
+    STATUS_SPREAD: ("△ spread_only：整体一致（系统偏差、端点漂移都在阈值内），"
+                    "但少数行离散——**保持 PASS，必须看 worst_rows**"),
+    STATUS_DIVERGENT: ("⚠ divergent：系统偏差或端点漂移超阈值，"
+                       "**现有单源 PASS/FAIL 不可信**，可升格 AMBIGUOUS 或抽查音频"),
     STATUS_SINGLE: "· single_source：只有一路可用，**未获双引擎印证**",
     STATUS_NO_DATA: "· no_data：两路都没有足够锚点",
 }
@@ -360,12 +469,13 @@ def render_section(dual) -> list:
         return ["## 双对齐器时间戳互证", "",
                 "未启用（未提供第二路词级时间戳 `--asr-words-b`）。"
                 "时间轴结论只基于单路对齐器。", ""]
-    L = ["## 双对齐器时间戳互证（不参与 PASS/FAIL 计算）", "",
+    L = ["## 双对齐器时间戳互证（可信度层，不改单源 stats/verdict）", "",
          "- 状态：%s" % _STATUS_TEXT.get(dual["status"], dual["status"]),
          "- 原因：%s" % dual.get("reason", "—"),
          "- 路 A：`%s`；路 B：`%s`" % (dual["label_a"], dual["label_b"]),
          "- 行数 %d；两路可比 %d；单路缺覆盖 %d"
-         % (dual["n_rows"], dual["n_compared"], dual["n_uncovered"]), ""]
+         % (dual["n_rows"], dual["n_compared"], dual["n_uncovered"]),
+         "- 阈值：%s" % dual.get("threshold_status", THRESHOLD_STATUS), ""]
 
     sa, sb = dual["sources"]["a"], dual["sources"]["b"]
     L += ["| 指标 | 路 A | 路 B |", "|---|---|---|",
@@ -404,17 +514,30 @@ def render_section(dual) -> list:
                         w["delta"], (w["text"] or "").replace("|", "\\|")))
         L.append("")
     if dual.get("criteria"):
-        L += ["| 判据 | 实测 | 阈值 |", "|---|---|---|"]
+        L += ["| 判据 | 分组 | 实测 | 阈值 | 结果 |", "|---|---|---|---|---|"]
         for c in dual["criteria"]:
-            L.append("| %s | %s | %s |" % (c["name"], c["value"], c["tol"]))
+            val = ("%.1f%%" % (c["value"] * 100.0) if c.get("unit") == "ratio"
+                   else "%.3f s" % c["value"] if c.get("unit") == "s"
+                   else str(c["value"]))
+            tol = ("%.0f%%" % (c["tol"] * 100.0) if c.get("unit") == "ratio"
+                   else "%.2f s" % c["tol"] if c.get("unit") == "s"
+                   else str(c["tol"]))
+            L.append("| %s | %s | %s | %s | %s |"
+                     % (c["name"], c.get("group", "—"), val, tol,
+                        "✓" if c["pass"] else "✗"))
         L.append("")
 
     if dual["status"] == STATUS_DIVERGENT:
         L += ["> **两路不一致**：这不是「其中一路算错了」的证据，而是「这套轴目前"
               "不可信」。单源 PASS 不能直接放行，单源 FAIL 也不能直接拿去改轴——"
               "先在关键时段抽查音频。", ""]
+    elif dual["status"] == STATUS_SPREAD:
+        L += ["> **整体一致但行级离散**：时间轴保持 PASS；上表 `worst_rows` 是"
+              "必须抽查的行，尤其要确认这些行不是切点错位或吞词。", ""]
     L += ["> 本小节只作可信度标注：`stats` / `verdict` / `pairs` / `curve` 一个都不改，"
-          "`align_anchors` / `robust_reject` 的阈值与曲线拟合口径也不动。",
+          "`align_anchors` / `robust_reject` 的阈值与曲线拟合口径也不动。"
+          "唯一的口径联动是 `divergent` 允许把时间轴结论升格为 AMBIGUOUS，"
+          "以阻止静默 PASS。",
           "> 本能力**不依赖独立转录**：输入是同一份字幕文本，两路只是在做"
           "「文本 ↔ 音频」的强制对齐。", ""]
     return L
@@ -427,6 +550,8 @@ def confidence_label(dual) -> str:
     st = dual.get("status")
     if st == STATUS_CORROBORATED:
         return "双对齐器已印证"
+    if st == STATUS_SPREAD:
+        return "双对齐器整体一致（少数行离散，见 worst_rows）"
     if st == STATUS_DIVERGENT:
         return "未获双对齐器印证（divergent）"
     if st == STATUS_SINGLE:
