@@ -220,7 +220,10 @@ python <skill>/scripts/scan_seed.py .subtitle-polish/slices/<stem>_p1.txt \
     --en-anchors --web-verify --out .subtitle-polish/reports/spelling-<stem>_p1.json
 ```
 
-- 把 `en_hint_text` 原样贴进 `{spelling_seeds}`；**不要**贴进 R11 的 `{seeds}`。
+- 把 `en_hint_text` 原样贴进 `{spelling_seeds}`；如果本轮之前跑过
+  `align_audit.py --asr-words-b`，再把报告「双源交叉校验」里的
+  `dual_source_mismatch` 行附在同一段。两者都只作提示，不自动改写英文轨；
+  **不要**贴进 R11 的 `{seeds}`。
 - 专名候选交给第 5 类判据；第 6 类只看非专名的词形/时态/功能词错误。
 - 在线检索只是提示：结果带 `source_url`，`status=unavailable` 表示**未检索**，
   不得据此下结论。检索范围集中在 `scripts/lib/web_lookup.py`，效果不好可整块删除。
