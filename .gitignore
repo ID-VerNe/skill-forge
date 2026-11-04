@@ -53,6 +53,9 @@ glue-engineer/.glue/
 # 外部仓库的本地克隆(自带 .git),不作为仓库内容
 /_repo_agency-agents/
 
+# .tmp — 本地临时 worktree / 校准脚本，含本机绝对路径，不入库
+/.tmp/
+
 # 过程产物与草稿,不作为仓库内容
 /.handoffs/
 /.web2md/
