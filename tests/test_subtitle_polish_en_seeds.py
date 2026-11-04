@@ -237,6 +237,59 @@ def t_align_core_not_imported():
     assert not hasattr(ss, "align_core"), "scan_seed 不应引入时间轴模块"
 
 
+# ── issue #47：收紧专名口径（旧口径一集 650 候选里 57% 是句首噪声） ──────────
+
+def t_initial_greetings_dropped():
+    seed = ss.build_seeds(_rows("Yeah, that's right", "Okay then", "Nice one"),
+                          en=True)
+    pro = [a for a in seed["en_anchors"] if a["form"] == "en_proper_noun"]
+    assert not pro, pro
+    st = seed["en_anchor_stats"]
+    assert st["kept"] == 0 and st["dropped"] > 0, st
+
+
+def t_contractions_not_names():
+    seed = ss.build_seeds(_rows("I'm here", "Let's go", "He's late"), en=True)
+    assert not [a for a in seed["en_anchors"]
+                if a["form"] == "en_proper_noun"], seed["en_anchors"]
+
+
+def t_mid_sentence_kept_initial_flagged():
+    seed = ss.build_seeds(_rows("We met John yesterday", "John was here"), en=True)
+    pros = [a for a in seed["en_anchors"] if a["form"] == "en_proper_noun"]
+    assert len(pros) == 2, pros
+    by_row = {a["srt_id"]: a for a in pros}
+    assert by_row[1]["note"] == "", by_row[1]
+    assert "弱证据" in by_row[2]["note"], by_row[2]
+
+
+def t_strong_form_kept_even_initial():
+    seed = ss.build_seeds(_rows("McLaren is fast", "F1 season starts"), en=True)
+    terms = [a["term"] for a in seed["en_anchors"]
+             if a["form"] == "en_proper_noun"]
+    assert "McLaren" in terms, terms
+    assert "F1" in terms, terms
+
+
+def t_elided_apostrophe_not_name():
+    seed = ss.build_seeds(_rows("'Cause they'll change", "Mr Smith arrived"),
+                          en=True)
+    terms = [a["term"] for a in seed["en_anchors"]
+             if a["form"] == "en_proper_noun"]
+    assert "Cause" not in terms, terms
+    assert "Smith" in terms, terms
+
+
+def t_stats_reported_in_md():
+    seed = ss.build_seeds(_rows("Yeah, that's right", "We met John yesterday"),
+                          en=True)
+    st = seed["en_anchor_stats"]
+    assert st["candidates"] == st["kept"] + st["dropped"], st
+    md = ss.render_md_seed(seed)
+    assert "大写开头候选" in md and "丢弃（只在句首出现）" in md, md
+    assert "%.1f%%" % st["dropped_pct"] in md, (st, md)
+
+
 if __name__ == "__main__":
     print("英文侧锚点 + 在线检索（只提示，不参与时间轴）")
     test("英文专名候选", t_proper_noun_anchor)
@@ -253,5 +306,11 @@ if __name__ == "__main__":
     test("--web-verify 需要 --en-anchors", t_web_verify_requires_en_anchors)
     test("第 6 类轮次已接线", t_round_seed_consumer_wired)
     test("不引入时间轴模块", t_align_core_not_imported)
+    test("句首问候语不报专名", t_initial_greetings_dropped)
+    test("缩写不算专名", t_contractions_not_names)
+    test("句中出现才留、句首只标弱证据", t_mid_sentence_kept_initial_flagged)
+    test("强形（内部大写/带数字）即使句首也留", t_strong_form_kept_even_initial)
+    test("撇号缩写不算专名", t_elided_apostrophe_not_name)
+    test("报告带候选/丢弃占比", t_stats_reported_in_md)
     print(f"\n通过 {PASS} / 失败 {FAIL}")
     sys.exit(0 if FAIL == 0 else 1)
