@@ -147,6 +147,10 @@ R4 只写「只看第 1 类」，R7 只写「只看第 4 类」，R10 写「全 
 - 白名单段 `{inclusive_list}` —— 仅 R11 填，内容来自 `inclusive-language.md`（L4 白名单必须贴，
   否则 agent 会把 `母头` 判成敏感词）。
 
+**第 6 类的默认启动**：无独立人工 SRT，或 init 标了 `--asr-transcribed` 时，R1–R3/R10 的
+`round_scope` 默认包含第 6 类；有独立人工 SRT 时默认不含，`--with-spelling` 强制开启，
+`--no-with-spelling` 显式关闭。详见 `rounds-spec.md` §1。
+
 **`round_scope` 只改 prompt 里的类别清单，不裁剪切片文件。** 类别专轮一律全量出片，
 禁止「只切含专名的块」「按关键词采样」这类省 token 做法（`rounds-spec.md` §2，硬约束）。
 

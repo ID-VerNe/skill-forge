@@ -37,6 +37,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import align_core as ac
+from lib import asr_cross as xc
 from lib import axis as ax
 from lib import credential as cred
 from lib import verdict as V
@@ -340,7 +341,8 @@ def print_summary(name, stats, n_rows, engine):
             for w in stats["windows"]))
 
 
-def build_report(args, stats, n_rows, engine, compare, axis_res=None):
+def build_report(args, stats, n_rows, engine, compare, axis_res=None,
+                 dual=None):
     L = ["# 对齐审计 · %s" % os.path.basename(args.sub), ""]
     if args.media_path.startswith("("):
         L.append("- 音频：%s（仅用缓存的词级时间戳）" % args.media_path)
@@ -514,6 +516,7 @@ def build_report(args, stats, n_rows, engine, compare, axis_res=None):
         L.append("2. 无参考流 → `--json` 已输出曲线 spec，用 "
                  "`align_patch.py --spec <json>` 分段补偿。")
     L.append("")
+    L += xc.render_section(dual)
     return "\n".join(L)
 
 
@@ -525,6 +528,11 @@ def main():
     ap.add_argument("--track", default=ac.TRACK_EN, help="ASS 轨道样式名（默认 英文）")
     ap.add_argument("--media", help="视频或音频（视频会自动抽 16k 单声道）")
     ap.add_argument("--asr-words", help="复用词级时间戳 json，跳过模型")
+    ap.add_argument("--asr-words-b",
+                    help="第二个词级时间戳 json，用于双源交叉校验（仅提示，"
+                         "不改变 PASS/FAIL）")
+    ap.add_argument("--dual-source-json",
+                    help="双源比对结果落盘路径（默认与 --json 同目录）")
     ap.add_argument("--engine", choices=["whisper", "qwen"], default="whisper")
     ap.add_argument("--model", help="模型目录（whisper 默认 large-v3 / qwen 必填）")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
@@ -662,6 +670,23 @@ def main():
 
     print_summary(os.path.basename(args.sub), stats, len(rows), engine)
 
+    # 2c) 双源交叉校验：只产提示，不碰 stats / verdict / pairs。
+    #     放在 stats 之后、写报告之前，确保报告与 json 拿到同一份结果。
+    dual = None
+    if args.asr_words_b:
+        tokens_b = xc.load_tokens(args.asr_words_b)
+        if not tokens_b:
+            print("  [warn] --asr-words-b 为空，跳过双源校验", file=sys.stderr)
+        else:
+            dual = xc.compare(
+                rows, tokens, tokens_b,
+                label_a=os.path.basename(args.asr_words) if args.asr_words else engine,
+                label_b=os.path.basename(args.asr_words_b))
+            print("  [dual] 可比 %d 行：一致 %d / 不一致 %d / 单源缺覆盖 %d"
+                  "（仅提示，不改判定）"
+                  % (dual["n_compared"], dual["n_agree"], dual["n_mismatch"],
+                     dual["n_uncovered"]))
+
     # 3) 轴归属 —— 判的是「哪条可信」，不是「哪条最小」
     compare = []
     compare_lookup = {}
@@ -697,7 +722,8 @@ def main():
     # 4) 落盘
     if args.report:
         os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
-        text = build_report(args, stats, len(rows), engine, compare, axis_res)
+        text = build_report(args, stats, len(rows), engine, compare, axis_res,
+                            dual=dual)
         with open(args.report, "w", encoding="utf-8") as f:
             f.write(text + "\n")
         print("\n[report] %s" % args.report)
@@ -728,6 +754,9 @@ def main():
             "reject": rej_info,
             "verdict": stats["verdict"],
             "axis": axis_res,
+            # 双源交叉校验：只做提示。这里写进 json 但不进 stats，
+            # 下游若只看 verdict/curve，行为与旧版完全一致。
+            "dual_source": dual,
         }
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=1)
@@ -735,6 +764,12 @@ def main():
                 if stats["verdict"] == "FAIL"
                 else "（判 %s，不输出曲线）" % stats["verdict"])
         print("[json]   %s  %s" % (args.json, tail))
+
+    if args.dual_source_json and dual:
+        os.makedirs(os.path.dirname(args.dual_source_json) or ".", exist_ok=True)
+        with open(args.dual_source_json, "w", encoding="utf-8") as f:
+            json.dump(dual, f, ensure_ascii=False, indent=1)
+        print("[dual]   %s" % args.dual_source_json)
 
     # 5) 凭据：PASS 与 FAIL 都写。
     #    只写 PASS 的话，FAIL 在 gate 眼里会退化成「没有凭据」，分不出

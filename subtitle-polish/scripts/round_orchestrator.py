@@ -113,17 +113,29 @@ STRUCTURAL_ACTIONS = ("retime_curve", "delete", "manual_edit", "structural_chang
 
 # ── 计划 ────────────────────────────────────────────────────────────────────
 
-def build_plan(*, with_low=False, with_inclusive=False, with_spelling=False) -> list:
-    """按开关排出本次实际要跑的轮次。返回的每一轮都带了生效的 scope。"""
+def build_plan(*, with_low=False, with_inclusive=False, with_spelling=None,
+               asr_source=False) -> list:
+    """按开关排出本次实际要跑的轮次。返回的每一轮都带了生效的 scope。
+
+    `with_spelling` 是三态：
+      - True  强制开启（CLI `--with-spelling`）
+      - False 强制关闭（CLI `--no-with-spelling`）
+      - None  按素材来源默认：英文轨来自 ASR/听写（`asr_source=True`）时默认开，
+              有独立人工 SRT 时默认关
+
+    `asr_source` 由调用方判定：没有独立 SRT，或显式 `--asr-transcribed`。
+    第 6 类仍只并入 R1–R3/R10，不新增轮次、不新增门。
+    """
+    spelling = bool(asr_source) if with_spelling is None else bool(with_spelling)
     opts = {"with_low": with_low, "with_inclusive": with_inclusive,
-            "with_spelling": with_spelling}
+            "with_spelling": spelling}
     plan = []
     for r in ROUNDS:
         if r["opt"] and not opts.get(r["opt"]):
             continue
         item = dict(r)
         item["scope"] = list(r["scope"])
-        if with_spelling and r["id"] in SPELLING_MERGE:
+        if spelling and r["id"] in SPELLING_MERGE:
             item["scope"] = item["scope"] + [6]
         else:
             item["scope"] = [c for c in item["scope"] if c != 6]
@@ -131,7 +143,7 @@ def build_plan(*, with_low=False, with_inclusive=False, with_spelling=False) -> 
     return plan
 
 
-def render_plan(plan: list, ass: str = "") -> str:
+def render_plan(plan: list, ass: str = "", spelling_reason: str = "") -> str:
     L = []
     if ass:
         L.append(f"# 轮次计划 — {os.path.basename(ass)}")
@@ -140,11 +152,27 @@ def render_plan(plan: list, ass: str = "") -> str:
     for r in plan:
         L.append("| %s | %s | %s | %s |" % (
             r["id"], r["name"], ", ".join(str(c) for c in r["scope"]), r["goal"]))
-    L += ["", f"共 {len(plan)} 轮。第 6 类（原文拼写）"
-              f"{'已并入 R1–R3/R10' if any(6 in r['scope'] for r in plan) else '未跑（需 --with-spelling）'}；"
+    spelling_on = any(6 in r["scope"] for r in plan)
+    if spelling_on:
+        why = {"asr_default": "（ASR 素材默认开）",
+               "forced": "（--with-spelling 强制开）"}.get(spelling_reason, "")
+        spell = f"已并入 R1–R3/R10{why}"
+    else:
+        why = {"disabled": "（--no-with-spelling 显式关闭）",
+               "human_srt": "（有独立 SRT 默认关闭；--with-spelling 可强制开）"
+               }.get(spelling_reason, "（需 --with-spelling）")
+        spell = f"未跑{why}"
+    L += ["", f"共 {len(plan)} 轮。第 6 类（原文拼写）{spell}；"
               f"第 7 类{'跑 R9' if any(r['id'] == 'r09' for r in plan) else '未跑（需 --with-low）'}；"
               f"第 8 类{'跑 R11' if any(r['id'] == 'r11' for r in plan) else '未跑（需 --with-inclusive）'}。"]
     return "\n".join(L)
+
+
+def spelling_reason(for_plan: bool, with_spelling, asr_source: bool) -> str:
+    """把「计划里第 6 类开没开」翻译成可写进 manifest/报告的原因标签。"""
+    if not for_plan:
+        return "disabled" if with_spelling is False else "human_srt"
+    return "forced" if with_spelling is True else "asr_default"
 
 
 # ── run 目录与 manifest ─────────────────────────────────────────────────────
@@ -216,7 +244,8 @@ def _structure_gate(ass: str) -> bool:
 def init_run(wd: str, ass: str, srt: str, plan: list, *,
              media: str = "", gated: bool = True, stamp: str = "",
              skip_structure_check: bool = False,
-             asr_transcribed: bool = False) -> str:
+             asr_transcribed: bool = False,
+             spelling_reason: str = "") -> str:
     """建 runs/<stamp>：manifest + round-plan.json + r00 快照 + logs/r00.jsonl。
 
     ## R0 之前先过结构门禁（C3b）
@@ -249,6 +278,14 @@ def init_run(wd: str, ass: str, srt: str, plan: list, *,
     else:
         open(os.path.join(d, "logs", "r00.jsonl"), "w", encoding="utf-8").close()
 
+    asr_source = bool(asr_transcribed or not (srt or "").strip())
+    spelling_on = any(6 in r["scope"] for r in plan)
+    if not spelling_reason:
+        # 直接调 API 的调用方没传原因时，按 manifest 里能观察到的事实回填。
+        if not spelling_on:
+            spelling_reason = "human_srt" if not asr_source else "unknown"
+        else:
+            spelling_reason = "asr_default" if asr_source else "forced"
     m = {
         "run": stamp,
         "ass": os.path.abspath(ass),
@@ -257,11 +294,14 @@ def init_run(wd: str, ass: str, srt: str, plan: list, *,
         "opts": {
             "with_low": any(r["id"] == "r09" for r in plan),
             "with_inclusive": any(r["id"] == "r11" for r in plan),
-            "with_spelling": any(6 in r["scope"] for r in plan),
+            "with_spelling": spelling_on,
+            "spelling_reason": spelling_reason,
             "gated": bool(gated),
             # issue #30：显式标记「英文轨是 ASR(whisper) 转录」。派生 SRT 场景下
             # srt 路径非空，仅凭路径分不出是不是听写结果，需要 init 时记一笔。
             "asr_transcribed": bool(asr_transcribed),
+            # 第 6 类默认开关的依据：无独立 SRT 或显式标记都算 ASR 源。
+            "asr_source": asr_source,
         },
         "created": datetime.now().isoformat(timespec="seconds"),
         "frozen": None,
@@ -1079,11 +1119,20 @@ def _render_single_report(wd: str, stamp: str) -> str:
         scopes |= set(r["scope"])
     gaps = []
     if 6 not in scopes:
-        gaps.append("第 6 类（原文拼写）—— 改英文轨需显式 `--with-spelling`")
-        if _is_asr_transcribed(m):
-            gaps.append("英文轨为 whisper 转录（init 未提供独立 SRT）："
-                        "可能存在 ASR 听写错误，建议以 `--with-spelling` 重跑"
-                        "或人工抽查英文轨")
+        reason = (m.get("opts") or {}).get("spelling_reason", "")
+        if reason == "disabled":
+            gaps.append("第 6 类（原文拼写）—— 本次被 `--no-with-spelling` 显式关闭")
+            if _is_asr_transcribed(m):
+                gaps.append("英文轨为 whisper/ASR 转录：听写造成的词形/时态/功能词错误"
+                            "未经第 6 类复核（专名拼写核实归第 5 类/R8，不在第 6 类）；"
+                            "需要时用 `--with-spelling` 重开")
+        elif _is_asr_transcribed(m):
+            gaps.append("第 6 类（原文拼写）—— 英文轨为 whisper/ASR 转录，本应默认开启，"
+                        "但本次计划未包含；建议检查 init 参数或以 `--with-spelling` 重跑"
+                        "（专名拼写核实归第 5 类/R8）")
+        else:
+            gaps.append("第 6 类（原文拼写）—— 有独立人工 SRT，默认关闭；"
+                        "`--with-spelling` 可强制开启")
     if not any(r["id"] == "r09" for r in rounds):
         gaps.append("第 7 类（低严重度）—— 需显式 `--with-low`")
     if not any(r["id"] == "r11" for r in rounds):
@@ -1268,7 +1317,13 @@ def main():
 
     ap.add_argument("--with-low", action="store_true", help="加 R9（第 7 类）")
     ap.add_argument("--with-inclusive", action="store_true", help="加 R11（第 8 类）")
-    ap.add_argument("--with-spelling", action="store_true", help="第 6 类并入 R1–R3/R10")
+    sp = ap.add_mutually_exclusive_group()
+    sp.add_argument("--with-spelling", dest="with_spelling", action="store_true",
+                    default=None,
+                    help="强制把第 6 类（原文拼写）并入 R1–R3/R10")
+    sp.add_argument("--no-with-spelling", dest="with_spelling", action="store_false",
+                    default=None,
+                    help="显式关闭第 6 类（ASR 素材默认开启）")
 
     ap.add_argument("--plan", action="store_true", help="只打印轮次计划，不建目录")
     ap.add_argument("--init", action="store_true", help="建 runs/<stamp> 与 r00 快照")
@@ -1299,7 +1354,8 @@ def main():
                          "放行理由写进报告")
     ap.add_argument("--asr-transcribed", action="store_true",
                     help="英文轨是 whisper/ASR 转录（无独立人工 SRT 源）。"
-                         "报告会在「本次未覆盖」提示 ASR 听写错误风险")
+                         "与「无独立 SRT」一样，默认开启第 6 类（原文拼写）；"
+                         "专名拼写核实归第 5 类/R8，不在第 6 类")
     args = ap.parse_args()
 
     wd = resolve_work_dir(args.work_dir)
@@ -1326,11 +1382,16 @@ def main():
     if args.plan or args.init:
         if not args.ass:
             ap.error("--plan / --init 需要 --ass")
+        # issue #30 建议 3：无独立 SRT，或显式标了 ASR 转录 → 默认开第 6 类。
+        asr_source = bool(args.asr_transcribed or not (args.srt or "").strip())
         plan = build_plan(with_low=args.with_low,
                           with_inclusive=args.with_inclusive,
-                          with_spelling=args.with_spelling)
+                          with_spelling=args.with_spelling,
+                          asr_source=asr_source)
+        reason = spelling_reason(any(6 in r["scope"] for r in plan),
+                                 args.with_spelling, asr_source)
         if args.plan:
-            print(render_plan(plan, args.ass))
+            print(render_plan(plan, args.ass, reason))
             return 0
         if not os.path.exists(args.ass):
             print(f"[!] ASS 不存在：{args.ass}", file=sys.stderr)
@@ -1338,9 +1399,10 @@ def main():
         stamp = init_run(wd, args.ass, args.srt, plan, media=args.media,
                          stamp=args.stamp,
                          skip_structure_check=args.skip_structure_check,
-                         asr_transcribed=args.asr_transcribed)
+                         asr_transcribed=args.asr_transcribed,
+                         spelling_reason=reason)
         print(f"[*] run {stamp} → {run_dir(wd, stamp)}")
-        print(render_plan(plan, args.ass))
+        print(render_plan(plan, args.ass, reason))
         return 0
 
     # D3：`--report --runs a,b` 不需要 --run，所以这里要把 --runs 也算进「有 run」。

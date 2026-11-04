@@ -86,11 +86,13 @@ ass 与 srt 可以是目录或单文件:
 | (无) | R1–R8 + R10,共 **9 轮** | ✅ |
 | `--with-low` | 追加 R9(第 7 类低严重度) | 关 |
 | `--with-inclusive` | 追加 R11(第 8 类中立与合规:性别/宗教/政治/法律四子域) | 关 |
-| `--with-spelling` | 把第 6 类**并入** R1–R3 与 R10 | 关 |
+| `--with-spelling` | **强制**把第 6 类并入 R1–R3 与 R10 | 有独立 SRT 时关 |
+| `--no-with-spelling` | **显式关闭**第 6 类(ASR 素材也关) | — |
 | `--auto` | 无监管:不停门,跑完出总账 | 关 |
 
-全开 = R1–R11 共 11 轮。**默认不跑第 6/7/8 类是设计决定,不是遗漏**——`final-report.md`
-强制有「本次未覆盖」一节把它写出来。
+第 6 类默认开中档:**无独立人工 SRT,或 init 时标了 `--asr-transcribed` → 默认开启**;有人工 SRT → 默认关闭。ASR 素材跑第 6 类的代价是改英文轨后要重跑一次验轴。
+全开 = R1–R11 共 11 轮(第 6 类只并入 R1–R3/R10,不新增轮次)。**第 7/8 类默认不跑是设计决定,不是遗漏**——`final-report.md`
+强制有「本次未覆盖」一节把它写出来。专名拼写(含 ASR 听错的专名)归第 5 类/R8,第 6 类不重复承担。
 
 **类别专轮一律全量出片,不切片取样。** token 不是本项目的稀缺资源,精确才是目标。
 详见 `references/rounds-spec.md` §2,这条是硬约束。
@@ -244,7 +246,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 | `cross_check.py` | 中英对照复核 + 撞车预警 + 动到历史结论 | 三模式 |
 | `regression_check.py` | 跨轮次台账/连续改动/批次沉住度(只读 log,不跑模型) | 三模式 |
 | `extract_subs.py` | 列/抽片源内嵌字幕流(判轴的前置) | 对轴 |
-| `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎);qwen 分块按显存规划并跑两档,跨档不一致报 AMBIGUOUS;离群点带 `isolation`/`outlier_kind` 判别提示 | 对轴 |
+| `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎);qwen 分块按显存规划并跑两档,跨档不一致报 AMBIGUOUS;离群点带 `isolation`/`outlier_kind` 判别提示;`--asr-words-b` 可对两份词级缓存做双源交叉校验(只提示,不改 PASS/FAIL;qwen 是强制对齐器,不能独立转录) | 对轴 |
 | `align_patch.py` | 按偏移量改时间轴(线性/曲线/重定时);写 log、`--revert` 撤销 | 对轴 |
 | `timeline_gate.py` | 读凭据判时间轴能否用于开工(不跑模型) | 对轴 + 自动审校阶段 0 |
 | `precheck_timeline.py` | L0 结构哨兵:秒级时间轴体检(不加载模型) | 前置 |
@@ -265,12 +267,12 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 ## 重要约束
 
 - **不带术语表**:作为第三者审校,不预设专名映射。详见 `references/glossary-handling.md`。
-- **8 类分类法**:结构性生产缺陷/漏译/语义反转/语境错译/专名错误不一致/原文拼写错误/低严重度/中立与合规(性别·宗教·政治·法律)。详见 `references/category-taxonomy.md`。**默认修 ≠ 默认跑**——第 6/7/8 类有判据但默认不进疗程,见上「三个开关」。
+- **8 类分类法**:结构性生产缺陷/漏译/语义反转/语境错译/专名错误不一致/原文拼写错误/低严重度/中立与合规(性别·宗教·政治·法律)。详见 `references/category-taxonomy.md`。**默认修 ≠ 默认跑**——第 7/8 类默认不进疗程;第 6 类在 ASR 素材上默认开启,有独立人工 SRT 时默认关,见上「三个开关」。
 - **第 8 类 C 子域只标注**:政治与主权表述(大陆/台湾/西藏/时政)一律 `action: flag`,不进 `fixes.json`。具体时政条目不入词表——本 skill 只做发现与标注,不做立场判定。
 - **第 8 类白名单是默认值,不是禁区**:`母头/公头/处女座/夫妻肺片/大陆架/台湾地区` 等词在 L4 白名单里,默认判「不是问题」。agent 通读后若认为确实该改,只能写 L3 并给理由,**不得自行生成替换词绕过白名单**;要改白名单本身得改 `references/inclusive-language.md` 并由 `tests/test_subtitle_polish_inclusive.py` 交叉校验。
 - **判断归 agent,脚本只定位**(适用于全部 8 类):`scan_seed.py` 出的锚点只表示「这里出现了某种形态」,不表示「这里是问题」;`scan_inclusive.py` 返回 0 条候选也不代表干净,只代表词表没命中。**任何一类都不许拿脚本命中当结论**。全文通读与最终判定由并行 subagent 做,分工与切分规则见 `references/subagent-delegation.md`。
 - **不 Edit ASS**:所有修改走脚本。**例外**:相邻 srt 块时间差 < 0.5s 时脚本 `_find_dialogue` 取最近也分不开(dry-run 会报"撞车预警"),允许破例 Edit ASS 兜底,但必须用 `apply_fixes.py --manual-log` 子命令补记 log.jsonl,不能手写 JSON。详见 `references/manual-flow.md` 兜底节。
-- **srt 是权威英文源**(除拼写错误,srt 与 ass 同源,拼写靠子 agent 判断)。**ASR 听写错误**(如 `big closet`→`big chested`)算英文源本身错,默认只改中文轨,英文轨改不改是另一次决定,SRT 源始终不动。详见 `references/manual-flow.md` ASR 节。若英文轨是 whisper/ASR 转录(无独立人工 SRT;派生 SRT 场景 `--init` 时加 `--asr-transcribed` 标记),报告的「本次未覆盖」会明确提示 ASR 听写错误风险,建议以 `--with-spelling` 重跑或人工抽查英文轨。
+- **srt 是权威英文源**(除拼写错误,srt 与 ass 同源,拼写靠子 agent 判断)。**ASR 听写错误**(如 `big closet`→`big chested`)算英文源本身错,默认只改中文轨,英文轨改不改是另一次决定,SRT 源始终不动。详见 `references/manual-flow.md` ASR 节。若英文轨是 whisper/ASR 转录(无独立人工 SRT;派生 SRT 场景 `--init` 时加 `--asr-transcribed` 标记),**第 6 类默认开启**并并入 R1–R3/R10;若用 `--no-with-spelling` 显式关闭,报告的「本次未覆盖」会提示 ASR 听写错误风险。专名拼写(含 ASR 听错的专名)归第 5 类/R8,不在第 6 类。
 - **派生 SRT 与 ASS 英文轨同源**:无独立 SRT 源时,`extract_slice.py` 从 ASS 英文轨派生的 `.srt` **就是权威英文源**,只是换了容器。因此第 6 类(原文拼写)不能拿「SRT 与 ASS 英文不一致」当证据——两者逐字相同;whisper 转录本身听错的内容算源错,默认只改中文轨,不重写英文。派生不改 ASS、不进成品目录,可用 `--no-derive-srt` 关闭。
 - **异常标记**:提取脚本自动标 ASS_HAS_SRT_NONE 等,这些本身是审计线索。`MULTI_SAME_LANG` 在配对算法去重后,只有真同时间戳重复行才标(不再因 ±0.5s 容差误配产生)。
 - **不要幻觉**:没把握说某行是问题就别报;但「判过了、认为不是问题」要写成 `false_positive` 记下来——清单与规则靠它迭代,沉默等于让清单只增不减。
