@@ -112,6 +112,19 @@ token 不是本项目的稀缺资源，**精确**才是目标。这条是硬约�
 --report` 按 `<episode>.ts.json` 写：凭据新鲜 → PASS/FAIL/AMBIGUOUS；manifest 没记
 片源但凭据记过 → 用凭据里的路径复核「没换片」；两者都无 → 才写 UNVERIFIED。
 
+**时间轴可信度附注（不改变四态 code）**：凭据里若有 `axis.confidence`，总账在
+时间轴结论后追加一句：
+
+- `corroborated` → 「双对齐器已印证」；
+- `divergent` → 「⚠ 未获双对齐器印证（divergent：<原因>），现有 PASS/FAIL 不可全信，
+  建议抽查音频」；
+- `single_source` → 「单路对齐，未获双引擎印证」；
+- `no_data` → 「两路均无足够锚点」。
+
+这条附注只影响文字表述，**不把 PASS 改成 AMBIGUOUS，也不改退出码**。要不要因为
+`divergent` 整体定格，是待定的口径（需要真实样片校准后再决定），当前**不自动定格**。
+
+
 ## 4. 定格规则（无监管模式）
 
 | 触发 | 动作 |

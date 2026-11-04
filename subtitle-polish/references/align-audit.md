@@ -342,6 +342,84 @@ python scripts/align_patch.py --sub a.ass --revert
 
 ---
 
+## 7.5 双对齐器时间戳互证（`--asr-words-b`）
+
+**这不是转录比对。** 输入始终是**同一份现成英文文本**（ASS/SRT 里的英文轨），
+两路各自把它**强制对齐**到同一段音频，再比较两套时间戳：
+
+| 路 | 对齐器 | 产出 |
+|---|---|---|
+| A（主路） | `qwen3-forced-aligner`（或 faster-whisper，按 `--engine`） | 词级时间戳缓存 |
+| B（第二路） | whisperX 的 wav2vec2 对齐器（`scripts/align_whisperx.py`） | 词级时间戳 json |
+
+`whisper` 的 ASR 转写和 whisperX 的 wav2vec2 对齐器不是一回事：前者是「听写出
+文本」，后者是「把已有文本钉到音频上」。本能力只用后者，因此**不需要第二个
+ASR、不产生第二份转写文本**。
+
+### 生产第二路时间戳
+
+```bash
+# 用本机 whisperX 环境自己的解释器（与仓库 .venv 进程隔离），只读调用
+python align_whisperx.py --audio clip.wav --sub clip.en.srt \
+    --out wx_words.json --model-dir <本机 wav2vec2 模型目录>
+# 再回仓库侧做互证
+python align_audit.py --sub clip.en.srt --asr-words qwen_words.json \
+    --asr-words-b wx_words.json --aligner-b-label whisperx
+```
+
+对齐方式：whisperX 一侧把整段音频作为**单个 segment**（`0..duration`）做全局对齐，
+不让字幕原有时间轴参与切分；qwen 一侧沿用 `align_audit` 的全局强制对齐与分块规划。
+两路都输出词级时间戳，再按「词的起点落在哪一行」归到同一套字幕行，最后比每行起点。
+
+### 三态与阈值
+
+| 状态 | 条件 |
+|---|---|
+| `corroborated` | 逐行起点差中位 ≤0.25 s、P90 ≤0.60 s、两路偏移中位差 ≤0.25 s、斜率差 ≤0.002 /s、两路单源判定一致 |
+| `divergent` | 任一条不满足 |
+| `single_source` | 只有一路锚点 ≥10 条 |
+| `no_data` | 两路都不足 10 条 |
+
+`divergent` 会在 `align_audit` 报告里单列一节、在 json 的 `dual_aligner` 字段里
+出现，并在 `round_orchestrator --report` 的时间轴结论后附「未获双对齐器印证」。
+**它不改 `stats` / `verdict` / `pairs` / `curve`，也不改 PASS/FAIL 的退出码。**
+
+### 真实样片实测（两集 120 s 片段，同一份英文轨）
+
+| 集 | 行 | 路 A 中位/斜率/判定 | 路 B 中位/斜率/判定 | 可比 | 起点差 中位/P90/最大 | 结论 |
+|---|---|---|---|---|---|---|
+| A | 45 | +0.000 / +0.000049 / PASS | +0.151 / +0.002457 / PASS | 38 | 0.104 / 0.733 / 2.130 | divergent（P90、斜率差） |
+| B | 18 | +0.128 / −0.001838 / PASS | −0.099 / +0.002626 / PASS | 17 | 0.137 / 0.452 / 1.778 | divergent（斜率差 0.00446） |
+
+两集单源结论都是 PASS，但两路斜率差分别是 0.00241 / 0.00446，超过保守默认
+0.002。**这说明「单源 PASS」在两个独立对齐器下没有得到印证**，正是本能力要
+暴露的情况；不是因为哪一路算错了。
+
+耗时（同一台机器，RTX 4060 Laptop 8G）：音频解码 0.46 s；whisperX 加载模型
+10.0/10.3 s、对齐 5.9/5.2 s；qwen 对齐整段 18.7 s；互证 + 报告（读缓存）259/266 ms。
+
+### 待校准
+
+保守默认值是在没有真实分布时定的。两集实测显示：
+
+- `ts_median_s=0.25` 站得住（实测 0.104 / 0.137）；
+- `offset_diff_s=0.25` 勉强站得住（实测 0.151 / 0.227）；
+- `ts_p90_s=0.60` 偏紧（实测 0.733），建议 0.80；
+- `slope_diff=0.002` 对 120 s 级短片段过紧（斜率是在 84~115 s 跨度上估的），
+  建议短片段放宽到 0.005，或只在跨度 ≥600 s 时把斜率差计入判据。
+
+**以上只是建议值，未改代码默认值，也未改 PASS/FAIL 判定口径**——要改需先经批准。
+
+### 已知限制
+
+- 说话人标记（`[SPEAKER_02]` / `SPEAKER02`）是轨里的元数据，两路都会把它当词对齐，
+  且位置不同，互证前会剔除并计数；跨度 >10 s 的异常 token 同样剔除。
+- 词级缓存是两路各自的**内部实现细节**，不同版本可能改变切词方式；互证只看行起点，
+  不要求两边词数相同。
+- 这套互证只说明「两路是否同意」，不回答「谁更对」。
+
+---
+
 ## 8. 命令清单
 
 ```bash
@@ -356,6 +434,10 @@ python scripts/align_audit.py --sub S06E01.eng.ass --media S06E01.mkv \
 # ③ 轴归属
 python scripts/align_audit.py --sub 终稿.ass --asr-words w.json \
     --compare uk.ass --compare us.ass
+
+# ③b 双对齐器时间戳互证（第二路先在本机 whisperX 环境里跑 align_whisperx.py）
+python scripts/align_audit.py --sub a.eng.ass --asr-words qwen_words.json \
+    --asr-words-b wx_words.json --dual-aligner-json dual.json
 
 # ④ 修复（默认 dry-run，加 --write 生效，自动 .bak）
 python scripts/align_patch.py --sub a.ass --sub a.srt --slope 0.000096 --write

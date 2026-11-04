@@ -152,9 +152,28 @@ def save(sub_path: str, data: dict) -> str:
     return p
 
 
+def _confidence_of(dual: dict) -> dict:
+    """把双对齐器互证结果压成凭据里的一小块，只留可核对的事实。"""
+    d = dual.get("timestamp_delta") or {}
+    return {
+        "status": dual.get("status"),
+        "reason": dual.get("reason"),
+        "label_a": dual.get("label_a"),
+        "label_b": dual.get("label_b"),
+        "n_compared": dual.get("n_compared"),
+        "ts_median": d.get("median"),
+        "ts_p90": d.get("p90"),
+        "ts_max": d.get("max"),
+        "offset_diff": dual.get("offset_diff"),
+        "slope_diff": dual.get("slope_diff"),
+        "verdict_agree": dual.get("verdict_agree"),
+        "thresholds": dual.get("thresholds"),
+    }
+
+
 def build(sub_path: str, stats: dict, engine: str, media: Optional[str] = None,
           source: Optional[dict] = None, l0: Optional[dict] = None,
-          cross_checked: bool = False) -> dict:
+          cross_checked: bool = False, dual: Optional[dict] = None) -> dict:
     """由一次 align_audit 的结果组装凭据。
 
     `files[]` 保留此前记录过、且当前仍与盘面一致的条目：同一个 episode 的
@@ -210,6 +229,10 @@ def build(sub_path: str, stats: dict, engine: str, media: Optional[str] = None,
             "verdict": stats.get("verdict") or ("PASS" if stats.get("ok") else "FAIL"),
             "cross_checked": bool(cross_checked),
             "l0": l0,
+            # 双对齐器时间戳互证的可信度标注。**不参与 gate 判定**：
+            # 这里只记录「有没有第二路印证」，PASS/FAIL 仍由单路 stats 决定。
+            # 缺失（没跑第二路）就是 None，不写成 "corroborated" 冒充验过。
+            "confidence": (_confidence_of(dual) if dual else None),
         },
         "files": files,
         "computed_at": _now(),
@@ -279,6 +302,8 @@ def check(sub_path: str, media: Optional[str] = None) -> dict:
     detail["sidecar"] = sidecar_path(sub_path)
     detail["computed_at"] = data.get("computed_at")
     detail["axis_verdict"] = (data.get("axis") or {}).get("verdict")
+    # 双对齐器互证只是「可信度附注」，不参与 PASS/FAIL 判定，也不让凭据失效。
+    detail["axis_confidence"] = (data.get("axis") or {}).get("confidence")
     stale = False
 
     # --- 2. 片源绑定

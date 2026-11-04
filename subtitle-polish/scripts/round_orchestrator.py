@@ -873,17 +873,38 @@ def _timeline_state(m: dict) -> dict:
         "has_credential": bool(res.get("data")),
         "media": media,
         "sidecar": (res.get("detail") or {}).get("sidecar", ""),
+        # 双对齐器互证的可信度附注。**不改变 code**：PASS 仍是 PASS，
+        # 只是把「有没有第二路印证」写清楚，交给人决定要不要抽查。
+        "confidence": (res.get("detail") or {}).get("axis_confidence"),
     }
+
+
+def _confidence_suffix(conf) -> str:
+    """时间轴结论后面的可信度短句。没有互证记录就返回空串。"""
+    if not conf:
+        return ""
+    status = conf.get("status")
+    if status == "corroborated":
+        return "；双对齐器已印证"
+    if status == "divergent":
+        return ("；⚠ 未获双对齐器印证（divergent：%s），现有 PASS/FAIL 不可全信，"
+                "建议抽查音频" % (conf.get("reason") or "两路结论不一致"))
+    if status == "single_source":
+        return "；单路对齐，未获双引擎印证"
+    if status == "no_data":
+        return "；两路均无足够锚点，未获双引擎印证"
+    return ""
 
 
 def _timeline_top_text(st: dict) -> str:
     """顶栏一句话。PASS/FAIL/AMBIGUOUS 与 UNVERIFIED 的成因要分开写。"""
+    suffix = _confidence_suffix(st.get("confidence"))
     if st["code"] == V.PASS:
-        return "时间轴 PASS（凭据已验）"
+        return "时间轴 PASS（凭据已验）" + suffix
     if st["code"] == V.FAIL:
-        return "时间轴 FAIL（凭据判轴有问题）"
+        return "时间轴 FAIL（凭据判轴有问题）" + suffix
     if st["code"] == V.AMBIGUOUS:
-        return "时间轴 AMBIGUOUS（验了但判不出）"
+        return "时间轴 AMBIGUOUS（验了但判不出）" + suffix
     if st["has_credential"]:
         return "时间轴 UNVERIFIED（凭据失效：%s）" % (st["reason"] or "原因未记录")
     if st["media"]:
