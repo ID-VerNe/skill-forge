@@ -2,7 +2,7 @@
 
   #27  round_orchestrator 等脚本捕获子进程输出时按 UTF-8 解码，不再用 locale 编码
   #28  最终报告的时间轴结论读 sidecar 凭据，不再只看 init 时冻结的 media
-  #30  无独立 SRT（whisper 转录）时，「本次未覆盖」提示 ASR 听写错误风险
+  #30  无独立 SRT（whisper 转录）时默认开第 6 类；显式关闭仍提示 ASR 风险
 
 跑法:
   cd <skill-forge>
@@ -91,11 +91,14 @@ class Run:
             f.write(b"not-a-real-video")
 
     def init(self, srt=None, media="", plan=None, stamp="T1",
-             asr_transcribed=False):
-        plan = plan or ro.build_plan()
+             asr_transcribed=False, spelling_reason=""):
         srt = self.srt if srt is None else srt
+        if plan is None:
+            asr_source = bool(asr_transcribed or not (srt or "").strip())
+            plan = ro.build_plan(asr_source=asr_source)
         return ro.init_run(self.wd, self.ass, srt, plan, media=media, stamp=stamp,
-                           asr_transcribed=asr_transcribed)
+                           asr_transcribed=asr_transcribed,
+                           spelling_reason=spelling_reason)
 
     def write_cred(self, media=None, ok=True, verdict=None):
         stats = {"n_pairs": 10, "mad": 0.1, "drift": 0.0,
@@ -232,52 +235,114 @@ def t_cross_run_table_uses_credential():
 
 
 # ══════════════════════════════════════════════════════════════════
-# #30 whisper 转录的「未覆盖」提示
+# #30 建议 3：第 6 类默认开中档
 # ══════════════════════════════════════════════════════════════════
 
-def t_whisper_hint_when_no_srt():
+def t_asr_default_spelling_on_without_srt():
+    """无独立 SRT → 第 6 类默认开启，不再是「本次未覆盖」。"""
     r = Run()
     try:
         stamp = r.init(srt="")
+        m = ro.load_manifest(r.wd, stamp)
+        assert m["opts"]["with_spelling"] is True, m["opts"]
+        assert m["opts"]["spelling_reason"] == "asr_default", m["opts"]
+        assert any(6 in rd["scope"] for rd in m["rounds"]), m["rounds"]
         md = ro.render_report(r.wd, stamp)
         gaps = md.split("## 本次未覆盖")[1]
-        assert "whisper 转录" in gaps, gaps
-        assert "ASR 听写错误" in gaps, gaps
-        assert "--with-spelling" in gaps, gaps
+        assert "whisper 转录" not in gaps, gaps
     finally:
         r.close()
 
 
-def t_no_whisper_hint_with_independent_srt():
+def t_independent_srt_default_off():
+    """有独立人工 SRT → 默认关闭，并在「未覆盖」写明原因。"""
     r = Run()
     try:
         stamp = r.init(srt=r.srt)
-        md = ro.render_report(r.wd, stamp)
-        assert "whisper 转录" not in md, md
+        m = ro.load_manifest(r.wd, stamp)
+        assert m["opts"]["with_spelling"] is False, m["opts"]
+        assert m["opts"]["spelling_reason"] == "human_srt", m["opts"]
+        gaps = ro.render_report(r.wd, stamp).split("## 本次未覆盖")[1]
+        assert "有独立人工 SRT" in gaps, gaps
+        assert "默认关闭" in gaps, gaps
     finally:
         r.close()
 
 
-def t_whisper_hint_with_asr_flag():
-    """派生 SRT 路径非空，但 init 标了 --asr-transcribed → 同样要提示。"""
+def t_asr_flag_default_on():
+    """派生 SRT 路径非空，但 init 标了 --asr-transcribed → 仍默认开。"""
     r = Run()
     try:
         stamp = r.init(srt=r.srt, asr_transcribed=True)
-        md = ro.render_report(r.wd, stamp)
-        gaps = md.split("## 本次未覆盖")[1]
-        assert "whisper 转录" in gaps, gaps
+        m = ro.load_manifest(r.wd, stamp)
+        assert m["opts"]["asr_source"] is True, m["opts"]
+        assert m["opts"]["with_spelling"] is True, m["opts"]
+        assert m["opts"]["spelling_reason"] == "asr_default", m["opts"]
     finally:
         r.close()
 
 
-def t_no_whisper_hint_when_spelling_enabled():
+def t_no_with_spelling_explicit_off_hints():
+    """ASR 素材也能用 --no-with-spelling 显式关；关掉后仍提示 ASR 风险。"""
     r = Run()
     try:
-        stamp = r.init(srt="", plan=ro.build_plan(with_spelling=True))
-        md = ro.render_report(r.wd, stamp)
-        assert "whisper 转录" not in md, md
+        plan = ro.build_plan(with_spelling=False, asr_source=True)
+        stamp = r.init(srt="", plan=plan, spelling_reason="disabled")
+        m = ro.load_manifest(r.wd, stamp)
+        assert m["opts"]["with_spelling"] is False, m["opts"]
+        assert m["opts"]["spelling_reason"] == "disabled", m["opts"]
+        gaps = ro.render_report(r.wd, stamp).split("## 本次未覆盖")[1]
+        assert "--no-with-spelling" in gaps, gaps
+        assert "ASR" in gaps, gaps
+        assert "第 5 类" in gaps, gaps
     finally:
         r.close()
+
+
+def t_with_spelling_forced_on_with_srt():
+    """有人工 SRT 时 --with-spelling 仍可强制开启。"""
+    r = Run()
+    try:
+        plan = ro.build_plan(with_spelling=True, asr_source=False)
+        stamp = r.init(srt=r.srt, plan=plan, spelling_reason="forced")
+        m = ro.load_manifest(r.wd, stamp)
+        assert m["opts"]["with_spelling"] is True, m["opts"]
+        assert m["opts"]["spelling_reason"] == "forced", m["opts"]
+        assert any(6 in rd["scope"] for rd in m["rounds"]), m["rounds"]
+    finally:
+        r.close()
+
+
+# ══════════════════════════════════════════════════════════════════
+# #30 建议 2 B：专名归第 5 类，第 6 类不重复承担
+# ══════════════════════════════════════════════════════════════════
+
+def t_proper_noun_owned_by_class5():
+    root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "..", "subtitle-polish"))
+    with open(os.path.join(root, "references", "category-taxonomy.md"),
+              encoding="utf-8") as f:
+        tax = f.read()
+    with open(os.path.join(root, "prompts", "audit.tmpl"), encoding="utf-8") as f:
+        tmpl = f.read()
+
+    assert "ASR 听错的专名也归此类" in tax, "taxonomy 没把 ASR 专名归第 5 类"
+    sec6 = tax.split("## 6.")[1].split("## 7.")[0]
+    assert "不重复承担专名核实" in sec6, sec6
+    assert "第 6 类负责专名" not in sec6, sec6
+
+    sec6_tmpl = tmpl.split("6. **原文拼写错误")[1].split("7. **")[0]
+    assert "归第 5 类" in sec6_tmpl, sec6_tmpl
+    assert "对专名（人/地/品牌/车型/型号）的拼写，如有在线检索" not in sec6_tmpl, \
+        "audit.tmpl 仍把专名核实写在第 6 类"
+
+
+def t_asr_help_does_not_claim_proper_nouns():
+    p = subprocess.run([sys.executable,
+                        os.path.join(SCRIPTS, "round_orchestrator.py"), "--help"],
+                       capture_output=True, text=True, encoding="utf-8")
+    assert p.returncode == 0, p.stderr
+    assert "专名拼写核实归第 5 类" in p.stdout, p.stdout
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -292,9 +357,15 @@ if __name__ == "__main__":
     test("#28 有 media 无凭据不算通过", t_media_without_credential_is_not_pass)
     test("#28 凭据失效写明原因", t_stale_credential_says_reason)
     test("#28 合并报告按凭据写时间轴", t_cross_run_table_uses_credential)
-    test("#30 whisper 素材给出未覆盖提示", t_whisper_hint_when_no_srt)
-    test("#30 有独立 SRT 不提示 whisper", t_no_whisper_hint_with_independent_srt)
-    test("#30 派生 SRT + --asr-transcribed 仍提示", t_whisper_hint_with_asr_flag)
-    test("#30 开了拼写类不再提示 whisper", t_no_whisper_hint_when_spelling_enabled)
+    test("#30 无 SRT 默认开第 6 类", t_asr_default_spelling_on_without_srt)
+    test("#30 有独立 SRT 默认关第 6 类", t_independent_srt_default_off)
+    test("#30 派生 SRT + --asr-transcribed 默认开", t_asr_flag_default_on)
+    test("#30 --no-with-spelling 显式关仍提示 ASR 风险",
+         t_no_with_spelling_explicit_off_hints)
+    test("#30 --with-spelling 可强制开", t_with_spelling_forced_on_with_srt)
+    test("#30 专名归第 5 类（taxonomy/audit.tmpl）",
+         t_proper_noun_owned_by_class5)
+    test("#30 --asr-transcribed 帮助不再声称涵盖专名",
+         t_asr_help_does_not_claim_proper_nouns)
     print(f"\n通过 {PASS} / 失败 {FAIL}")
     sys.exit(0 if FAIL == 0 else 1)

@@ -164,6 +164,48 @@ def t_spelling_merges():
         assert 6 in r["scope"], f"{rid} 没并进第 6 类：{r['scope']}"
 
 
+def t_asr_source_defaults_spelling_on():
+    """无独立 SRT / --asr-transcribed → 第 6 类默认并入，轮数仍是 9。"""
+    plan = ro.build_plan(asr_source=True)
+    assert len(plan) == 9, len(plan)
+    for rid in ("r01", "r02", "r03", "r10"):
+        r = next(x for x in plan if x["id"] == rid)
+        assert 6 in r["scope"], f"{rid} 没默认并进第 6 类：{r['scope']}"
+    assert not any(r["scope"] == [6] for r in plan), "第 6 类开了独立轮"
+
+
+def t_no_with_spelling_overrides_asr():
+    """ASR 素材也能显式关闭第 6 类。"""
+    plan = ro.build_plan(with_spelling=False, asr_source=True)
+    assert len(plan) == 9, len(plan)
+    assert not any(6 in r["scope"] for r in plan), "显式关闭没生效"
+
+
+def t_cli_plan_spelling_switch():
+    """CLI 判定：无 SRT 默认开；有 SRT 默认关；两个显式开关都能覆盖。"""
+    r = Run()
+    try:
+        script = os.path.join(SCRIPTS, "round_orchestrator.py")
+
+        def run(*args):
+            p = subprocess.run([sys.executable, script, "--plan", "--ass", r.ass]
+                               + list(args), capture_output=True, text=True,
+                               encoding="utf-8")
+            assert p.returncode == 0, p.stderr
+            return p.stdout
+
+        out = run()
+        assert "ASR 素材默认开" in out, out
+        out = run("--srt", r.srt)
+        assert "有独立 SRT 默认关闭" in out, out
+        out = run("--srt", r.srt, "--with-spelling")
+        assert "--with-spelling 强制开" in out, out
+        out = run("--no-with-spelling")
+        assert "--no-with-spelling 显式关闭" in out, out
+    finally:
+        r.close()
+
+
 def t_full_plan_11():
     plan = ro.build_plan(with_low=True, with_inclusive=True, with_spelling=True)
     assert len(plan) == 11, len(plan)
@@ -624,6 +666,9 @@ if __name__ == "__main__":
     print("轮次编排：计划 / 快照回滚 / 定格 / 报告")
     for n, fn in (
         ("默认 9 轮且不含第 6/7/8 类", t_default_plan_9_rounds),
+        ("ASR 素材默认开第 6 类", t_asr_source_defaults_spelling_on),
+        ("--no-with-spelling 可关 ASR 默认", t_no_with_spelling_overrides_asr),
+        ("CLI 第 6 类开关判定", t_cli_plan_spelling_switch),
         ("第 7 类固定 R9", t_low_is_r09),
         ("第 8 类独立 R11", t_inclusive_is_r11),
         ("第 6 类并入 R1-R3/R10", t_spelling_merges),
