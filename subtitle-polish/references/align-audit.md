@@ -443,6 +443,7 @@ python align_audit.py --sub clip.en.srt --asr-words qwen_words.json \
 
 耗时（同一台机器，RTX 4060 Laptop 8G）：解码 0.19~0.46 s；whisperX（含加载模型）
 17.6~45.0 s；qwen（自动分块、单次）156.4~179.5 s；互证 + 报告（读缓存）0.26~0.28 s。
+上列解码/whisperX/qwen 耗时只来自新跑的两集（4 集里另两集复用了已有产物）。
 qwen 在 CPU 独立环境上有一次 60 s 音频的冒烟：106.6 s、135 个 token，能跑通但慢，
 生产应留给有 CUDA 的环境。
 
