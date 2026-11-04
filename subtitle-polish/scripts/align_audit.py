@@ -9,6 +9,11 @@
   whisper（默认）  faster-whisper large-v3 转录，独立于任何字幕
   qwen            Qwen3-ForcedAligner 全局强制对齐，须给模型目录
 
+双对齐器互证（可选）：`--asr-words-b` 读第二路词级时间戳，与主路比**时间戳**
+（不比对文本）。第二路可以用 `scripts/align_whisperx.py` 在 whisperX 环境里
+对**同一份字幕文本 + 同一段音频**做强制对齐产出。结论只作可信度标注，
+不改 stats / verdict / curve。
+
 用法:
   # 最常用：视频 + 字幕，自动抽音轨
   python align_audit.py --sub S06E01.eng.ass --media S06E01.mkv
@@ -37,7 +42,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import align_core as ac
-from lib import asr_cross as xc
+from lib import align_cross as xc
 from lib import axis as ax
 from lib import credential as cred
 from lib import verdict as V
@@ -529,10 +534,14 @@ def main():
     ap.add_argument("--media", help="视频或音频（视频会自动抽 16k 单声道）")
     ap.add_argument("--asr-words", help="复用词级时间戳 json，跳过模型")
     ap.add_argument("--asr-words-b",
-                    help="第二个词级时间戳 json，用于双源交叉校验（仅提示，"
-                         "不改变 PASS/FAIL）")
-    ap.add_argument("--dual-source-json",
-                    help="双源比对结果落盘路径（默认与 --json 同目录）")
+                    help="第二路对齐器的词级时间戳 json（如 whisperX 对齐器产出），"
+                         "用于双对齐器时间戳互证；只标可信度，不改 PASS/FAIL")
+    ap.add_argument("--aligner-b-label", default="whisperx",
+                    help="第二路对齐器的短标签（默认 whisperx）")
+    ap.add_argument("--aligner-b-tol", type=float, default=0.5,
+                    help="第二路单独判定的窗间极差阈值（秒），默认 0.5（对齐器抖动口径）")
+    ap.add_argument("--dual-aligner-json",
+                    help="双对齐器互证结果落盘路径（默认与 --json 同目录）")
     ap.add_argument("--engine", choices=["whisper", "qwen"], default="whisper")
     ap.add_argument("--model", help="模型目录（whisper 默认 large-v3 / qwen 必填）")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
@@ -670,22 +679,41 @@ def main():
 
     print_summary(os.path.basename(args.sub), stats, len(rows), engine)
 
-    # 2c) 双源交叉校验：只产提示，不碰 stats / verdict / pairs。
+    # 2c) 双对齐器时间戳互证：只产可信度标注，不碰 stats / verdict / pairs。
     #     放在 stats 之后、写报告之前，确保报告与 json 拿到同一份结果。
+    #
+    #     比的是**时间戳**：两路各自把同一份英文文本强制对齐到同一段音频，
+    #     再比较逐行起点差与各自的偏移/斜率结论。这里不依赖任何独立转录。
     dual = None
     if args.asr_words_b:
         tokens_b = xc.load_tokens(args.asr_words_b)
         if not tokens_b:
-            print("  [warn] --asr-words-b 为空，跳过双源校验", file=sys.stderr)
+            print("  [warn] --asr-words-b 为空，跳过双对齐器互证", file=sys.stderr)
         else:
+            # 第二路单独算一次偏移结论（与主路同一套 align_core 口径），
+            # 阈值按第二路引擎的抖动口径取，默认 0.5。
+            pairs_b = ac.align_anchors(rows, tokens_b)
+            stats_b = (ac.summarize(pairs_b, args.window, args.aligner_b_tol, args.min_n)
+                       if len(pairs_b) >= xc.THRESHOLDS["min_rows"] else None)
             dual = xc.compare(
                 rows, tokens, tokens_b,
-                label_a=os.path.basename(args.asr_words) if args.asr_words else engine,
-                label_b=os.path.basename(args.asr_words_b))
-            print("  [dual] 可比 %d 行：一致 %d / 不一致 %d / 单源缺覆盖 %d"
-                  "（仅提示，不改判定）"
-                  % (dual["n_compared"], dual["n_agree"], dual["n_mismatch"],
-                     dual["n_uncovered"]))
+                label_a=(os.path.basename(args.asr_words) if args.asr_words else engine),
+                label_b=args.aligner_b_label,
+                stats_a=stats, stats_b=stats_b,
+                tol_a=tol, tol_b=args.aligner_b_tol)
+            if stats_b:
+                print("  vs %-28s 中位 %s  斜率 %+.6f  %s"
+                      % (args.aligner_b_label, _fmt(stats_b["median"]),
+                         stats_b["slope"], stats_b["verdict"]))
+            print("  [dual] %s：可比 %d 行，起点差中位 %.3f s / P90 %.3f s / 最大 %.3f s"
+                  "（仅标可信度，不改判定）"
+                  % (dual["status"], dual["n_compared"],
+                     dual["timestamp_delta"]["median"],
+                     dual["timestamp_delta"]["p90"],
+                     dual["timestamp_delta"]["max"]))
+            if dual["status"] == xc.STATUS_DIVERGENT:
+                print("[!] 两路对齐结论不一致，时间轴未获双引擎印证：%s"
+                      % dual["reason"], file=sys.stderr)
 
     # 3) 轴归属 —— 判的是「哪条可信」，不是「哪条最小」
     compare = []
@@ -754,9 +782,9 @@ def main():
             "reject": rej_info,
             "verdict": stats["verdict"],
             "axis": axis_res,
-            # 双源交叉校验：只做提示。这里写进 json 但不进 stats，
+            # 双对齐器时间戳互证：只做可信度标注。这里写进 json 但不进 stats，
             # 下游若只看 verdict/curve，行为与旧版完全一致。
-            "dual_source": dual,
+            "dual_aligner": dual,
         }
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=1)
@@ -765,11 +793,11 @@ def main():
                 else "（判 %s，不输出曲线）" % stats["verdict"])
         print("[json]   %s  %s" % (args.json, tail))
 
-    if args.dual_source_json and dual:
-        os.makedirs(os.path.dirname(args.dual_source_json) or ".", exist_ok=True)
-        with open(args.dual_source_json, "w", encoding="utf-8") as f:
+    if args.dual_aligner_json and dual:
+        os.makedirs(os.path.dirname(args.dual_aligner_json) or ".", exist_ok=True)
+        with open(args.dual_aligner_json, "w", encoding="utf-8") as f:
             json.dump(dual, f, ensure_ascii=False, indent=1)
-        print("[dual]   %s" % args.dual_source_json)
+        print("[dual]   %s" % args.dual_aligner_json)
 
     # 5) 凭据：PASS 与 FAIL 都写。
     #    只写 PASS 的话，FAIL 在 gate 眼里会退化成「没有凭据」，分不出
@@ -800,6 +828,7 @@ def main():
                     "family": args.source_family or tag["family"],
                     "sdh": tag["sdh"]},
             cross_checked=bool(axis_res and axis_res.get("cross_checked")),
+            dual=dual,
         )
         data["axis"]["total"] = len(rows)
         p = cred.save(cred_sub, data)

@@ -32,7 +32,12 @@
              "title": "Original | English (United Kingdom)", "family": "UK" },
  "axis":   { "engine": "qwen3-forced-aligner", "anchors": 761, "total": 763,
              "mad": 0.18, "drift": -0.11, "window_span": 0.23, "tol": 0.3,
-             "verdict": "PASS", "cross_checked": true, "l0": null },
+             "verdict": "PASS", "cross_checked": true, "l0": null,
+             "confidence": { "status": "corroborated", "label_a": "qwen3-forced-aligner",
+                             "label_b": "whisperx", "n_compared": 761,
+                             "ts_median": 0.11, "ts_p90": 0.34, "ts_max": 0.72,
+                             "offset_diff": 0.12, "slope_diff": 0.0004,
+                             "verdict_agree": true } },
  "files":  [ { "path": "S06E01.ass", "sha1": "9c14…",
                "patched_at": null, "max_shift": 0.0, "patches": 0 } ],
  "computed_at": "2026-10-31T14:00:12.881"
@@ -51,6 +56,31 @@
 最后一条是实测里最容易犯的：E03 一轮修正后如果不复测，凭据就成了「上一版」的结论。
 
 `files[]` 是数组而不是单个对象，因为 ASS 与 SRT 可能各自被 `align_patch` 施加过。
+
+## 双对齐器可信度（`axis.confidence`）
+
+`align_audit --asr-words-b` 提供第二路对齐器结果时，凭据会多记一块 `axis.confidence`。
+它不是第四道门，**只回答「这条 PASS/FAIL 有没有被另一套对齐器印证」**。
+
+口径是**比时间戳**：同一份现成英文文本，分别喂 whisperX 的 wav2vec2 对齐器与
+qwen3-forced-aligner，两路各自产出词级时间戳，再比逐行起点差与各自的偏移/斜率结论。
+**不需要独立转录**——两路都只是在做「文本 ↔ 音频」的强制对齐。
+
+| `confidence.status` | 含义 | 怎么用 |
+|---|---|---|
+| `corroborated` | 两路偏移结论一致 | 该 PASS/FAIL 属高置信结论 |
+| `divergent` | 时间戳或结论明显不一致 | 现有 PASS/FAIL 不可全信，报 AMBIGUOUS 或抽查音频 |
+| `single_source` | 只有一路可用 | **不冒充双证**，按单源结论使用 |
+| `no_data` | 两路都没有足够锚点 | 没有可信度信息 |
+
+阈值（保守默认，待真实样片校准，见 `align-audit.md` §7.5）：逐行起点差中位
+≤0.25 s、P90 ≤0.60 s、两路偏移中位之差 ≤0.25 s、斜率之差 ≤0.002 /s、每路至少
+10 个锚点。
+
+**判定顺序里没有 `confidence`。** 凭据是否可用于结案仍只看 `axis.verdict`；
+`confidence` 只被 `round_orchestrator --report` 读去给时间轴结论加一句附注
+（`divergent` 时写「未获双对齐器印证」，但不改 PASS/FAIL 的 code）。
+缺省（没跑第二路）就是 `null`，不写成 `corroborated` 冒充验过。
 
 ## 判定顺序（不要改）
 
