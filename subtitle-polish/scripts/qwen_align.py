@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import align_audit as aa                    # noqa: E402  同一套分块/对齐实现
 from lib import align_core as ac            # noqa: E402
+from lib import align_device as ad          # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -41,7 +42,18 @@ def main(argv=None) -> int:
     ap.add_argument("--single-chunk", action="store_true",
                     help="只跑主分块，不做跨分块复核（省一半时间）")
     ap.add_argument("--language", default="English")
+    ap.add_argument("--allow-cpu", action="store_true",
+                    help="显式允许无 CUDA 时继续（默认硬失败）")
     args = ap.parse_args(argv)
+
+    # 设备硬门：这里就是「跑模型的那一层」，不能等模型加载完再发现是 CPU。
+    try:
+        info = ad.require_cuda(None, allow_cpu=args.allow_cpu,
+                               purpose="qwen 强制对齐", require_qwen=True)
+    except ad.DeviceError as e:
+        print("[x] %s" % e, file=sys.stderr)
+        return 3
+    print("  " + ad.fmt_line(info), flush=True)
 
     rows = ac.load_rows(args.sub, args.track or None)
     if not rows:
@@ -71,6 +83,7 @@ def main(argv=None) -> int:
                  for c, tk in runs],
         "elapsed_s": round(elapsed, 2),
         "plan": why,
+        "device_info": ad.record(info),
     }
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)

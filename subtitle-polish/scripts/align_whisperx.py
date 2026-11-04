@@ -264,6 +264,8 @@ def main() -> int:
                     help="跳过本地缓存自动探测，强制联网（默认不联网）")
     ap.add_argument("--language", default="en")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    ap.add_argument("--allow-cpu", action="store_true",
+                    help="显式允许无 CUDA 时继续（默认硬失败）")
     ap.add_argument("--start", type=float, default=None, help="只对齐该秒之后的音频")
     ap.add_argument("--end", type=float, default=None, help="只对齐该秒之前的音频")
     ap.add_argument("--window", type=float, default=None,
@@ -306,6 +308,15 @@ def main() -> int:
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 设备硬门：whisperX 曾在主环境（torch 2.15.0+cpu）静默跑成 CPU，
+    # 产物只有 device=cpu 一个字段，肉眼不看就发现不了。
+    if (device == "cpu" or not torch.cuda.is_available()) and not args.allow_cpu:
+        print("[x] 未检测到 CUDA，已拒绝在 CPU 上跑 whisperX 对齐；"
+              "解释器 %s（torch %s）。如确需 CPU 请显式 --allow-cpu。"
+              % (sys.executable, torch.__version__), file=sys.stderr)
+        return 3
+    print("[device] %s（torch %s，解释器 %s）"
+          % (device, torch.__version__, sys.executable), flush=True)
 
     a = args.start if args.start is not None else 0.0
     z = args.end if args.end is not None else max(r["end"] for r in rows_all)
@@ -412,6 +423,9 @@ def main() -> int:
         "aligner": "wav2vec2",
         "model": args.model_name,
         "device": device,
+        "torch_version": torch.__version__,
+        "python": sys.executable,
+        "python_version": sys.version.split()[0],
         "language": args.language,
         "audio": os.path.basename(args.audio),
         "sub": os.path.basename(args.sub),
