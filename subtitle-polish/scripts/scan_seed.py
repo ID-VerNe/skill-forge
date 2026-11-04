@@ -132,6 +132,14 @@ _EN_SENT_END = re.compile(r"[.!?…][\"'’)\]]*$")
 #: 这种形态即使只在句首出现，也不可能是普通词。
 _RE_EN_STRONG_FORM = re.compile(r"[a-z][A-Z]|[0-9]")
 
+#: issue #54：第 6 类的两类**形态错**，旧的英文侧锚点池收不进来：
+#:   1. 标点占位残留 `, , ,` / `,,,`（逗号不是词，`_en_candidates` 直接跳过）
+#:   2. 截断缩写 `t's`（应为 `it's`；小写，也不在「大写开头」候选池）
+#: 实测 S06E04 的 319/649 两处，旧口径英文侧锚点 0 命中，第 6 类即使开启
+#: 也没有任何线索指过去。这里单独扫形态，只给位置，不给结论。
+_RE_EN_PUNCT_RUN = re.compile(r"(?:\s*[,;]\s*){3,}")
+_RE_EN_TRUNC = re.compile(r"(?<![\w'])t's\b")
+
 #: 同音/形近词对。**两边在同一文档都出现**才提示（单个常见词不算异常）。
 _EN_HOMOPHONES = (
     ("brake", "break"), ("there", "their"), ("hear", "here"),
@@ -294,6 +302,7 @@ _EN_FORM_NOTE = {
     "en_proper_noun": "英文专名候选（第 5 类）",
     "en_near_variant": "同文档近似变体（形近）",
     "en_homophone": "同音词双现",
+    "en_text_defect": "英文形态错（第 6 类）",
 }
 
 
@@ -342,6 +351,17 @@ def _build_en_anchors(rows: list, lookup=None) -> tuple:
         doc_words.append(words)
         for w in words:
             all_occ.setdefault(w, []).append((w, r, idx))
+
+    # issue #54：形态错（第 6 类）。标点占位与截断缩写不在「大写专名候选」池里，
+    # 必须单独扫——否则第 6 类开着也拿不到任何线索（S06E04 319/649 实测 0 命中）。
+    for idx, r in enumerate(rows):
+        m = _mask(r["en"])
+        for hit in _RE_EN_PUNCT_RUN.finditer(m):
+            add("en_text_defect", hit.group(0).strip(), r, idx,
+                note="标点占位残留（`, , ,` / `,,,`）")
+        for hit in _RE_EN_TRUNC.finditer(m):
+            add("en_text_defect", hit.group(0), r, idx,
+                note="截断缩写（疑漏首字母，如 `t's` 应为 `it's`）")
 
     def strong(low: str) -> bool:
         """这个词有没有「它确实是专名」的文档级证据。"""
@@ -425,6 +445,7 @@ def _build_en_anchors(rows: list, lookup=None) -> tuple:
         "distinct_dropped": len(dropped_terms),
         "anchors": len(uniq),
         "by_form": by_form,
+        "text_defects": by_form.get("en_text_defect", 0),
     }
     return uniq, stats
 
@@ -438,6 +459,10 @@ def _render_en_hint(anchors: list, stats: dict | None = None) -> str:
                 % (stats["candidates"], stats["kept"], stats["dropped"],
                    stats["dropped_pct"]),
                 ""]
+        if stats.get("text_defects"):
+            head.append("英文形态错（第 6 类）%d 条：标点占位残留 / 截断缩写。"
+                        % stats["text_defects"])
+            head.append("")
     if not anchors:
         return "\n".join(head + [
             "英文侧无可疑候选。注意：**这不等于英文轨没有听写错误**——"

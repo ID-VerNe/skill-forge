@@ -152,9 +152,17 @@ R4 只写「只看第 1 类」，R7 只写「只看第 4 类」，R10 写「全 
 - 白名单段 `{inclusive_list}` —— 仅 R11 填，内容来自 `inclusive-language.md`（L4 白名单必须贴，
   否则 agent 会把 `母头` 判成敏感词）。
 
-**第 6 类的默认启动**：无独立人工 SRT，或 init 标了 `--asr-transcribed` 时，R1–R3/R10 的
-`round_scope` 默认包含第 6 类；有独立人工 SRT 时默认不含，`--with-spelling` 强制开启，
-`--no-with-spelling` 显式关闭。详见 `rounds-spec.md` §1。
+**第 6 类的默认启动**：无独立人工 SRT、init 标了 `--asr-transcribed`、或 init 实测
+SRT 与 ASS 英文轨逐字同源（`srt_same_source=True`，派生副本）时，R1–R3/R10 的
+`round_scope` 默认包含第 6 类；内容确实不同的人工审校 SRT 默认不含，
+`--with-spelling` 强制开启，`--no-with-spelling` 显式关闭。详见 `rounds-spec.md` §1。
+
+**口径外的发现不许自行驳回**：`round_scope` 是审计清单，不是「只能报这些」。审计员
+在清单外发现真问题时，单列到「交人类（超出本轮口径）」，写清它属于哪个类别；
+**不得**改标成清单内的类别（R10 反例：319/649 本属第 6 类，被写成「结构性生产缺陷」
+后驳回），**不得**静默丢弃。未开启第 6 类时遇到拼写问题，判「已超出、交人类」，
+并在 report 的「本次未覆盖」里留痕（`rounds-spec.md` §1）。
+
 
 **`round_scope` 只改 prompt 里的类别清单，不裁剪切片文件。** 类别专轮一律全量出片，
 禁止「只切含专名的块」「按关键词采样」这类省 token 做法（`rounds-spec.md` §2，硬约束）。
@@ -225,6 +233,10 @@ python <skill>/scripts/scan_seed.py .subtitle-polish/slices/<stem>_p1.txt \
   `timeline-credential.md` 的 `axis.confidence`），不涉及英文文本，也不改写英文轨。
   两者都只作提示，**不要**贴进 R11 的 `{seeds}`。
 - 专名候选交给第 5 类判据；第 6 类只看非专名的词形/时态/功能词错误。
+- **形态错单独扫（issue #54）**：`en_text_defect` 覆盖两类旧口径收不进的错——
+  `, , ,`/`,,,` 标点占位残留、`t's`（应为 `it's`）这类截断缩写。它们既不是
+  大写开头、也不是完整词，靠「大写专名候选」永远捞不到（S06E04 的 319/649
+  实测旧口径 0 命中）。锚点仍只给位置，不判断对错。
 - 在线检索只是提示：结果带 `source_url`，`status=unavailable` 表示**未检索**，
   不得据此下结论。检索范围集中在 `scripts/lib/web_lookup.py`，效果不好可整块删除。
 - **这批锚点不参与时间轴对齐**，不调用 `align_anchors`，不改 PASS/FAIL。

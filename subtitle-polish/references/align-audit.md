@@ -359,13 +359,34 @@ ASR、不产生第二份转写文本**。
 ### 生产第二路时间戳
 
 ```bash
-# 用本机 whisperX 环境自己的解释器（与仓库 .venv 进程隔离），只读调用
+# 用本机 whisperX 环境自己的解释器（与仓库 .venv 进程隔离），只读调用。
+# 不传 --model-dir 时自动找本地 HF hub 缓存（HF_HUB_CACHE / HF_HOME/hub /
+# ~/.cache/huggingface/hub / whisperX 环境旁的 hf_cache/hub），找到就离线跑。
+python align_whisperx.py --audio clip.wav --sub clip.en.srt --out wx_words.json
+# 只有确实要联网校验/下载时才加 --online
 python align_whisperx.py --audio clip.wav --sub clip.en.srt \
-    --out wx_words.json --model-dir <本机 wav2vec2 模型目录>
+    --out wx_words.json --online
 # 再回仓库侧做互证
 python align_audit.py --sub clip.en.srt --asr-words qwen_words.json \
     --asr-words-b wx_words.json --aligner-b-label whisperx
 ```
+
+> **默认离线（issue #54）。** 以前 `--model-dir` 缺省即在线：1.2 GB 的 wav2vec2
+> 权重在弱网下实测两次 320 s 超时（`IncompleteRead`），模型加载 337 s。现在
+> 脚本先探测本地缓存，命中就把 `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1`
+> 写进环境再导入 whisperX（离线开关在 import 时被读死，顺序错了不生效）。
+> 同一集实测：离线命中缓存后模型加载 **7.8 s** 量级；断网也能直接跑。
+>
+> 用 whisperX 独立环境（`<whisperX>/python_embed` + `<whisperX>/hf_cache/hub`）
+> 时推荐：
+>
+> ```powershell
+> & '<whisperX>\python_embed\python.exe' align_whisperx.py `
+>   --audio clip.wav --sub clip.en.srt --out wx_words.json --device cuda
+> ```
+>
+> 缓存布局不是两种默认位置时，用 `SUBTITLE_POLISH_HF_CACHE` 指过去即可，
+> 不必修改脚本。
 
 对齐方式：whisperX 一侧按**固定时间网格分窗**（默认由空闲显存估峰值、挑 30~300 s，
 与字幕原有时间轴无关），逐窗全局对齐后按绝对时间拼接；qwen 一侧沿用

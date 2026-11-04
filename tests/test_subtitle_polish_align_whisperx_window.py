@@ -110,6 +110,48 @@ def test_window_zero_single_segment():
     assert len(wins) == 1, "窗长等于全长时应只有一个窗"
 
 
+def test_find_model_cache_local():
+    """issue #54：默认先找本地缓存；只有真权重到位才算命中。
+
+    只看 `models--org--name` 目录存在是不够的：坏快照会留下目录但权重只有
+    `*.incomplete`，离线加载会直接 `could not be found`。所以命中判据是
+    「有 >= 1 MB 的完整权重文件」。
+    """
+    import shutil
+    import tempfile
+
+    root = tempfile.mkdtemp(prefix="sp-hf-")
+    name = "jonatasgrosman/wav2vec2-large-xlsr-53-english"
+    repo = os.path.join(root, "models--" + name.replace("/", "--"))
+    orig = W._candidate_caches
+    try:
+        snap = os.path.join(repo, "snapshots", "rev1")
+        os.makedirs(snap)
+        # 模拟下载完成的权重（>1 MB）
+        weight = os.path.join(snap, "model.safetensors")
+        with open(weight, "wb") as f:
+            f.write(b"\0" * (W._MIN_WEIGHT_BYTES + 1024))
+        # 只测探测逻辑本身：把候选路径收窄到当前临时目录，避免本机其它
+        # HF 缓存（可能正好有同名目录）干扰断言。
+        W._candidate_caches = lambda: [root]
+        assert W.find_model_cache(name) == os.path.abspath(root), "本地缓存没命中"
+
+        # 坏快照：目录在，但只有 .incomplete，不能命中
+        os.remove(weight)
+        with open(weight + ".incomplete", "wb") as f:
+            f.write(b"\0" * (W._MIN_WEIGHT_BYTES + 1024))
+        assert W.find_model_cache(name) == "", "只有 .incomplete 的快照被误判成缓存"
+
+        # 空壳目录不能命中
+        empty = os.path.join(root, "empty")
+        os.makedirs(empty)
+        W._candidate_caches = lambda: [empty]
+        assert W.find_model_cache(name) == "", "空目录被误判成缓存"
+    finally:
+        W._candidate_caches = orig
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     print("== whisperX 分窗对齐（#46）==")
     test("W1a 分窗不重不漏", test_partition_no_duplicate)
@@ -117,6 +159,7 @@ def main():
     test("W1c 边界行归后一窗", test_boundary_row_goes_next_window)
     test("W2 按空闲显存自适应窗长", test_auto_window_tiers)
     test("W3 窗长=全长等价单段", test_window_zero_single_segment)
+    test("W4 本地模型缓存探测（#54）", test_find_model_cache_local)
     print("\n通过 %d / 失败 %d" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1
 

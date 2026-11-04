@@ -290,6 +290,32 @@ def t_stats_reported_in_md():
     assert "%.1f%%" % st["dropped_pct"] in md, (st, md)
 
 
+# ── issue #54：第 6 类的形态错必须能被英文侧锚点捞到 ──────────────────────────
+
+def t_text_defect_anchors():
+    """标点占位残留与截断缩写要进锚点池。
+
+    S06E04 的 319/649 实测：旧口径英文侧 0 命中（逗号不是词、`t's` 是小写，
+    都不在「大写开头专名候选」池里），第 6 类即使开着也没有线索指过去。
+    """
+    seed = ss.build_seeds(_rows("Yeah. ,,,and look at that.",
+                                "Ooh, t's getting busy now."), en=True)
+    defects = [(a["srt_id"], a["term"]) for a in seed["en_anchors"]
+               if a["form"] == "en_text_defect"]
+    assert (1, ",,,") in defects, defects
+    assert (2, "t's") in defects, defects
+    assert seed["en_anchor_stats"]["text_defects"] == 2, seed["en_anchor_stats"]
+    assert "英文形态错" in seed["en_hint_text"], seed["en_hint_text"]
+
+
+def t_text_defect_no_false_positive():
+    """正常缩写与正常逗号不能报成形态错。"""
+    seed = ss.build_seeds(_rows("Let's go there", "It's getting late",
+                                "Yeah, look, it's fine"), en=True)
+    bad = [a for a in seed["en_anchors"] if a["form"] == "en_text_defect"]
+    assert not bad, bad
+
+
 if __name__ == "__main__":
     print("英文侧锚点 + 在线检索（只提示，不参与时间轴）")
     test("英文专名候选", t_proper_noun_anchor)
@@ -312,5 +338,7 @@ if __name__ == "__main__":
     test("强形（内部大写/带数字）即使句首也留", t_strong_form_kept_even_initial)
     test("撇号缩写不算专名", t_elided_apostrophe_not_name)
     test("报告带候选/丢弃占比", t_stats_reported_in_md)
+    test("形态错进锚点池（#54）", t_text_defect_anchors)
+    test("形态错不误报正常缩写", t_text_defect_no_false_positive)
     print(f"\n通过 {PASS} / 失败 {FAIL}")
     sys.exit(0 if FAIL == 0 else 1)

@@ -50,6 +50,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -156,10 +157,13 @@ def render_plan(plan: list, ass: str = "", spelling_reason: str = "") -> str:
     spelling_on = any(6 in r["scope"] for r in plan)
     if spelling_on:
         why = {"asr_default": "（ASR 素材默认开）",
+               "derived_srt": "（SRT 与 ASS 英文轨逐字同源=派生，按 ASR 素材默认开）",
                "forced": "（--with-spelling 强制开）"}.get(spelling_reason, "")
         spell = f"已并入 R1–R3/R10{why}"
     else:
         why = {"disabled": "（--no-with-spelling 显式关闭）",
+               "derived_srt": "（派生 SRT 与 ASS 英文轨同源，本应默认开；"
+                              "--with-spelling 可强制开）",
                "human_srt": "（有独立 SRT 默认关闭；--with-spelling 可强制开）"
                }.get(spelling_reason, "（需 --with-spelling）")
         spell = f"未跑{why}"
@@ -169,11 +173,80 @@ def render_plan(plan: list, ass: str = "", spelling_reason: str = "") -> str:
     return "\n".join(L)
 
 
-def spelling_reason(for_plan: bool, with_spelling, asr_source: bool) -> str:
-    """把「计划里第 6 类开没开」翻译成可写进 manifest/报告的原因标签。"""
+def spelling_reason(for_plan: bool, with_spelling, asr_source: bool,
+                    srt_same: bool = False) -> str:
+    """把「计划里第 6 类开没开」翻译成可写进 manifest/报告的原因标签。
+
+    `srt_same` 是 issue #54 的根因修复：**有 SRT 文件不等于有人工 SRT**。
+    派生 SRT（与 ASS 英文轨逐字同源）本质仍是 ASR 文本，第 6 类应默认开；
+    只有内容确实不同、且经过人工审校的 SRT 才算独立权威源。
+    """
     if not for_plan:
-        return "disabled" if with_spelling is False else "human_srt"
-    return "forced" if with_spelling is True else "asr_default"
+        if with_spelling is False:
+            return "disabled"
+        return "derived_srt" if srt_same else "human_srt"
+    if with_spelling is True:
+        return "forced"
+    return "derived_srt" if srt_same else "asr_default"
+
+
+def _norm_sub_text(text: str) -> str:
+    """字幕文本归一化：去 ASS 标签、换行与多余空白，只留可比较的字面。
+
+    两边首尾成对的引号也去掉：SSA/ASS 的 Text 字段允许用引号包住含逗号的
+    文本，pysubs2 解析后可能把引号留在 `text` 里；SRT 侧通常不带引号。
+    不归一化会让「文本完全相同」的两份文件同源率凭空变成 0（测试夹具实测）。
+    """
+    t = re.sub(r"\{[^}]*\}", "", text or "")
+    t = t.replace("\\N", " ").replace("\\n", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    while len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+        t = t[1:-1].strip()
+    return t
+
+
+def srt_same_source(ass: str, srt: str, *, min_ratio: float = 0.95,
+                    min_rows: int = 10) -> dict:
+    """判断外挂 SRT 是否只是 ASS 英文轨的**派生副本**（issue #54）。
+
+    ## 为什么不能只看「有没有 SRT」
+
+    `--init` 原来按「srt 路径非空 = 有人工 SRT」处理，于是把派生 SRT 当成
+    独立权威源，默认关掉第 6 类。S06E04 实测：`S06E04.eng.srt` 与 ASS 英文轨
+    **750 行里 748 行逐字相同**（另外 2 行是 ASS 侧的 `s***` 打码），它就是
+    同一份 ASR 文本换了个容器。结果 319「Yeah. ,,,and look at that.」、
+    649「Ooh, t's getting busy now.」这类 ASR 错字整集无人审。
+
+    判定口径：按起点排序后逐行比较归一化文本，同源率 ≥ `min_ratio` 且
+    行数 ≥ `min_rows` 才算派生。返回 `{"same", "ratio", "n", "n_srt"}`，
+    读不出文件时 `same=False`（宁可退回旧口径，也不误开第 6 类）。
+    """
+    out = {"same": False, "ratio": 0.0, "n": 0, "n_srt": 0}
+    if not (ass and srt) or not os.path.exists(ass) or not os.path.exists(srt):
+        return out
+    try:
+        import pysubs2
+        subs_a = pysubs2.load(ass, encoding="utf-8-sig")
+        subs_s = pysubs2.load(srt, encoding="utf-8-sig")
+    except Exception:  # noqa: BLE001
+        return out
+
+    en = [e for e in subs_a if (e.style or "").strip() == "英文"]
+    if not en:      # 样式名不叫「英文」时，退回按字符集挑非中文行
+        en = [e for e in subs_a
+              if not any("\u4e00" <= c <= "\u9fff" for c in (e.text or ""))]
+    en = sorted(en, key=lambda e: (e.start, e.end))
+    sr = sorted([e for e in subs_s if (e.text or "").strip()],
+                key=lambda e: (e.start, e.end))
+    out["n"], out["n_srt"] = len(en), len(sr)
+    if len(en) < min_rows or len(sr) < min_rows:
+        return out
+    n = min(len(en), len(sr))
+    same = sum(1 for a, b in zip(en[:n], sr[:n])
+               if _norm_sub_text(a.text) == _norm_sub_text(b.text))
+    out["ratio"] = round(same / float(n), 4)
+    out["same"] = out["ratio"] >= min_ratio
+    return out
 
 
 # ── run 目录与 manifest ─────────────────────────────────────────────────────
@@ -279,12 +352,18 @@ def init_run(wd: str, ass: str, srt: str, plan: list, *,
     else:
         open(os.path.join(d, "logs", "r00.jsonl"), "w", encoding="utf-8").close()
 
-    asr_source = bool(asr_transcribed or not (srt or "").strip())
+    # issue #54：有 SRT 路径 ≠ 有人工 SRT。派生 SRT 与 ASS 英文轨逐字同源，
+    # 本质仍是 ASR 文本，第 6 类应按 ASR 素材默认开。
+    same = srt_same_source(ass, srt)
+    asr_source = bool(asr_transcribed or not (srt or "").strip() or same["same"])
     spelling_on = any(6 in r["scope"] for r in plan)
     if not spelling_reason:
         # 直接调 API 的调用方没传原因时，按 manifest 里能观察到的事实回填。
         if not spelling_on:
-            spelling_reason = "human_srt" if not asr_source else "unknown"
+            if same["same"]:
+                spelling_reason = "derived_srt"
+            else:
+                spelling_reason = "human_srt" if not asr_source else "unknown"
         else:
             spelling_reason = "asr_default" if asr_source else "forced"
     m = {
@@ -303,6 +382,10 @@ def init_run(wd: str, ass: str, srt: str, plan: list, *,
             "asr_transcribed": bool(asr_transcribed),
             # 第 6 类默认开关的依据：无独立 SRT 或显式标记都算 ASR 源。
             "asr_source": asr_source,
+            # issue #54：SRT 与 ASS 英文轨的同源实测。`same=True` 表示这份 SRT
+            # 只是派生副本，不能当作「独立人工审校源」来关掉第 6 类。
+            "srt_same_source": bool(same["same"]),
+            "srt_match_ratio": same["ratio"],
         },
         "created": datetime.now().isoformat(timespec="seconds"),
         "frozen": None,
@@ -1037,8 +1120,13 @@ def _is_asr_transcribed(m: dict) -> bool:
     两种来源都算：init 时显式 `--asr-transcribed`（派生 SRT 场景，路径非空但
     内容仍是听写结果），或根本没提供独立 SRT（没有权威英文源，只能是听写）。
     这种素材即使中文轨全对，第 6 类（原文拼写）不跑也会把 ASR 错误留在英文轨。
+
+    issue #54：init 实测出 `srt_same_source=True`（SRT 与 ASS 英文轨逐字同源）
+    同样算 ASR 源——有 SRT 文件不等于有人工审校。
     """
     if (m.get("opts") or {}).get("asr_transcribed"):
+        return True
+    if (m.get("opts") or {}).get("srt_same_source"):
         return True
     return not (m.get("srt") or "").strip()
 
@@ -1192,32 +1280,43 @@ def _render_single_report(wd: str, stamp: str) -> str:
         # 碰过」：R1 的 8 条改动还被两个回滚批次碰过，按批次数会显示 3，
         # 而它们其实只属于 r01。
         b2r = {r["batch_id"]: r["id"] for r in rounds if r.get("batch_id")}
-        stray_files = []
+
+        # issue #54：跨运行目录的**净零**历史条目不进总账。它们对净改动贡献 0，
+        # 却会以旧 run 路径的形式出现在脚注里，看起来像一条能照抄的回滚命令
+        # （S06E04 实测：8 条 r01 条目把 `20261104_131806` 路径打印了 8 次）。
+        def _stray_zero(r):
+            return (bool(r.get("file")) and _path_differs(r["file"], m["ass"])
+                    and (r.get("new") or "") == (r.get("old") or ""))
+
+        stray_zero = [r for r in ledger if _stray_zero(r)]
+        stray_live = [r for r in ledger
+                      if r.get("file") and _path_differs(r["file"], m["ass"])
+                      and not _stray_zero(r)]
+        ledger_show = [r for r in ledger if not _stray_zero(r)]
+
         L += ["| srt_id | 轨道 | 原译 | 终译 | 类别 | 轮次 | 回滚 |",
               "|---|---|---|---|---|---|---|"]
-        for r in ledger:
+        for r in ledger_show:
             # 单条回滚必须指向**本次实际在用的** ASS：历史日志里的 file 是
             # 上一次 run 的路径，跨 run 复用时会回滚到别的目录。
             cmd = _rollback_cmd(m["ass"], srt_id=r["srt_id"], work_dir=wd)
-            hist = r.get("file") or ""
-            if hist and _path_differs(hist, m["ass"]):
-                stray_files.append((r["srt_id"], hist))
             L.append("| %s | %s | %s | %s | %s | %s | `%s` |" % (
                 r["srt_id"], r["track"], _md_cell(r["old"]) or "—", _md_cell(r["new"]) or "—",
                 r["category"] or "—", _round_cell(r, b2r), cmd))
         L.append("")
-        has_star = any(b and b not in b2r for r in ledger for b in r["batches"])
-        has_zero = any((r.get("new") or "") == (r.get("old") or "") for r in ledger)
+        has_star = any(b and b not in b2r for r in ledger_show for b in r["batches"])
+        has_zero = any((r.get("new") or "") == (r.get("old") or "") for r in ledger_show)
         if has_star or has_zero:
             L += ["> 「轮次」列：`*` = 该行另经过非轮次批次（回滚或外部 apply_fixes）；"
                   "「净零」= 终译与首稿相同（典型是已回滚）。", ""]
-        if stray_files:
-            L += ["> 注：单条回滚命令已统一改用**本次运行的文件** `%s`。"
-                  "以下改动的历史日志记录在另一个文件，照抄旧路径会回滚到别的目录："
-                  % os.path.basename(m["ass"]), ""]
-            for sid, hist in stray_files[:20]:
-                L.append("- srt_id %s：日志文件 `%s`" % (sid, hist))
-            L += [""]
+        if stray_zero:
+            # 只报「有几条」，不打印旧路径：这些路径照抄会指到别的目录。
+            L += ["> 另有 %d 条跨运行目录的历史日志（终译=首稿，净零，已并入本次基线），"
+                  "未列入上表；它们不产生净改动，也没有可回滚的差异。"
+                  % len(stray_zero), ""]
+        if stray_live:
+            L += ["> 表中 %d 行的历史日志记录在另一个运行目录；上表的回滚列已"
+                  "统一指向本次 ASS，旧目录不可照抄。" % len(stray_live), ""]
         # B3：整批回滚给的是 batch_id，不是轮 id——两者长得像（都在 --run 上下文里），
         # 混用会回滚错一整轮。这里按「每轮一行」列出来，抄一行就是一轮。
         bt = [r for r in kept if r["batch_id"]]
@@ -1242,6 +1341,28 @@ def _render_single_report(wd: str, stamp: str) -> str:
               "```", ""]
     else:
         L += ["台账为空（本次没有改动）。", ""]
+
+    # issue #54：英文轨改动必须同步 SRT，但 **skill 从不写 SRT**。这里只出清单，
+    # 把「改了 ASS 但 SRT 没跟上」这件事显式交给人，而不是悄悄让两边发散。
+    en_fixes = [r for r in ledger
+                if "英文" in (r.get("track") or "")
+                and (r.get("new") or "") != (r.get("old") or "")]
+    if m.get("srt") and en_fixes:
+        ratio = (m.get("opts") or {}).get("srt_match_ratio")
+        L += ["## 英文轨改动 → SRT 需人工同步（skill 不写 SRT）", "",
+              "| srt_id | 原文 | 新文 |", "|---|---|---|"]
+        for r in en_fixes:
+            L.append("| %s | %s | %s |" % (
+                r["srt_id"], _md_cell(r.get("old")) or "—",
+                _md_cell(r.get("new")) or "—"))
+        note = ("> SRT 是权威英文源，**本 skill 不会写它**；请按上表人工同步，"
+                "否则 ASS 英文轨与 SRT 会不一致。这些改动只动文本，"
+                "不改变时间轴（指纹不变）。")
+        if (m.get("opts") or {}).get("srt_same_source"):
+            note += ("本次 init 实测 SRT 与 ASS 英文轨同源率 %s%%：它是派生副本，"
+                     "不是独立人工审校源，因此第 6 类按 ASR 素材默认开启。"
+                     % ("%.2f" % (ratio * 100) if isinstance(ratio, (int, float)) else "?"))
+        L += ["", note, ""]
 
     # A1 尾巴：advisory 轮必须单列，写清「本轮 N 条建议未落盘」。
     # 只靠下面的「建议改动」一节不够——那一节不区分是哪一轮产出的，也不写
@@ -1293,6 +1414,10 @@ def _render_single_report(wd: str, stamp: str) -> str:
                 gaps.append("英文轨为 whisper/ASR 转录：听写造成的词形/时态/功能词错误"
                             "未经第 6 类复核（专名拼写核实归第 5 类/R8，不在第 6 类）；"
                             "需要时用 `--with-spelling` 重开")
+        elif reason == "derived_srt":
+            gaps.append("第 6 类（原文拼写）—— 派生 SRT 与 ASS 英文轨逐字同源，"
+                        "本应默认开启，但本次计划未包含；用 `--with-spelling` 重跑"
+                        "（不是「有人工 SRT 所以不用审」）")
         elif _is_asr_transcribed(m):
             gaps.append("第 6 类（原文拼写）—— 英文轨为 whisper/ASR 转录，本应默认开启，"
                         "但本次计划未包含；建议检查 init 参数或以 `--with-spelling` 重跑"
@@ -1549,13 +1674,17 @@ def main():
         if not args.ass:
             ap.error("--plan / --init 需要 --ass")
         # issue #30 建议 3：无独立 SRT，或显式标了 ASR 转录 → 默认开第 6 类。
-        asr_source = bool(args.asr_transcribed or not (args.srt or "").strip())
+        # issue #54：派生 SRT（与 ASS 英文轨逐字同源）同样按 ASR 素材处理。
+        same = srt_same_source(args.ass, args.srt)
+        asr_source = bool(args.asr_transcribed or not (args.srt or "").strip()
+                          or same["same"])
         plan = build_plan(with_low=args.with_low,
                           with_inclusive=args.with_inclusive,
                           with_spelling=args.with_spelling,
                           asr_source=asr_source)
         reason = spelling_reason(any(6 in r["scope"] for r in plan),
-                                 args.with_spelling, asr_source)
+                                 args.with_spelling, asr_source,
+                                 srt_same=same["same"])
         if args.plan:
             print(render_plan(plan, args.ass, reason))
             return 0
