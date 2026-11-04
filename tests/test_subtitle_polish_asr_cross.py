@@ -174,6 +174,15 @@ def t_does_not_touch_subtitles():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def t_round_seed_consumer_wired():
+    tmpl = os.path.join(SKILL_ROOT, "prompts", "audit.tmpl")
+    with open(tmpl, encoding="utf-8") as f:
+        text = f.read()
+    assert "{spelling_seeds}" in text, "第 6 类轮次没有英文侧提示段"
+    assert "dual_source_mismatch" in text, "双源不一致没接到第 6 类轮次"
+    assert "不得据此自动改写英文轨" in text, "模板没写明只提示不改写"
+
+
 if __name__ == "__main__":
     print("双源交叉校验（合成 fixture，不代表真实双引擎验证）")
     test("两源不一致只标提示", t_mismatch_only_hint)
@@ -181,5 +190,6 @@ if __name__ == "__main__":
     test("报告写明仅提示", t_render_says_only_hint)
     test("时间轴判定不被双源改动", t_align_audit_verdict_unchanged)
     test("不改字幕文件", t_does_not_touch_subtitles)
+    test("第 6 类轮次已接线", t_round_seed_consumer_wired)
     print(f"\n通过 {PASS} / 失败 {FAIL}")
     sys.exit(0 if FAIL == 0 else 1)
