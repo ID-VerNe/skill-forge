@@ -30,6 +30,8 @@ agent 当成待办清单，而真正该做的是读全文。
   python scan_seed.py <slice.txt> --out .subtitle-polish/reports/seed-e05_p1.json
   python scan_seed.py <ass_or_dir> --srt <srt>   # 直接从 ASS 出种子（不经切片）
   python scan_seed.py <slice.txt> --fmt md       # 人读版
+  python scan_seed.py <slice.txt> --en-anchors   # 英文侧候选（第 6 类/第 5 类用）
+  python scan_seed.py <slice.txt> --en-anchors --web-verify  # 在线检索专名（默认关）
 
 退出码:
   0  正常（**不给「有无问题」的信号**——这是线索器，没有「有候选/无候选」之分；
@@ -49,6 +51,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import scan_inclusive as si
+from lib import web_lookup as wl
 
 # ── 独立的正则：**故意扫得比词表宽** ────────────────────────────────────────
 # 词表里的词已经由 scan_inclusive 给出，这里补的是「词表永远追不上」的形态：
@@ -77,6 +80,73 @@ _RE_GEO = re.compile(
 
 #: 敏感词**附近**要给的上下文行数：judge 需要看前后文才判得准
 _CTX_LINES = 4
+
+# ── 英文侧候选（第 6 类 / 第 5 类定位用） ──────────────────────────────────
+# 只给「可疑点」，不做判断，更不自动改英文轨。
+
+_RE_EN_TOKEN = re.compile(r"[A-Za-z][A-Za-z'’\-]*")
+
+#: 句首/常见大写词，不算专名候选，避免每句第一个词都成为锚点。
+_EN_STOP = frozenset("""
+the this that these those it its i we you he she they them there then than
+but and so now well right ok oh yes no if when what who whom whose how why
+my our your his her their a an is are was were be been being do does did
+can could would should will shall may might must not of to in on at for
+with from as by up out off over under again just very really actually
+probably maybe course sure good great look listen come go get take make
+one two three four five six seven eight nine ten first last next new old
+all some any more most none every each both few many much other another
+god damn hell bloody christ jesus lord gosh geez wow hey hi hello please
+thanks thank sorry excuse monday tuesday wednesday thursday friday saturday
+sunday january february march april may june july august september october
+november december
+""".split())
+
+#: 常见缩写/全大写词，不是专名拼写问题。
+_EN_COMMON_CAPS = frozenset("""
+ok tv dvd gps usb abs esp suv mpg bhp rpm v6 v8 phd ceo usa uk bbc itv
+""".split())
+
+#: 同音/形近词对。**两边在同一文档都出现**才提示（单个常见词不算异常）。
+_EN_HOMOPHONES = (
+    ("brake", "break"), ("there", "their"), ("hear", "here"),
+    ("pedal", "peddle"), ("course", "coarse"), ("fair", "fare"),
+    ("right", "write"), ("sight", "site"), ("sole", "soul"),
+    ("waist", "waste"), ("weather", "whether"), ("toe", "tow"),
+    ("rein", "reign"), ("meat", "meet"), ("piece", "peace"),
+    ("whole", "hole"), ("allowed", "aloud"), ("bear", "bare"),
+    ("dear", "deer"), ("floor", "flour"), ("for", "four"),
+    ("knew", "new"), ("night", "knight"),
+)
+
+
+def _lev(a: str, b: str) -> int:
+    """编辑距离（只用于英文侧近似变体检测，字符串都很短）。"""
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _en_terms(text: str) -> list:
+    """从英文行提取专名候选。宁可多报，判断交给读全文的 agent。"""
+    m = _mask(text)
+    out = []
+    for tok in _RE_EN_TOKEN.findall(m):
+        low = tok.lower()
+        if len(tok) < 2 or low in _EN_STOP or low in _EN_COMMON_CAPS:
+            continue
+        if not tok[0].isupper():
+            continue
+        # 句首的全小写词不会走到这里；保留内部大写（McLaren）与全大写缩写。
+        out.append(tok)
+    return out
 
 
 def _mask(text: str) -> str:
@@ -127,7 +197,7 @@ def read_slice(path: str) -> list:
 
 # ── ASS/SRT 直读（备用路径：手上没有切片时） ────────────────────────────────
 
-def read_ass(ass_path: str) -> list:
+def read_ass(ass_path: str, *, with_en: bool = False) -> list:
     import pysubs2
 
     subs = pysubs2.load(ass_path, encoding="utf-8-sig")
@@ -135,25 +205,166 @@ def read_ass(ass_path: str) -> list:
     known = sum(1 for e in events
                 if si.style_to_track(e.style or "") in (si.TRACK_ZH, si.TRACK_EN))
     fallback = bool(events) and known == 0
-    rows = []
-    for i, e in enumerate(events, 1):
+    tracks = []
+    for e in events:
         body = si.clean_ass_text(e.text or "")
         track = si.TRACK_ZH if fallback and si._is_cjk(body) \
             else si.style_to_track(e.style or "")
+        tracks.append((track, body, (e.start or 0) / 1000.0,
+                       (e.end or 0) / 1000.0))
+
+    en_events = [t for t in tracks if t[0] == si.TRACK_EN]
+    rows = []
+    for i, (track, body, sec, end) in enumerate(tracks, 1):
         if track != si.TRACK_ZH:
             continue
+        en = ""
+        if with_en and en_events:
+            best = None
+            best_ov = 0.0
+            for et in en_events:
+                ov = min(end, et[3]) - max(sec, et[2])
+                if ov > best_ov:
+                    best, best_ov = et, ov
+            en = best[1] if best else ""
+        rows.append({
+            "srt_id": i,
+            "ass_time": "%.2f-%.2f" % (sec, end),
+            "en": en, "zh": body, "raw": body,
+        })
+    return rows
+
+
+def read_srt(ass_path: str) -> list:
+    """仅英文侧扫描时读 SRT：每行只有英文，zh 留空。"""
+    import pysubs2
+
+    subs = pysubs2.load(ass_path, encoding="utf-8-sig")
+    rows = []
+    for i, e in enumerate(subs.events, 1):
+        body = si.clean_ass_text(e.text or "")
         sec = (e.start or 0) / 1000.0
         rows.append({
             "srt_id": i,
             "ass_time": "%.2f-%.2f" % (sec, (e.end or 0) / 1000.0),
-            "en": "", "zh": body, "raw": body,
+            "en": body, "zh": "", "raw": body,
         })
     return rows
 
 
 # ── 种子构造 ────────────────────────────────────────────────────────────────
 
-def build_seeds(rows: list, *, base: str = "") -> dict:
+_EN_FORM_NOTE = {
+    "en_proper_noun": "英文专名候选（第 5 类）",
+    "en_near_variant": "同文档近似变体（形近）",
+    "en_homophone": "同音词双现",
+}
+
+
+def _build_en_anchors(rows: list, lookup=None) -> list:
+    """英文侧锚点：专名候选、同文档近似变体、同音词双现。
+
+    只产行号与线索，不判断对错；不参与时间轴对齐。
+    `lookup(term)` 仅在开启在线检索时传入，返回 `web_lookup.verify_term` 的结构。
+    """
+    anchors = []
+
+    def add(form, term, r, idx, note=""):
+        anchors.append({
+            "srt_id": r["srt_id"],
+            "ass_time": r["ass_time"],
+            "row_index": idx,
+            "form": form,
+            "term": term,
+            "en": r["en"],
+            "zh": r["zh"],
+            "note": note,
+            "verify": None,
+        })
+
+    occ: dict = {}
+    all_occ: dict = {}
+    doc_words = []
+    for idx, r in enumerate(rows):
+        for term in _en_terms(r["en"]):
+            add("en_proper_noun", term, r, idx)
+            occ.setdefault(term.lower(), []).append((term, r, idx))
+        words = {w.lower() for w in _RE_EN_TOKEN.findall(_mask(r["en"]))}
+        doc_words.append(words)
+        for w in words:
+            all_occ.setdefault(w, []).append((w, r, idx))
+
+    # 近似变体（专名大小写归一到小写后比较，编辑距离 ≤1 且不是同一个词）
+    keys = [k for k in occ if len(k) >= 4]
+    for i, a in enumerate(keys):
+        for b in keys[i + 1:]:
+            if abs(len(a) - len(b)) > 1 or _lev(a, b) != 1:
+                continue
+            for term, r, idx in occ[b]:
+                other = occ[a][0][0]
+                add("en_near_variant", term, r, idx, note="与 `%s` 形近" % other)
+
+    # 同音词双现
+    for a, b in _EN_HOMOPHONES:
+        if a in _EN_STOP or b in _EN_STOP:
+            continue
+        has_a = any(a in w for w in doc_words)
+        has_b = any(b in w for w in doc_words)
+        if not (has_a and has_b):
+            continue
+        for term, r, idx in all_occ.get(a, []) + all_occ.get(b, []):
+            add("en_homophone", term, r, idx, note="`%s` ↔ `%s` 同音/形近" % (a, b))
+
+    # 去重（同一行同一形态同一词只留一条）
+    seen = set()
+    uniq = []
+    for a in anchors:
+        key = (a["srt_id"], a["form"], a["term"].lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(a)
+
+    # 在线检索只用于专名/近似变体；按词缓存，避免重复请求。
+    # 未开启时也显式记「disabled」，让报告能区分「没检索」与「检索无结果」。
+    cache = {}
+    for a in uniq:
+        if a["form"] not in ("en_proper_noun", "en_near_variant"):
+            continue
+        key = a["term"].lower()
+        if lookup:
+            if key not in cache:
+                cache[key] = lookup(a["term"])
+            a["verify"] = cache[key]
+        else:
+            a["verify"] = {"status": "disabled", "query": a["term"]}
+    return uniq
+
+
+def _render_en_hint(anchors: list) -> str:
+    if not anchors:
+        return ("英文侧无可疑候选。注意：**这不等于英文轨没有听写错误**——"
+                "词形与专名候选只覆盖能被形态规则抓到的部分。")
+    L = ["英文侧可疑点（**只作定位线索**；专名归第 5 类，第 6 类只看非专名词形）："]
+    for a in anchors:
+        line = "- srt_id %d [%s] `%s`" % (a["srt_id"], a["form"], a["term"])
+        if a.get("note"):
+            line += "（%s）" % a["note"]
+        v = a.get("verify") or {}
+        if v.get("status") == "found":
+            line += "；检索：%s <%s>" % (v.get("title"), v.get("source_url"))
+        elif v.get("status") == "disabled":
+            line += "；检索：未启用"
+        elif v.get("status") in ("unavailable", "no_result"):
+            line += "；检索：%s" % v.get("status")
+        L.append(line)
+    L += ["", "> 这批锚点不参与时间轴对齐、不改 PASS/FAIL；"
+              "在线检索结果只作提示，不写 ASS。"]
+    return "\n".join(L)
+
+
+def build_seeds(rows: list, *, base: str = "", en: bool = False,
+                lookup=None) -> dict:
     """把行 + 锚点 + 上下文行打包成给 subagent 的种子。
 
     返回结构里同时有：
@@ -217,7 +428,7 @@ def build_seeds(rows: list, *, base: str = "") -> dict:
                             for i in range(ctx_lo, ctx_hi + 1)],
             })
 
-    return {
+    out = {
         "base": base,
         "n_rows": len(rows),
         "anchors": anchors,
@@ -235,6 +446,21 @@ def build_seeds(rows: list, *, base: str = "") -> dict:
             "但必须写清「为什么这算问题」以及「为什么现有清单没收它」。"
         ),
     }
+    if en:
+        en_anchors = _build_en_anchors(rows, lookup=lookup)
+        out["en_anchors"] = en_anchors
+        out["en_hint_text"] = _render_en_hint(en_anchors)
+        out["en_instruction"] = (
+            "英文侧锚点是**定位线索**，不是待办清单，更不是改写建议。\n"
+            "1. 专名（品牌/产品/车型/人/地，含 ASR 听错的专名）归第 5 类，"
+            "按第 5 类判据核实，不交给第 6 类。\n"
+            "2. 第 6 类只看非专名的词形/时态/功能词错误；"
+            "锚点里的同音/形近提示先对照上下文再判断。\n"
+            "3. 在线检索只作参考：status=unavailable 表示**未检索**，"
+            "不得据此断言拼写正确或错误。\n"
+            "4. 本批锚点不参与时间轴对齐，不改变任何 PASS/FAIL 判定。"
+        )
+    return out
 
 
 # ── 输出 ────────────────────────────────────────────────────────────────────
@@ -249,7 +475,7 @@ _FORM_NOTE = {
 
 
 def render_md_seed(seed: dict) -> str:
-    L = ["# 第 8 类线索（scan_seed）", "",
+    L = ["# 线索（scan_seed）", "",
          f"- 来源：{seed['base'] or '（未标注）'}",
          f"- 行数：{seed['n_rows']}",
          f"- 锚点：{len(seed['anchors'])} 条 / 归并成 {len(seed['segments'])} 段",
@@ -258,10 +484,25 @@ def render_md_seed(seed: dict) -> str:
          "> 不说明这里有问题，更不说明该怎么改。判断由读全文的 agent 做。", "",
          "## 判定规则（贴进 prompt）", "", "```", seed["instruction"], "```", ""]
 
+    enL = []
+    if "en_anchors" in seed:
+        enL = ["## 英文侧线索（第 6 类/第 5 类定位用）", "",
+               "```", seed["en_instruction"], "```", "",
+               seed["en_hint_text"], ""]
+        if seed["en_anchors"]:
+            enL += ["| 形态 | 命中 | srt_id | 检索 |", "|---|---|---|---|"]
+            for a in seed["en_anchors"]:
+                v = a.get("verify") or {}
+                src = v.get("source_url") or v.get("status") or "—"
+                enL.append("| %s | `%s` | %d | %s |"
+                           % (_EN_FORM_NOTE.get(a["form"], a["form"]),
+                              a["term"], a["srt_id"], src))
+            enL.append("")
+
     if not seed["segments"]:
         L += ["## 锚点", "", "无。注意：**这不等于这一片没有敏感问题**——",
               "词表与正则都追不上的表述（换了说法的首次/主权/歧视）本来就不会出现在这里。", ""]
-        return "\n".join(L)
+        return "\n".join(L + enL)
 
     for i, seg in enumerate(seed["segments"], 1):
         L += [f"## 段 {i}（锚点 {seg['srt_id_from']}–{seg['srt_id_to']}，"
@@ -276,18 +517,28 @@ def render_md_seed(seed: dict) -> str:
             L.append(f"| {c['srt_id']} | {c['ass_time']} | "
                      f"{(c['en'] or '')[:48]} | {(c['zh'] or '')[:48]} |")
         L.append("")
-    return "\n".join(L)
+    return "\n".join(L + enL)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="第 8 类线索（给 subagent 定位用，不做判断）")
-    ap.add_argument("target", help="切片 .txt / ASS / SSA / SRT / 目录")
+        description="线索扫描（给 subagent 定位用，不做判断）")
+    ap.add_argument("target", help="切片 .txt / ASS / SSA / SRT（SRT 仅 --en-anchors）/ 目录")
     ap.add_argument("--srt", default="", help="配对 SRT（补英文列，ASS 输入时用）")
     ap.add_argument("--out", default="", help="写 json")
     ap.add_argument("--fmt", default="json", choices=("json", "md"),
                     help="json（贴 prompt）或 md（人读）")
+    ap.add_argument("--en-anchors", action="store_true",
+                    help="增加英文侧可疑点（词形/专名/同音形近），供含第 6 类的轮次使用")
+    ap.add_argument("--web-verify", dest="web_verify", action="store_true",
+                    default=False,
+                    help="对英文专名候选做在线检索（默认关闭；需同时开 --en-anchors）")
+    ap.add_argument("--no-web-verify", dest="web_verify", action="store_false",
+                    help="显式关闭在线检索（默认即关闭）")
     args = ap.parse_args()
+
+    if args.web_verify and not args.en_anchors:
+        ap.error("--web-verify 只对英文侧候选生效，请同时加 --en-anchors")
 
     if not os.path.exists(args.target):
         print(f"[!] 不存在：{args.target}", file=sys.stderr)
@@ -298,12 +549,16 @@ def main() -> int:
         rows = read_slice(args.target)
         base = args.target
     elif low.endswith((".ass", ".ssa")):
-        rows = read_ass(args.target)
+        rows = read_ass(args.target, with_en=args.en_anchors)
         base = args.target
     elif low.endswith(".srt"):
-        print("[!] 直接扫 SRT 没有意义：本类判的是中文译文，SRT 是英文源。"
-              "请给 ASS 或切片。", file=sys.stderr)
-        return 2
+        if not args.en_anchors:
+            print("[!] 直接扫 SRT 没有意义：中文侧判的是中文译文，SRT 是英文源。"
+                  "请给 ASS 或切片；只做英文侧候选时加 --en-anchors。",
+                  file=sys.stderr)
+            return 2
+        rows = read_srt(args.target)
+        base = args.target
     else:
         print(f"[!] 认不出输入类型：{args.target}", file=sys.stderr)
         return 2
@@ -313,7 +568,8 @@ def main() -> int:
               "**这不是「干净」，是没扫到**，请先查切片。", file=sys.stderr)
         return 2
 
-    seed = build_seeds(rows, base=base)
+    lookup = (lambda term: wl.verify_term(term, enabled=True)) if args.web_verify else None
+    seed = build_seeds(rows, base=base, en=args.en_anchors, lookup=lookup)
     text = render_md_seed(seed) if args.fmt == "md" else \
         json.dumps(seed, ensure_ascii=False, indent=1)
 
@@ -327,6 +583,10 @@ def main() -> int:
 
     print(f"[*] {len(rows)} 行 → {len(seed['anchors'])} 锚点 / "
           f"{len(seed['segments'])} 段（线索，非结论）", file=sys.stderr)
+    if args.en_anchors:
+        print(f"[*] 英文侧 {len(seed['en_anchors'])} 锚点"
+              + ("（已尝试在线检索）" if args.web_verify else "（在线检索关闭）"),
+              file=sys.stderr)
     return 0
 
 

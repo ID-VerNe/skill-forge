@@ -144,6 +144,11 @@ R4 只写「只看第 1 类」，R7 只写「只看第 4 类」，R10 写「全 
 - 台账段 `{ledger}` —— 从 `regression_check.py --ledger --no-reason` 取，整段贴入（见 §11c）；
 - 线索段 `{seeds}` —— 仅 R11 填，来自 `scan_seed.py`（锚点 + 上下文段）。非 R11 填一句
   「本轮未启用第 8 类，无锚点」；
+- 英文侧线索段 `{spelling_seeds}` —— 仅本轮 `round_scope` 含第 6 类时填，来自
+  `scan_seed.py --en-anchors` 的 `en_hint_text`。其余轮次填一句
+  「本轮未含第 6 类，无英文侧锚点」。**专名候选交给第 5 类判据，第 6 类只看非专名词形。**
+  这批锚点**不参与时间轴对齐、不改 PASS/FAIL**；在线检索默认关闭，失败降级为
+  「未检索」，只作提示；
 - 白名单段 `{inclusive_list}` —— 仅 R11 填，内容来自 `inclusive-language.md`（L4 白名单必须贴，
   否则 agent 会把 `母头` 判成敏感词）。
 
@@ -159,7 +164,7 @@ R4 只写「只看第 1 类」，R7 只写「只看第 4 类」，R10 写「全 
 
 - 每文件份数 = `max(1, round(块数/700))`。
 - **小文件短路**：单文件块数 ≤ 200 时，主 agent 可直接审计该切片，不必另起子 agent（省成本）。> 200 必须起子 agent。边界明确，不要因"已读完整切片"自行放宽阈值。
-- 每份起一个子 agent，prompt 用 `prompts/audit.tmpl`，填入 `{slice_path}`、`{start_block}`、`{end_block}`、`{n_rows}`、`{project_context}`、`{round_scope}`、`{ledger}`、`{seeds}`、`{inclusive_list}`。
+- 每份起一个子 agent，prompt 用 `prompts/audit.tmpl`，填入 `{slice_path}`、`{start_block}`、`{end_block}`、`{n_rows}`、`{project_context}`、`{round_scope}`、`{ledger}`、`{seeds}`、`{spelling_seeds}`、`{inclusive_list}`。
   **`{n_rows}` 是必填项，不是可选装饰**：模板用它写出 srt_id 的合法值域 `1..{n_rows}`
   与「越界候选」的判据。漏填会让 prompt 里留下一个花括号，agent 只能自己猜片长——而这正是
   M2（审计员越界编造 15 次）的成因之一。`{n_rows}` = 该切片对应的 SRT 总块数（全片口径，
@@ -199,6 +204,27 @@ python <skill>/scripts/scan_inclusive.py <ass> --srt <srt> --layer L1,L2,L3
 - **清单只是起点**：完整清单在 `references/inclusive-language.md`，脚本内置清单与之同源，
   `tests/test_subtitle_polish_inclusive.py` 的 `t_list_in_sync_with_md` 会抓漂移。
   **但清单外的表述是常态，不是意外**——锚点之外也要报（须写清为什么），这才是本类的主要产出。
+
+### 3c. 第 6 类的英文侧锚点（仅 R1–R3/R10 含第 6 类时）
+
+最后一轮（R10）之后不需要再改英文轨，这是 **A/B 建议 3 的代价**：第 6 类一旦动了英文轨，
+时间轴要重跑一次验轴。第 6 类只在 R1–R3/R10 里跑，所以锚点也只给这几轮。
+
+```bash
+# 英文侧可疑点（专名/形近/同音双现）；只定位，不判断
+python <skill>/scripts/scan_seed.py .subtitle-polish/slices/<stem>_p1.txt \
+    --en-anchors --out .subtitle-polish/reports/spelling-<stem>_p1.json
+
+# 可选：在线检索疑似专名的标准拼写（默认关闭；失败自动降级为「未检索」）
+python <skill>/scripts/scan_seed.py .subtitle-polish/slices/<stem>_p1.txt \
+    --en-anchors --web-verify --out .subtitle-polish/reports/spelling-<stem>_p1.json
+```
+
+- 把 `en_hint_text` 原样贴进 `{spelling_seeds}`；**不要**贴进 R11 的 `{seeds}`。
+- 专名候选交给第 5 类判据；第 6 类只看非专名的词形/时态/功能词错误。
+- 在线检索只是提示：结果带 `source_url`，`status=unavailable` 表示**未检索**，
+  不得据此下结论。检索范围集中在 `scripts/lib/web_lookup.py`，效果不好可整块删除。
+- **这批锚点不参与时间轴对齐**，不调用 `align_anchors`，不改 PASS/FAIL。
 
 **`scan_inclusive.py` 返回 0 条候选时，不许在报告里写「本类无问题」**——只写「词表无命中」。
 两者差别就是「判过了」和「只查了词表」。

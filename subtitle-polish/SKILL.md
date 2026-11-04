@@ -235,7 +235,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 | `derive_srt.py` | 从 ASS 英文轨派生 SRT(派生物默认落 `.subtitle-polish/derived/`) | 自动审校 |
 | `precheck_punct.py` | 中文行标点归一(默认 dry-run) | 自动审校 |
 | `pre_audit.py` | 三轨预审(需显式开启) | 自动审校 |
-| `scan_seed.py` | 出锚点（命中词/白名单候选/感叹·贬义·主权形态 + 上下文段），贴进审计 prompt。**只定位，不判断** | 自动审校(R11, 也用于 1–7 类查漏) |
+| `scan_seed.py` | 出锚点（命中词/白名单候选/感叹·贬义·主权形态 + 上下文段），贴进审计 prompt。`--en-anchors` 追加英文侧词形/专名/同音形近候选（供含第 6 类的轮次）；`--web-verify` 可选在线检索专名标准拼写（默认关闭、失败降级、仅提示）。**只定位，不判断** | 自动审校（R11；英文侧锚点用于第 6 类轮次） |
 | `scan_inclusive.py` | 第 8 类词表判定:按子域 A/B/C/D 分段出命中;C 子域只 flag 不改,L4 白名单优先丢弃。**首列是 srt_id**,可直接进 fixes.json。**词表 0 命中 ≠ 干净** | 自动审校(R11) |
 | `structure_check.py` | 结构前置门禁:轨道枚举/起点重合/时长异常/索引偏差画像/残片重复。ABORT(20) 不许开工、SUSPECT(21) 放行待看。**偏差小 ≠ 配对了** | 自动审校(开工前) |
 | `show_ids.py` | `srt_id → 英文/中文/时间` 对照表,`--ids/--range/--grep/--empty` 过滤。裁决时逐条核对位置用 | 三模式 |
