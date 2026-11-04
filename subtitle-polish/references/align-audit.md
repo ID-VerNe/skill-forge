@@ -396,7 +396,7 @@ python align_audit.py --sub clip.en.srt --asr-words qwen_words.json \
 暴露的情况；不是因为哪一路算错了。
 
 耗时（同一台机器，RTX 4060 Laptop 8G）：音频解码 0.46 s；whisperX 加载模型
-10.0/10.3 s、对齐 5.9/5.2 s；qwen 对齐整段 18.7 s；互证 + 报告（读缓存）0.28/0.30 s。
+10.0/10.3 s、对齐 5.9/5.2 s；qwen 对齐整段 18.7 s；互证 + 报告（读缓存）259/266 ms。
 
 ### 待校准
 
