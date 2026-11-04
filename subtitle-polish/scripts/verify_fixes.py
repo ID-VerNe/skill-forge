@@ -25,6 +25,7 @@ import pysubs2
 from lib.ass_srt_pair import parse_srt, style_to_track, TRACK_ZH
 from lib.log import read_log, filter_log
 from lib.paths import resolve_work_dir, report_path
+from lib.report_state import mark_fresh
 from lib.tags import extract_leading_tags
 from lib.ass_srt_pair import clean_ass_text
 from apply_fixes import (_find_dialogue, _build_srt_index, _find_paired_srt,
@@ -331,7 +332,10 @@ def run(entries, work_dir, label):
             fsrt_path = _find_paired_srt(f)
             fsrt_blocks = parse_srt(fsrt_path) if fsrt_path and os.path.exists(fsrt_path) else []
             fsrt_index = _build_srt_index(fsrt_blocks)
-            f_align = (_build_index_alignment(fsubs, fsrt_index)
+            # 这里必须传**路径**，不是刚加载的 SSAFile 对象：
+            # _build_index_alignment 内部按路径重新加载，传对象会在
+            # pysubs2.load(obj) 处抛 SystemExit（issue #45，S06E04 实测崩溃）。
+            f_align = (_build_index_alignment(f, fsrt_index)
                        if fsubs is not None and fsrt_index else {})
             for e, actual, detail in items:
                 ass_time = ""
@@ -378,6 +382,9 @@ def run(entries, work_dir, label):
 
     with open(out_path, "w", encoding="utf-8") as fp:
         fp.write("\n".join(lines))
+    # 这是一份针对**当前**盘面的新结论：清掉回滚时留下的作废标记，
+    # 否则报告会一直写「已作废」，哪怕人已经重跑过。
+    mark_fresh(work_dir, "verify-fixes.md")
     print(f"[*] 验证 {ok_count} 通过 / {fail_count} 失败，报告 {out_path}")
     return ok_count, fail_count
 

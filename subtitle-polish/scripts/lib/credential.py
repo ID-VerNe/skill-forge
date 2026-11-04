@@ -71,6 +71,26 @@ def fingerprint(path: str) -> dict:
     return {"path": os.path.abspath(path), "size": st.st_size, "sha1": sha1_of(path)}
 
 
+def content_digest(path: str) -> str:
+    """事件级内容摘要：只取 (起点, 终点, 样式, 文本)，忽略表头与序列化差异。
+
+    为什么需要它：`pysubs2` 重存会把表头注释 `Aegisub` 改成 `pysubs2`，
+    于是**内容完全相同的文件** sha1 也变了。只看 sha1 会把「回滚成功 / 只是
+    被重写」判成「文件内容已变」，gate 给出假红（S06E04 实测）。摘要对不上时
+    才说明事件真的变了。
+    """
+    try:
+        import pysubs2
+        subs = pysubs2.load(path, encoding="utf-8-sig")
+    except Exception:
+        return ""
+    h = hashlib.sha1()
+    for ev in sorted(subs, key=lambda e: (e.start, e.end, e.style, e.text)):
+        h.update(("%d|%d|%s|%s\n" % (ev.start, ev.end, ev.style, ev.text))
+                 .encode("utf-8"))
+    return h.hexdigest()
+
+
 def probe_duration(path: str) -> Optional[float]:
     """时长（秒）。wav 走标准库，其余走 ffprobe；取不到返回 None。"""
     if not path or not os.path.exists(path):
@@ -194,6 +214,8 @@ def build(sub_path: str, stats: dict, engine: str, media: Optional[str] = None,
         files.append({
             "path": name,
             "sha1": sha1_of(sub_path),
+            # 事件级摘要：raw sha1 会因为表头/序列化重写而变化，摘要不会。
+            "digest": content_digest(sub_path),
             "patched_at": None,
             "max_shift": 0.0,
             "patches": 0,
@@ -209,6 +231,9 @@ def build(sub_path: str, stats: dict, engine: str, media: Optional[str] = None,
             continue
         if f.get("sha1") and sha1_of(full) != f["sha1"]:
             continue          # 已经变了，别把旧结论带进新凭据
+        if not f.get("digest"):
+            # 旧凭据没记摘要：文件此刻与旧 sha1 一致，补算即可。
+            f["digest"] = content_digest(full)
         files.append(f)
     data = {
         "version": SCHEMA_VERSION,
@@ -278,6 +303,7 @@ def touch_patch(sub_path: str, max_shift: float, n_events: int = 0) -> Optional[
                "max_shift": 0.0, "patches": 0}
         data.setdefault("files", []).append(hit)
     hit["sha1"] = cur
+    hit["digest"] = content_digest(sub_path) if os.path.exists(sub_path) else ""
     hit["patched_at"] = now
     hit["max_shift"] = round(float(max_shift), 4)
     hit["patches"] = int(hit.get("patches") or 0) + 1
@@ -315,10 +341,21 @@ def check(sub_path: str, media: Optional[str] = None) -> dict:
     # spread_only 仍是 PASS，只把「行级离散」记进 detail 供抽查。
     detail["axis_confidence"] = (data.get("axis") or {}).get("confidence")
     stale = False
+    notes = []          # 不影响判定，但必须让人看见的事实
+    base_dir = os.path.dirname(os.path.abspath(sub_path))
 
     # --- 2. 片源绑定
+    #     三种「哈希不一致」必须分开，否则会把正常流程报成换片（S06E04 实测：
+    #     init 冻结的是 MKV，验轴用的是派生 WAV，报告直接写「片源已换」）：
+    #       a. 同一路径、哈希变了        -> 真的换了片
+    #       b. 不同路径、凭据绑定的文件仍在且哈希未变
+    #                                  -> 只是另一个产物（容器 vs 派生音频）
+    #       c. 凭据绑定的文件不存在/被改 -> 无法复核
     rec_media = data.get("media") or {}
     if rec_media.get("sha1"):
+        rec_path = rec_media.get("path") or ""
+        rec_full = (rec_path if os.path.isabs(rec_path)
+                    else os.path.join(base_dir, rec_path)) if rec_path else ""
         if not media:
             stale = True
             reasons.append("凭据绑定了片源（%s…），但本次未提供 --media，"
@@ -329,14 +366,34 @@ def check(sub_path: str, media: Optional[str] = None) -> dict:
             reasons.append("片源不存在：%s" % media)
         else:
             cur = fingerprint(media)
-            if cur["sha1"] != rec_media["sha1"]:
-                stale = True
-                reasons.append("片源已换（sha1 %s → %s），凭据失效，须重验"
-                               % (str(rec_media.get("sha1"))[:8], cur["sha1"][:8]))
             detail["media_sha1"] = cur["sha1"]
+            if cur["sha1"] == rec_media["sha1"]:
+                pass
+            elif (rec_full
+                  and os.path.normcase(os.path.abspath(media))
+                  == os.path.normcase(os.path.abspath(rec_full))):
+                stale = True
+                reasons.append("片源已换（同一路径的文件被替换：sha1 %s → %s），"
+                               "凭据失效，须重验"
+                               % (str(rec_media.get("sha1"))[:8], cur["sha1"][:8]))
+            elif (rec_full and os.path.exists(rec_full)
+                  and sha1_of(rec_full) == rec_media["sha1"]):
+                # 不是换片：验轴用的是另一个产物（典型是 ffmpeg 抽出的 wav），
+                # 而它本身逐字节未变。凭据的证据链完整，放行但写清楚。
+                detail["media_alt"] = {"passed": os.path.abspath(media),
+                                       "recorded": rec_full}
+                notes.append(
+                    "本次片源与凭据绑定的文件不同（本次：%s；凭据：%s），"
+                    "但凭据绑定的文件仍在且哈希未变——这是派生音频/容器差异，"
+                    "不是换片。"
+                    % (os.path.basename(media), os.path.basename(rec_full)))
+            else:
+                stale = True
+                reasons.append("片源校验失败：凭据绑定的 %s 已不存在或被改，"
+                               "且本次片源哈希不符，无法复核"
+                               % (os.path.basename(rec_full) or "（未记录路径）"))
 
     # --- 3/4. 文件与复测时间
-    base_dir = os.path.dirname(os.path.abspath(sub_path))
     files = data.get("files") or []
     if not files:
         stale = True
@@ -349,17 +406,26 @@ def check(sub_path: str, media: Optional[str] = None) -> dict:
             reasons.append("凭据记录的文件不存在：%s" % p)
             continue
         if f.get("sha1") and sha1_of(full) != f["sha1"]:
-            stale = True
-            reasons.append("文件内容已变（%s），凭据描述的是旧版本" % p)
+            # raw sha1 变了，再比事件级摘要：只变了表头/序列化（典型是 pysubs2
+            # 回滚重存）就按「未变」处理；摘要也对不上才是实质改动。
+            rec_digest = f.get("digest") or ""
+            cur_digest = content_digest(full)
+            if rec_digest and cur_digest and rec_digest == cur_digest:
+                notes.append("%s 被重写但事件内容未变（表头/序列化差异），按未变处理" % p)
+            else:
+                stale = True
+                reasons.append("文件内容已变（%s），凭据描述的是旧版本" % p)
         patched, computed = f.get("patched_at"), data.get("computed_at")
         if patched and computed and _newer(patched, computed):
             stale = True
             reasons.append("改过时间轴但未复测（patched_at %s > computed_at %s）"
                            % (patched, computed))
 
+    detail["notes"] = notes
+
     if stale:
         return {"verdict": V.UNVERIFIED, "reasons": reasons,
-                "detail": detail, "data": data}
+                "detail": detail, "data": data, "notes": notes}
 
     # --- 5. verdict
     av = (data.get("axis") or {}).get("verdict")
@@ -369,7 +435,8 @@ def check(sub_path: str, media: Optional[str] = None) -> dict:
                        % (av or "缺失",
                           _num((data.get("axis") or {}).get("window_span")),
                           _num((data.get("axis") or {}).get("tol"))))
-        return {"verdict": code, "reasons": reasons, "detail": detail, "data": data}
+        return {"verdict": code, "reasons": reasons, "detail": detail,
+                "data": data, "notes": notes}
 
     # --- 6. 双对齐器互证：divergent 阻止静默 PASS
     #     单源 verdict 本身是 PASS，但另一套对齐器给出明显不同的结论时，
@@ -381,9 +448,10 @@ def check(sub_path: str, media: Optional[str] = None) -> dict:
         reasons.append("双对齐器互证为 divergent（%s），单源 PASS 未获印证"
                        % (conf.get("reason") or "两路结论不一致"))
         return {"verdict": V.AMBIGUOUS, "reasons": reasons, "detail": detail,
-                "data": data}
+                "data": data, "notes": notes}
 
-    return {"verdict": V.PASS, "reasons": [], "detail": detail, "data": data}
+    return {"verdict": V.PASS, "reasons": [], "detail": detail,
+            "data": data, "notes": notes}
 
 
 def _num(x) -> str:
@@ -414,7 +482,13 @@ def render(res: dict) -> str:
                          % (("#%s " % src["index"]) if src.get("index") is not None else "",
                             src.get("family")))
         if ax.get("cross_checked") is False:
-            lines.append("      ⚠ 仅一条候选，未经交叉验证（cross_checked=false）")
+            # cross_checked 指的是「内嵌字幕候选流是否做过交叉比对」，
+            # 与双对齐器互证（axis.confidence）是两件事。原文案写成
+            # 「未经交叉验证」，和同页的「双对齐器已印证」直接打架（issue #44）。
+            lines.append("      注：内嵌字幕流只有一条候选，未做候选轴交叉比对"
+                         "（cross_checked=false，与双对齐器互证无关）")
+    for n in res.get("notes") or []:
+        lines.append("  ℹ " + n)
     for r in res.get("reasons") or []:
         lines.append("  ✗ " + r)
     lines.append("判定  %s" % V.label(code))

@@ -37,6 +37,7 @@ from lib.ass_srt_pair import parse_ass, parse_srt, pair, TRACK_ZH, TRACK_EN
 from lib import regress as rg
 from lib.log import read_log, filter_log
 from lib.paths import resolve_work_dir, report_path
+from lib.report_state import mark_fresh
 from lib.tags import extract_leading_tags
 
 TAG = re.compile(r"\{[^}]*\}")
@@ -320,6 +321,8 @@ def main():
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         f.write(text)
+    # 新报告对应当前盘面：清掉回滚留下的作废标记（见 issue #45）。
+    mark_fresh(wd, "cross-check.md")
     print(f"[*] 复核 {len(want)} 块，撞车预警 {len(collisions)} 条，"
           f"动到历史结论 {len(regs)} 条")
     print(f"[*] 报告写入 {out}")
