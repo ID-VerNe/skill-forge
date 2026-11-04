@@ -246,7 +246,7 @@ python <skill>/scripts/regression_check.py --ledger --conflicts --no-reason
 | `cross_check.py` | 中英对照复核 + 撞车预警 + 动到历史结论 | 三模式 |
 | `regression_check.py` | 跨轮次台账/连续改动/批次沉住度(只读 log,不跑模型) | 三模式 |
 | `extract_subs.py` | 列/抽片源内嵌字幕流(判轴的前置) | 对轴 |
-| `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎);qwen 分块按显存规划并跑两档,跨档不一致报 AMBIGUOUS;离群点带 `isolation`/`outlier_kind` 判别提示;`--asr-words-b` 做**双对齐器时间戳互证**(同一份英文文本分别喂 whisperX 对齐器与 qwen 强制对齐器,比时间戳而非文本;只标可信度,不改 PASS/FAIL;不依赖独立转录) | 对轴 |
+| `align_audit.py` | 对音频测时间偏差(whisper/qwen 双引擎);qwen 分块按显存规划并跑两档,跨档不一致报 AMBIGUOUS;离群点带 `isolation`/`outlier_kind` 判别提示;`--asr-words-b` 做**双对齐器时间戳互证**(同一份英文文本分别喂 whisperX 对齐器与 qwen 强制对齐器,比时间戳而非文本;四态 corroborated/spread_only/divergent/single_source;divergent 可升格 AMBIGUOUS 阻止静默 PASS,spread_only 保持 PASS 并附 worst_rows;不依赖独立转录) | 对轴 |
 | `align_whisperx.py` | 在**本机 whisperX 环境**里对同一份英文文本 + 同一段音频做强制对齐,产出词级时间戳 json(双对齐器互证的 whisper 一侧;与仓库解释器进程隔离) | 对轴 |
 | `align_patch.py` | 按偏移量改时间轴(线性/曲线/重定时);写 log、`--revert` 撤销 | 对轴 |
 | `timeline_gate.py` | 读凭据判时间轴能否用于开工(不跑模型) | 对轴 + 自动审校阶段 0 |

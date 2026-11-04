@@ -108,8 +108,9 @@ def t_corroborated():
     r = xc.compare(rows, a, b, label_a="qwen", label_b="whisperx")
     assert r["status"] == "corroborated", r
     assert r["n_compared"] == 12, r
-    assert r["timestamp_delta"]["median"] <= xc.THRESHOLDS["ts_median_s"], r
+    assert r["metrics"]["bias_median"] <= xc.THRESHOLDS["bias_median_s"], r
     assert r["verdict_agree"] is True, r
+    assert r["threshold_status"].startswith("已校准"), r["threshold_status"]
     text = "\n".join(xc.render_section(r))
     assert "corroborated" in text, text
 
@@ -117,15 +118,61 @@ def t_corroborated():
 def t_divergent_and_report():
     rows = _rows()
     a = _tokens(shift=0.1)
-    b = _tokens(shift=2.6)          # 整体晚 2.5 s：结论明显不同
+    b = _tokens(shift=2.6)          # 整体晚 2.5 s：系统偏差超阈值
     r = xc.compare(rows, a, b, label_a="qwen", label_b="whisperx")
     assert r["status"] == "divergent", r
-    assert r["offset_diff"] > xc.THRESHOLDS["offset_diff_s"], r
-    assert r["timestamp_delta"]["median"] > xc.THRESHOLDS["ts_median_s"], r
+    assert r["metrics"]["bias_median"] > xc.THRESHOLDS["bias_median_s"], r["metrics"]
     text = "\n".join(xc.render_section(r))
     assert "divergent" in text, text
     assert "未获双对齐器印证" in xc.confidence_label(r), xc.confidence_label(r)
     assert "单源 PASS 不能直接放行" in text, text
+
+
+def t_spread_only_keeps_pass_with_worst_rows():
+    """整体一致、只有少数行离散 → spread_only；必须给 worst_rows。"""
+    rows = _rows()
+    a = _tokens(shift=0.1)
+    b = _tokens(shift=0.1)
+    for i in (3, 7):               # 2/12 = 16.7% 的行偏 1.0 s
+        b[2 * i][0] += 1.0
+        b[2 * i][1] += 1.0
+    r = xc.compare(rows, a, b, label_a="qwen", label_b="whisperx")
+    assert r["status"] == "spread_only", r
+    assert r["metrics"]["bias_median"] <= xc.THRESHOLDS["bias_median_s"], r["metrics"]
+    assert r["metrics"]["endpoint_drift"] <= xc.THRESHOLDS["endpoint_drift_s"], r["metrics"]
+    assert r["metrics"]["outlier_share"] > xc.THRESHOLDS["row_outlier_share"], r["metrics"]
+    assert r["worst_rows"], "spread_only 必须给 worst_rows"
+    text = "\n".join(xc.render_section(r))
+    assert "spread_only" in text, text
+    assert "worst_rows" in text, text
+    assert "保持 PASS" in text, text
+
+
+def t_real_episode_metrics():
+    """用两集真实实测值回算最终判据：A→spread_only，B→divergent。"""
+    # A（James May 片段）：可比 38 行，中位 0.104 / P90 0.733 / 最大 2.130，
+    # 两路斜率 +0.00005 / +0.00246，跨度 120 s → 端点漂移 0.289 s。
+    ma = {"bias_median": 0.104, "row_p90": 0.733, "row_max": 2.130,
+          "outlier_share": 0.105, "slope_a": 0.00005, "slope_b": 0.00246,
+          "slope_diff": 0.00241, "span": 120.0, "endpoint_drift": 0.289,
+          "offset_diff": 0.151, "verdict_agree": True, "n_compared": 38}
+    sa, _, ra = xc.evaluate(ma)
+    assert sa == xc.STATUS_SPREAD, (sa, ra)
+
+    # B（Tesla 片段）：可比 17 行，中位 0.137 / P90 0.452 / 最大 1.778，
+    # 两路斜率 −0.00184 / +0.00263，跨度 120 s → 端点漂移 0.536 s。
+    mb = {"bias_median": 0.137, "row_p90": 0.452, "row_max": 1.778,
+          "outlier_share": 0.059, "slope_a": -0.00184, "slope_b": 0.00263,
+          "slope_diff": 0.00446, "span": 120.0, "endpoint_drift": 0.536,
+          "offset_diff": 0.227, "verdict_agree": True, "n_compared": 17}
+    sb, _, rb = xc.evaluate(mb)
+    assert sb == xc.STATUS_DIVERGENT, (sb, rb)
+    assert "endpoint_drift" in rb, rb
+
+    # 从"斜率差绝对值"改判据的理由：B 的斜率差 0.00446 本身不该判死，
+    # 换成端点漂移 0.536 s 后才是「片尾两路差半秒」这个可解释的量。
+    assert any(c["name"] == "endpoint_drift" and not c["pass"]
+               for c in xc.evaluate(mb)[1]), xc.evaluate(mb)[1]
 
 
 def t_single_source_not_claiming():
@@ -229,7 +276,7 @@ def t_align_audit_verdict_unchanged():
             md = f.read()
         assert "双对齐器时间戳互证" in md, md[-3000:]
         assert "divergent" in md, md[-3000:]
-        assert "不参与 PASS/FAIL" in md, md[-3000:]
+        assert "不改单源" in md, md[-3000:]
         with open(dup, encoding="utf-8") as f:
             dj = json.load(f)
         assert dj["status"] == "divergent", dj
@@ -270,12 +317,46 @@ def t_credential_and_round_wiring():
         dual = xc.compare(_rows(), _tokens(shift=0.1), _tokens(shift=2.6))
         data = cred.build(srt, stats, "qwen3-forced-aligner", dual=dual)
         assert data["axis"]["confidence"]["status"] == "divergent", data["axis"]
+        assert data["axis"]["confidence"]["endpoint_drift"] is not None, data["axis"]
         cred.save(srt, data)
         res = cred.check(srt)
-        assert res["verdict"] == V.PASS, res
+        # divergent 阻止静默 PASS：单源 PASS 升格为 AMBIGUOUS。
+        assert res["verdict"] == V.AMBIGUOUS, res
         assert res["detail"]["axis_confidence"]["status"] == "divergent", res
+        assert any("divergent" in r for r in res["reasons"]), res["reasons"]
         suffix = ro._confidence_suffix({"status": "divergent", "reason": "r"})
         assert "未获双对齐器印证" in suffix, suffix
+
+        # spread_only：整体一致，仍按 PASS 放行，附注里点名 worst_rows。
+        spread = xc.compare(_rows(), _tokens(shift=0.1), _tokens(shift=0.1))
+        d2 = cred.build(srt, stats, "qwen3-forced-aligner", dual=spread)
+        cred.save(srt, d2)
+        res2 = cred.check(srt)
+        assert res2["verdict"] == V.PASS, res2
+        sfx = ro._confidence_suffix({"status": "spread_only", "ts_p90": 0.0})
+        assert "worst_rows" in sfx, sfx
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_strict_exit_code_ambiguous():
+    """divergent + 单源 PASS + strict → 退出码必须是 AMBIGUOUS(4)。"""
+    root = tempfile.mkdtemp(prefix="sp-dual-strict-")
+    try:
+        srt = os.path.join(root, "e01.srt")
+        a = os.path.join(root, "a.json")
+        b = os.path.join(root, "b.json")
+        _write_srt(srt)
+        with open(a, "w", encoding="utf-8") as f:
+            json.dump(_tokens(shift=0.1), f)
+        with open(b, "w", encoding="utf-8") as f:
+            json.dump(_tokens(shift=2.6), f)
+        p = subprocess.run([sys.executable, os.path.join(SCRIPTS, "align_audit.py"),
+                            "--sub", srt, "--asr-words", a,
+                            "--asr-words-b", b],
+                           capture_output=True, text=True, encoding="utf-8")
+        assert p.returncode == V.AMBIGUOUS, (p.returncode, p.stderr[-500:])
+        assert "升格为 AMBIGUOUS" in p.stderr, p.stderr[-500:]
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -284,6 +365,9 @@ if __name__ == "__main__":
     print("双对齐器时间戳互证（合成 fixture）")
     test("两路一致 → corroborated", t_corroborated)
     test("两路偏离 → divergent + 报告提示", t_divergent_and_report)
+    test("整体一致少数行离散 → spread_only + worst_rows", 
+         t_spread_only_keeps_pass_with_worst_rows)
+    test("真实两集实测值回算（A→spread_only / B→divergent）", t_real_episode_metrics)
     test("单路 → single_source 不冒充双证", t_single_source_not_claiming)
     test("两路都不足 → no_data", t_no_data)
     test("token 清洗：说话人/超长/反向", t_sanitize)
@@ -293,5 +377,6 @@ if __name__ == "__main__":
     test("时间轴判定不被双对齐器改动", t_align_audit_verdict_unchanged)
     test("不改 ASS 文件", t_ass_hash_unchanged)
     test("凭据与总账接线", t_credential_and_round_wiring)
+    test("divergent 阻止静默 PASS（strict 退出码）", t_strict_exit_code_ambiguous)
     print(f"\n通过 {PASS} / 失败 {FAIL}")
     sys.exit(0 if FAIL == 0 else 1)

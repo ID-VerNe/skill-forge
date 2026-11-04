@@ -11,8 +11,11 @@
 
 双对齐器互证（可选）：`--asr-words-b` 读第二路词级时间戳，与主路比**时间戳**
 （不比对文本）。第二路可以用 `scripts/align_whisperx.py` 在 whisperX 环境里
-对**同一份字幕文本 + 同一段音频**做强制对齐产出。结论只作可信度标注，
-不改 stats / verdict / curve。
+对**同一份字幕文本 + 同一段音频**做强制对齐产出。四态为
+`corroborated` / `spread_only` / `divergent` / `single_source`：
+`divergent` 可把单源 PASS 升格为 AMBIGUOUS（strict 退出码 4）并阻止静默放行；
+`spread_only` 保持 PASS 但在报告里强制附 `worst_rows`。
+它不改 stats / verdict / curve 的数值。
 
 用法:
   # 最常用：视频 + 字幕，自动抽音轨
@@ -37,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -309,6 +313,37 @@ def tokens_qwen_dual(wav, rows, model_dir, chunks, language="English"):
     return out
 
 
+def _qwen_runs_subprocess(args, chunks):
+    """把 qwen 对齐交给**独立环境**（子进程），本进程只读回词级 JSON。
+
+    这是「主环境不再需要 qwen_asr」的接线方式：和 whisperX 对齐器一样，
+    依赖冲突用进程隔离解决，不往主环境里装 torch/transformers 的另一套版本。
+    """
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "qwen_align.py")
+    stem = os.path.splitext(os.path.basename(args.sub))[0]
+    out = os.path.join(args.cache_dir, "qwen_runs_%s.json" % stem)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    cmd = [args.qwen_python, helper,
+           "--sub", args.sub, "--wav", args.media_path,
+           "--model", args.model, "--out", out,
+           "--chunk", str(int(chunks[0]))]
+    if args.track:
+        cmd += ["--track", args.track]
+    if args.single_chunk:
+        cmd += ["--single-chunk"]
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0 or not os.path.exists(out):
+        raise SystemExit("qwen 独立环境对齐失败（退出码 %d）：%s"
+                         % (proc.returncode, args.qwen_python))
+    with open(out, encoding="utf-8") as f:
+        data = json.load(f)
+    runs = [(int(c), [tuple(t) for t in tk]) for c, tk in data["runs"]]
+    if not runs or not runs[0][1]:
+        raise SystemExit("qwen 独立环境返回空词级时间戳")
+    return runs
+
+
 
 # ---------------------------------------------------------------- 报告
 
@@ -535,7 +570,8 @@ def main():
     ap.add_argument("--asr-words", help="复用词级时间戳 json，跳过模型")
     ap.add_argument("--asr-words-b",
                     help="第二路对齐器的词级时间戳 json（如 whisperX 对齐器产出），"
-                         "用于双对齐器时间戳互证；只标可信度，不改 PASS/FAIL")
+                         "用于双对齐器时间戳互证；divergent 可升格 AMBIGUOUS，"
+                         "spread_only 保持 PASS 并附 worst_rows")
     ap.add_argument("--aligner-b-label", default="whisperx",
                     help="第二路对齐器的短标签（默认 whisperx）")
     ap.add_argument("--aligner-b-tol", type=float, default=0.5,
@@ -553,6 +589,9 @@ def main():
     ap.add_argument("--single-chunk", action="store_true",
                     help="qwen 只跑一遍分块，不做跨分块复核（快一倍，但判定会"
                          "随分块值翻转；仅调试用）")
+    ap.add_argument("--qwen-python", default=os.environ.get("QWEN_PYTHON", ""),
+                    help="qwen 独立环境的 python.exe。给了就走子进程读词级 JSON，"
+                         "主环境不再需要 qwen_asr（也可用环境变量 QWEN_PYTHON）")
     ap.add_argument("--tol", type=float, default=None,
                     help="分时段中位极差阈值（秒）。默认按引擎取：qwen 0.3 / whisper 0.5")
     ap.add_argument("--min-n", type=int, default=5, help="时段最少样本数")
@@ -611,7 +650,13 @@ def main():
                 chunks = [c1] + ([c2] if c2 else [])
                 print("  分块规划：%ds + %s（%s）"
                       % (c1, ("%ds" % c2) if c2 else "无副档（已在最小档）", why))
-            runs = tokens_qwen_dual(args.media_path, rows, args.model, chunks)
+            if args.qwen_python:
+                runs = _qwen_runs_subprocess(args, chunks)
+            else:
+                print("  [warn] 未给 --qwen-python：qwen 将在当前解释器里加载模型。"
+                      "建议用独立环境跑（主环境不必装 qwen_asr），见 "
+                      "references/align-audit.md §7.6", file=sys.stderr)
+                runs = tokens_qwen_dual(args.media_path, rows, args.model, chunks)
             tokens = runs[0][1]
             alt_runs = runs[1:]
             engine = "qwen3-forced-aligner"
@@ -700,7 +745,12 @@ def main():
                 label_a=(os.path.basename(args.asr_words) if args.asr_words else engine),
                 label_b=args.aligner_b_label,
                 stats_a=stats, stats_b=stats_b,
-                tol_a=tol, tol_b=args.aligner_b_tol)
+                tol_a=tol, tol_b=args.aligner_b_tol,
+                # 端点漂移差要按「这次审计的音频跨度」换算。用锚点 x_span 会
+                # 偏小（字幕只覆盖片段的一部分时更明显），见 align_cross 注释。
+                span_s=(cred.probe_duration(args.media_path)
+                        if args.media_path and os.path.exists(args.media_path)
+                        else None))
             if stats_b:
                 print("  vs %-28s 中位 %s  斜率 %+.6f  %s"
                       % (args.aligner_b_label, _fmt(stats_b["median"]),
@@ -714,6 +764,9 @@ def main():
             if dual["status"] == xc.STATUS_DIVERGENT:
                 print("[!] 两路对齐结论不一致，时间轴未获双引擎印证：%s"
                       % dual["reason"], file=sys.stderr)
+            elif dual["status"] == xc.STATUS_SPREAD:
+                print("  [dual] 整体一致但行级离散：保持 PASS，需看 worst_rows（%d 行）"
+                      % len(dual.get("worst_rows") or []), flush=True)
 
     # 3) 轴归属 —— 判的是「哪条可信」，不是「哪条最小」
     compare = []
@@ -838,6 +891,13 @@ def main():
     # 轴判定比单文件判定更「上层」：主文件 FAIL 是 2，但若多条候选无法区分，
     # 说明不知道该信谁，必须报 AMBIGUOUS(4) 让人来看，不能当成「修一下就好」。
     if axis_res and axis_res["code"] == V.AMBIGUOUS and code == V.PASS:
+        code = V.AMBIGUOUS
+    # 双对齐器互证：divergent 时**允许**把单源 PASS 升格为 AMBIGUOUS，
+    # 阻止「一个对齐器说 PASS 就静默放行」。FAIL 不降级、不动数值；
+    # spread_only 保持 PASS（只是报告必须附 worst_rows）。
+    if dual and dual["status"] == xc.STATUS_DIVERGENT and code == V.PASS:
+        print("[!] 单源判定 PASS 未获双对齐器印证，时间轴升格为 AMBIGUOUS：%s"
+              % dual["reason"], file=sys.stderr)
         code = V.AMBIGUOUS
     if args.strict:
         sys.exit(code)

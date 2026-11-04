@@ -164,10 +164,18 @@ def _confidence_of(dual: dict) -> dict:
         "ts_median": d.get("median"),
         "ts_p90": d.get("p90"),
         "ts_max": d.get("max"),
+        # 新判据的三条实测值 + 两路斜率，供复核（不再只记 slope_diff）。
+        "bias_median": (dual.get("metrics") or {}).get("bias_median"),
+        "endpoint_drift": (dual.get("metrics") or {}).get("endpoint_drift"),
+        "outlier_share": (dual.get("metrics") or {}).get("outlier_share"),
+        "slope_a": (dual.get("metrics") or {}).get("slope_a"),
+        "slope_b": (dual.get("metrics") or {}).get("slope_b"),
         "offset_diff": dual.get("offset_diff"),
         "slope_diff": dual.get("slope_diff"),
         "verdict_agree": dual.get("verdict_agree"),
+        "criteria": dual.get("criteria"),
         "thresholds": dual.get("thresholds"),
+        "threshold_status": dual.get("threshold_status"),
     }
 
 
@@ -229,8 +237,9 @@ def build(sub_path: str, stats: dict, engine: str, media: Optional[str] = None,
             "verdict": stats.get("verdict") or ("PASS" if stats.get("ok") else "FAIL"),
             "cross_checked": bool(cross_checked),
             "l0": l0,
-            # 双对齐器时间戳互证的可信度标注。**不参与 gate 判定**：
-            # 这里只记录「有没有第二路印证」，PASS/FAIL 仍由单路 stats 决定。
+            # 双对齐器互证的可信度标注。**不改单源 stats/verdict**：
+            # 这里记录「有没有第二路印证」，PASS/FAIL 仍由单路 stats 决定；
+            # 只有 `check()` 在读凭据时会把 divergent 升格为 AMBIGUOUS。
             # 缺失（没跑第二路）就是 None，不写成 "corroborated" 冒充验过。
             "confidence": (_confidence_of(dual) if dual else None),
         },
@@ -302,7 +311,8 @@ def check(sub_path: str, media: Optional[str] = None) -> dict:
     detail["sidecar"] = sidecar_path(sub_path)
     detail["computed_at"] = data.get("computed_at")
     detail["axis_verdict"] = (data.get("axis") or {}).get("verdict")
-    # 双对齐器互证只是「可信度附注」，不参与 PASS/FAIL 判定，也不让凭据失效。
+    # 双对齐器互证：divergent 会把单源 PASS 升格为 AMBIGUOUS（阻止静默放行），
+    # spread_only 仍是 PASS，只把「行级离散」记进 detail 供抽查。
     detail["axis_confidence"] = (data.get("axis") or {}).get("confidence")
     stale = False
 
@@ -360,6 +370,18 @@ def check(sub_path: str, media: Optional[str] = None) -> dict:
                           _num((data.get("axis") or {}).get("window_span")),
                           _num((data.get("axis") or {}).get("tol"))))
         return {"verdict": code, "reasons": reasons, "detail": detail, "data": data}
+
+    # --- 6. 双对齐器互证：divergent 阻止静默 PASS
+    #     单源 verdict 本身是 PASS，但另一套对齐器给出明显不同的结论时，
+    #     「这套轴可信」就不再是被印证的事实。升格 AMBIGUOUS，交给人抽查音频。
+    #     spread_only 不升格：整体（系统偏差/端点漂移）一致，只是少数行离散，
+    #     仍按 PASS 放行，离散行见 align_audit 报告的 worst_rows。
+    conf = (data.get("axis") or {}).get("confidence") or {}
+    if conf.get("status") == "divergent":
+        reasons.append("双对齐器互证为 divergent（%s），单源 PASS 未获印证"
+                       % (conf.get("reason") or "两路结论不一致"))
+        return {"verdict": V.AMBIGUOUS, "reasons": reasons, "detail": detail,
+                "data": data}
 
     return {"verdict": V.PASS, "reasons": [], "detail": detail, "data": data}
 
