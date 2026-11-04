@@ -34,6 +34,7 @@ from lib.log import append_log, append_raw, read_log, filter_log, make_batch_id
 from lib.paths import resolve_work_dir, assert_no_orphan_log
 from lib.current import read_current_strict, alignment_profile
 from lib import guard
+from lib.report_state import invalidate as invalidate_reports
 
 WORK_DIR = ".subtitle-polish"
 
@@ -1565,6 +1566,14 @@ def run_rollback(work_dir: str, *, batch_id=None, srt_id=None, file=None, before
         # 都返回 0，包装它的 --rollback-to 只看退出码，会以为整轮回退成功。
         # 用 1 而不是别的码，与 apply 路径的「拒绝」同义。
         raise SystemExit(1)
+    if count:
+        # 盘面已经变了，旧 verify/cross_check 报告描述的是回滚前的状态。
+        # 不处理它们，下一次 --report 会把旧绿当成当前结论（issue #45，
+        # S06E04 实测回滚后仍写「全部通过」）。
+        moved = invalidate_reports(work_dir, "批量回滚 %d 条（batch）" % count)
+        hint = "、".join(os.path.basename(p) for p in moved) or "（当时没有报告文件）"
+        print(f"[!] 旧验证报告已作废：{hint}")
+        print("    回滚改变了盘面，必须重跑 `verify_fixes --all` 才能再谈通过。")
     return count
 
 

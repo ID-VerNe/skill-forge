@@ -63,6 +63,7 @@ from lib.log import read_log
 from lib.paths import (resolve_work_dir, orphan_logs, assert_no_orphan_log,
                        assert_report_location)
 from lib import optional as OPT
+from lib import report_state as RSTATE
 import regression_check
 import structure_check as SC
 
@@ -622,6 +623,10 @@ def _restore(m: dict, d: str, snap: str) -> None:
     log_dst = os.path.join(os.path.dirname(os.path.dirname(d)), "log.jsonl")
     shutil.copy2(src, m["ass"])
     shutil.copy2(log_src, log_dst)
+    # 还原后盘面是旧快照，之前的 verify/cross_check 报告描述的是被撤销的那一版。
+    # 作废它们，报告才会写「需重跑」而不是沿用旧绿（issue #45）。
+    work_dir = os.path.dirname(os.path.dirname(d))
+    RSTATE.invalidate(work_dir, "整轮还原到 %s" % snap)
 
 
 def _resolve_snapshot(m: dict, rid: str) -> str:
@@ -760,16 +765,24 @@ def _parse_ledger(entries: list) -> list:
 
     取每个 (file, srt_id, track) 的**第一条 old_text** 与**最后一条 new_text**，
     中间经历几轮一并记上——挑毛病时看的是「原译 → 终译」，不是过程。
+
+    rollback 条目也参与「终译」：回滚日志的 new_text 就是还原后的文本。
+    以前只认 replace/manual_edit，于是 apply_fixes --rollback 之后总账仍显示
+    「原译 → 被撤回的新译」，配上一行「净改动 8 条」，整份报告都在说反话
+    （issue #45，S06E04 实测）。
     """
     rows = {}
     for e in sorted(entries, key=lambda x: x.get("ts", "")):
-        if e.get("action") not in ("replace", "manual_edit"):
+        action = e.get("action")
+        if action not in ("replace", "manual_edit", "rollback"):
             continue
         if not e.get("srt_id"):
             continue
         key = (e.get("file", ""), int(e["srt_id"]), e.get("track", ""))
         r = rows.get(key)
         if r is None:
+            if action == "rollback":
+                continue       # 只回滚、从未记过改动的行不成账
             rows[key] = {
                 "file": e.get("file", ""), "srt_id": int(e["srt_id"]),
                 "track": e.get("track", ""), "old": e.get("old_text", ""),
@@ -782,6 +795,16 @@ def _parse_ledger(entries: list) -> list:
             if e.get("batch_id") and e["batch_id"] not in r["batches"]:
                 r["batches"].append(e.get("batch_id", ""))
     return sorted(rows.values(), key=lambda r: (r["file"], r["srt_id"]))
+
+
+def _effective_net(ledger: list) -> int:
+    """净改动 = 终译与首稿不同的行数（`--rollback` 已折算进终译）。
+
+    不能直接用台账里的 n_fixes 相加：那是「这一轮写过几条」，不回答
+    「现在盘面上还剩几条改动」。回滚过的批次两者会分叉。
+    """
+    return sum(1 for r in ledger
+               if (r.get("new") or "") != (r.get("old") or ""))
 
 
 def _script(name: str) -> str:
@@ -877,6 +900,8 @@ def _timeline_state(m: dict) -> dict:
         # `divergent` 已在凭据侧升格为 AMBIGUOUS，这里只把成因写清楚，
         # 交给人决定要不要抽查。
         "confidence": (res.get("detail") or {}).get("axis_confidence"),
+        # 不影响判定但必须让人看见的事实（派生音频 vs 容器、表头重写等）。
+        "notes": res.get("notes") or [],
     }
 
 
@@ -999,6 +1024,12 @@ def _render_single_report(wd: str, stamp: str) -> str:
     churn = _churn_by_batch(wd)
     conflicts = _conflicts(wd)
     ledger = _parse_ledger(read_log(wd))
+    # 「还剩几条改动」要从日志回算：apply_fixes --rollback 之后，台账里
+    # 的 n_fixes 仍是「曾经写过几条」，不代表当前盘面（issue #45）。
+    net = _effective_net(ledger)
+    vst = RSTATE.state(wd)
+    vnames = vst.get("names") or []
+    vpath = os.path.join(wd, "reports", "verify-fixes.md")
     # issue #28：时间轴结论从 sidecar 凭据读，不再只看 init 时冻结的 media。
     tl = _timeline_state(m)
 
@@ -1010,11 +1041,23 @@ def _render_single_report(wd: str, stamp: str) -> str:
         top.append(f"skip {len(skipped)}")
     if advisory:
         top.append(f"建议未落盘 {sum(r.get('optional_pending', 0) for r in advisory)} 条")
-    top.append(f"净改动 {total} 条")
+    top.append(f"净改动 {net} 条" + (f"（台账 {total} 条）" if net != total else ""))
     top.append(_timeline_top_text(tl))
     if m.get("frozen"):
         top.append(f"**已定格于 {m['frozen']['at']}：{m['frozen']['reason']}**")
     L += ["> " + " / ".join(top), ""]
+    if tl.get("notes"):
+        L += ["> 注：" + "；".join(tl["notes"]), ""]
+    if net != total:
+        L += ["> ⚠ 台账与日志不一致：台账累计 %d 条，按日志（含 rollback）折算的"
+              "净改动只有 %d 条。多半是回滚后没更新轮次台账——以日志为准，"
+              "别把台账当盘面。" % (total, net), ""]
+    if "verify-fixes.md" in vnames:
+        L += ["> ⚠ 验证结论已作废：%s。回滚改变了盘面，旧的「通过」不再代表当前状态，"
+              "必须重跑 `verify_fixes --all`。" % (vst.get("reason") or "回滚"), ""]
+    elif not os.path.exists(vpath):
+        L += ["> ⚠ 还没有 verify_fixes 报告：本次改动未做执行后验证，"
+              "不能当作已通过。", ""]
 
     L += ["## 逐轮摘要", "",
           "| 轮 | 名称 | 类别 | 改动 | verdict | 沉住度 | batch_id |",
