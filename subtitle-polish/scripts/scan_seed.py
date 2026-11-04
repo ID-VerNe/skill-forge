@@ -84,7 +84,8 @@ _CTX_LINES = 4
 # ── 英文侧候选（第 6 类 / 第 5 类定位用） ──────────────────────────────────
 # 只给「可疑点」，不做判断，更不自动改英文轨。
 
-_RE_EN_TOKEN = re.compile(r"[A-Za-z][A-Za-z'’\-]*")
+#: 英文词（含型号里的数字：`F1`、`GT3`；数字打头的不算，避免把年份当日志）
+_RE_EN_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9'’\-]*")
 
 #: 句首/常见大写词，不算专名候选，避免每句第一个词都成为锚点。
 _EN_STOP = frozenset("""
@@ -104,8 +105,32 @@ november december
 
 #: 常见缩写/全大写词，不是专名拼写问题。
 _EN_COMMON_CAPS = frozenset("""
-ok tv dvd gps usb abs esp suv mpg bhp rpm v6 v8 phd ceo usa uk bbc itv
+ok tv dvd gps usb abs esp suv mpg bhp rpm v6 v8 phd ceo usa uk bbc itv vip
 """.split())
+
+#: 称谓前缀：后面跟的才是名字，前缀本身不算专名。
+_EN_TITLES = frozenset("mr mrs ms miss dr sir madam mate".split())
+
+#: 撇号缩写的后半截（`'Cause`、`'Em`）。tokenizer 从字母起算，会把撇号丢掉，
+#: 这里按「前一字符是撇号」把这个词还原成缩写而不是专名。
+_EN_ELIDED = frozenset("cause cos em til bout round tis n".split())
+
+#: 缩写/对话词。`I'm`、`Let's` 这类在句中也会大写，但不是专名——
+#: 实测一集里它们曾占英文侧锚点的 15%。
+_EN_CONTR = frozenset("""
+i'm i've i'll i'd you're you've you'll you'd he's he'll he'd she's she'll
+she'd we're we've we'll we'd they're they've they'll they'd it's it'll
+that's there's here's what's who's let's don't doesn't didn't isn't aren't
+wasn't weren't can't couldn't won't wouldn't shouldn't mustn't
+""".split())
+
+#: 句末标点：判断「这个大写词是不是句首词」。句首大写是每句第一个词的常态，
+#: 单独出现说明不了任何事——实测一集 650 个候选里 57% 落在这里。
+_EN_SENT_END = re.compile(r"[.!?…][\"'’)\]]*$")
+
+#: 强形证据：内部大写（`McLaren`/`iPhone`）或带数字（`F1`/`GT3`）。
+#: 这种形态即使只在句首出现，也不可能是普通词。
+_RE_EN_STRONG_FORM = re.compile(r"[a-z][A-Z]|[0-9]")
 
 #: 同音/形近词对。**两边在同一文档都出现**才提示（单个常见词不算异常）。
 _EN_HOMOPHONES = (
@@ -134,18 +159,29 @@ def _lev(a: str, b: str) -> int:
     return prev[-1]
 
 
-def _en_terms(text: str) -> list:
-    """从英文行提取专名候选。宁可多报，判断交给读全文的 agent。"""
+def _en_candidates(text: str) -> list:
+    """一行里的专名**候选**：[(词, 是否句首)]。
+
+    这里只做形态过滤（大写开头、长度 ≥2、不在停用词/缩写表），不判断专名。
+    是否成立要看**文档级证据**（该词有没有句中出现过），见 `_build_en_anchors`。
+    """
     m = _mask(text)
     out = []
-    for tok in _RE_EN_TOKEN.findall(m):
+    for hit in _RE_EN_TOKEN.finditer(m):
+        tok = hit.group(0)
         low = tok.lower()
-        if len(tok) < 2 or low in _EN_STOP or low in _EN_COMMON_CAPS:
+        if len(tok) < 2 or low in _EN_STOP or low in _EN_COMMON_CAPS \
+                or low in _EN_CONTR or low in _EN_TITLES:
             continue
         if not tok[0].isupper():
             continue
-        # 句首的全小写词不会走到这里；保留内部大写（McLaren）与全大写缩写。
-        out.append(tok)
+        prev = m[hit.start() - 1] if hit.start() else " "
+        if prev in "'’" and low in _EN_ELIDED:   # `'Cause` 不是专名
+            continue
+        pre = m[:hit.start()].rstrip()
+        # 行首 / 换行后 / 终止标点后都算句首；`\\N` 是 SRT/ASS 的软换行
+        out.append((tok, not pre or bool(_EN_SENT_END.search(pre))
+                    or pre.endswith("\\N")))
     return out
 
 
@@ -261,9 +297,17 @@ _EN_FORM_NOTE = {
 }
 
 
-def _build_en_anchors(rows: list, lookup=None) -> list:
+def _build_en_anchors(rows: list, lookup=None) -> tuple:
     """英文侧锚点：专名候选、同文档近似变体、同音词双现。
 
+    专名候选的口径（issue #47）：旧的「大写开头就算专名」在一集里产出 650 条、
+    其中 57% 只是句首的 `Yeah`/`Okay`/`I'm`。现在改成两道：
+      1. 形态过滤（`_en_candidates`）：大写开头、长度 ≥2、不在停用词/缩写表。
+      2. 文档级证据：该词至少有一次**句中出现**，或形态够强（内部大写/带数字）。
+    只有句首大写的词一律不报——宁可少报，也不把问候语混进专名清单。
+
+    返回 `(anchors, stats)`。stats 里带候选量、保留量、丢弃量与丢弃占比，
+    报告直接引用这些数字，读的人可以据此判断噪声水平。
     只产行号与线索，不判断对错；不参与时间轴对齐。
     `lookup(term)` 仅在开启在线检索时传入，返回 `web_lookup.verify_term` 的结构。
     """
@@ -282,19 +326,43 @@ def _build_en_anchors(rows: list, lookup=None) -> list:
             "verify": None,
         })
 
+    cands: list = []
     occ: dict = {}
+    init_flags: dict = {}
     all_occ: dict = {}
     doc_words = []
     for idx, r in enumerate(rows):
-        for term in _en_terms(r["en"]):
-            add("en_proper_noun", term, r, idx)
-            occ.setdefault(term.lower(), []).append((term, r, idx))
+        cs = _en_candidates(r["en"])
+        cands.append(cs)
+        for tok, is_init in cs:
+            low = tok.lower()
+            occ.setdefault(low, []).append((tok, r, idx))
+            init_flags.setdefault(low, []).append(is_init)
         words = {w.lower() for w in _RE_EN_TOKEN.findall(_mask(r["en"]))}
         doc_words.append(words)
         for w in words:
             all_occ.setdefault(w, []).append((w, r, idx))
 
-    # 近似变体（专名大小写归一到小写后比较，编辑距离 ≤1 且不是同一个词）
+    def strong(low: str) -> bool:
+        """这个词有没有「它确实是专名」的文档级证据。"""
+        flags = init_flags.get(low) or []
+        if any(not f for f in flags):          # 句中出现过
+            return True
+        return any(_RE_EN_STRONG_FORM.search(t) for t, _, _ in occ[low])  # 强形
+
+    n_cand = sum(len(c) for c in cands)
+    kept_occ = 0
+    for idx, r in enumerate(rows):
+        for tok, is_init in cands[idx]:
+            if not strong(tok.lower()):
+                continue
+            kept_occ += 1
+            add("en_proper_noun", tok, r, idx,
+                note="仅句首出现（弱证据）" if is_init else "")
+
+    # 近似变体（专名大小写归一到小写后比较，编辑距离 ≤1 且不是同一个词）。
+    # 这里用**全部候选**（不经过 strong 门），否则「只在句首写错一次」的
+    # 变体会被静默丢掉，而拼写错误恰恰常出现在称呼/片名里。
     keys = [k for k in occ if len(k) >= 4]
     for i, a in enumerate(keys):
         for b in keys[i + 1:]:
@@ -338,14 +406,43 @@ def _build_en_anchors(rows: list, lookup=None) -> list:
             a["verify"] = cache[key]
         else:
             a["verify"] = {"status": "disabled", "query": a["term"]}
-    return uniq
+
+    kept_terms, dropped_terms = set(), set()
+    for cs in cands:
+        for tok, _ in cs:
+            (kept_terms if strong(tok.lower()) else dropped_terms).add(tok.lower())
+    by_form: dict = {}
+    for a in uniq:
+        by_form[a["form"]] = by_form.get(a["form"], 0) + 1
+    stats = {
+        "candidates": n_cand,
+        "kept": kept_occ,
+        "dropped": n_cand - kept_occ,
+        # 丢弃占比 = 旧口径里「只出现在句首」的那部分，读报告的人据此判断噪声
+        "dropped_pct": round(100.0 * (n_cand - kept_occ) / n_cand, 1)
+                       if n_cand else 0.0,
+        "distinct_kept": len(kept_terms),
+        "distinct_dropped": len(dropped_terms),
+        "anchors": len(uniq),
+        "by_form": by_form,
+    }
+    return uniq, stats
 
 
-def _render_en_hint(anchors: list) -> str:
+def _render_en_hint(anchors: list, stats: dict | None = None) -> str:
+    head = []
+    if stats and stats.get("candidates"):
+        head = ["英文侧口径（issue #47）：大写开头候选 %d 条 → 保留 %d 条"
+                "（有句中出现或强形证据），丢弃 %d 条（%.1f%% 只出现在句首，"
+                "按问候语/对话词处理）。"
+                % (stats["candidates"], stats["kept"], stats["dropped"],
+                   stats["dropped_pct"]),
+                ""]
     if not anchors:
-        return ("英文侧无可疑候选。注意：**这不等于英文轨没有听写错误**——"
-                "词形与专名候选只覆盖能被形态规则抓到的部分。")
-    L = ["英文侧可疑点（**只作定位线索**；专名归第 5 类，第 6 类只看非专名词形）："]
+        return "\n".join(head + [
+            "英文侧无可疑候选。注意：**这不等于英文轨没有听写错误**——"
+            "词形与专名候选只覆盖能被形态规则抓到的部分。"])
+    L = head + ["英文侧可疑点（**只作定位线索**；专名归第 5 类，第 6 类只看非专名词形）："]
     for a in anchors:
         line = "- srt_id %d [%s] `%s`" % (a["srt_id"], a["form"], a["term"])
         if a.get("note"):
@@ -447,18 +544,21 @@ def build_seeds(rows: list, *, base: str = "", en: bool = False,
         ),
     }
     if en:
-        en_anchors = _build_en_anchors(rows, lookup=lookup)
+        en_anchors, en_stats = _build_en_anchors(rows, lookup=lookup)
         out["en_anchors"] = en_anchors
-        out["en_hint_text"] = _render_en_hint(en_anchors)
+        out["en_anchor_stats"] = en_stats
+        out["en_hint_text"] = _render_en_hint(en_anchors, en_stats)
         out["en_instruction"] = (
             "英文侧锚点是**定位线索**，不是待办清单，更不是改写建议。\n"
             "1. 专名（品牌/产品/车型/人/地，含 ASR 听错的专名）归第 5 类，"
             "按第 5 类判据核实，不交给第 6 类。\n"
-            "2. 第 6 类只看非专名的词形/时态/功能词错误；"
+            "2. 专名候选只收「句中出现过或形态够强（内部大写/带数字）」的词；"
+            "只在句首大写的词已按问候语丢弃，这类漏报是**故意的**（宁可少报）。\n"
+            "3. 第 6 类只看非专名的词形/时态/功能词错误；"
             "锚点里的同音/形近提示先对照上下文再判断。\n"
-            "3. 在线检索只作参考：status=unavailable 表示**未检索**，"
+            "4. 在线检索只作参考：status=unavailable 表示**未检索**，"
             "不得据此断言拼写正确或错误。\n"
-            "4. 本批锚点不参与时间轴对齐，不改变任何 PASS/FAIL 判定。"
+            "5. 本批锚点不参与时间轴对齐，不改变任何 PASS/FAIL 判定。"
         )
     return out
 
@@ -486,9 +586,20 @@ def render_md_seed(seed: dict) -> str:
 
     enL = []
     if "en_anchors" in seed:
-        enL = ["## 英文侧线索（第 6 类/第 5 类定位用）", "",
-               "```", seed["en_instruction"], "```", "",
-               seed["en_hint_text"], ""]
+        st = seed.get("en_anchor_stats") or {}
+        enL = ["## 英文侧线索（第 6 类/第 5 类定位用）", ""]
+        if st.get("candidates"):
+            enL += ["| 口径 | 数量 |", "|---|---|",
+                    "| 大写开头候选（旧口径会全报） | %d |" % st["candidates"],
+                    "| 保留（句中出现或强形证据） | %d |" % st["kept"],
+                    "| 丢弃（只在句首出现） | %d（%.1f%%） |"
+                    % (st["dropped"], st["dropped_pct"]),
+                    "| 锚点合计（含形近/同音） | %d |" % st.get("anchors", 0),
+                    "",
+                    "> 丢弃占比就是旧规则的噪声率；保留量下降是**故意的**（宁可少报）。",
+                    ""]
+        enL += ["```", seed["en_instruction"], "```", "",
+                seed["en_hint_text"], ""]
         if seed["en_anchors"]:
             enL += ["| 形态 | 命中 | srt_id | 检索 |", "|---|---|---|---|"]
             for a in seed["en_anchors"]:
@@ -584,7 +695,10 @@ def main() -> int:
     print(f"[*] {len(rows)} 行 → {len(seed['anchors'])} 锚点 / "
           f"{len(seed['segments'])} 段（线索，非结论）", file=sys.stderr)
     if args.en_anchors:
+        st = seed["en_anchor_stats"]
         print(f"[*] 英文侧 {len(seed['en_anchors'])} 锚点"
+              f"（专名候选 {st['kept']}/{st['candidates']}，"
+              f"丢弃仅句首 {st['dropped']} 条 = {st['dropped_pct']}%）"
               + ("（已尝试在线检索）" if args.web_verify else "（在线检索关闭）"),
               file=sys.stderr)
     return 0
