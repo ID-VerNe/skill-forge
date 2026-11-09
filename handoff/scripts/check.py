@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """check.py — handoff 草案发布前硬门禁(D12:全过才创建,失败即 abort)。
 
-校验项(共八项,对应规范 §check):
+校验项(共九项,对应规范 §check):
+  0  正文无 H1 行(标题信息由 frontmatter 承载,H1 属禁止项)
   1  frontmatter 必填字段齐且格式对(schema/repo/window/baseline_commit/head_commit/supersedes)
   2  baseline_commit 是 head_commit 的祖先(git merge-base --is-ancestor)
   3  §1 口径表每行的复算命令在本机重跑结果与表中数字一致
@@ -91,6 +92,11 @@ def main() -> int:
     def ck(no: str, desc: str, ok: bool, detail: str = "") -> None:
         results.append((no, ok, detail))
         print(f"  [{'PASS' if ok else 'FAIL'}] {no} {desc}" + (f": {detail}" if detail else ""))
+
+    # ---- 0. 正文无 H1 ----
+    print("=== check 0: 正文无 H1(标题信息由 frontmatter 承载) ===")
+    ck("0", "正文无 H1 行", not re.search(r"^# ", txt, re.M),
+       "" if not re.search(r"^# ", txt, re.M) else "含 H1 行,frontmatter 已承载标题信息")
 
     # ---- 1. frontmatter ----
     print("=== check 1: frontmatter 必填字段 ===")

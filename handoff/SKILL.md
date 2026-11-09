@@ -1,6 +1,6 @@
 ---
 name: handoff
-version: 2.0.0
+version: 2.0.1
 description: 生成或读取 Handoff 交接文档。v2 起主载体是 GitHub issue(单仓库当前态,supersedes 链),local 模式保留给无远端仓。用户说"handoff"、"交接"、"交接文档"、"看前一个 agent"、"上一份 handoff" 时触发。也支持 /handoff 命令。
 ---
 
@@ -26,10 +26,11 @@ description: 生成或读取 Handoff 交接文档。v2 起主载体是 GitHub is
    - issue 模式:仓库根有 `HANDOFF.md` → 按它三步走(`gh issue list --label handoff --state open` → `gh issue view N`)
    - 无 `HANDOFF.md` 或仓里无 open handoff → 探测 `.handoffs/handoff-*.md` 最新文件(local 模式)
    - 两者都无 → 告知用户:当前项目没有 handoff 记录
-2. **读正文**:按 8 节骨架总结,重点 §4 遗留 / §5 下一步 / §7 不确定项
+2. **读正文**:跑 `python handoff/scripts/collect.py --read <draft-or-issue-body.md>` 取结构化概要(frontmatter + §1 事实表 + §2 交付行 + §4 四桶计数 + §3/§5/§6/§7 是否已填),再按 8 节骨架读,重点 §4 遗留 / §5 下一步 / §7 不确定项
 3. **不主动执行代码,不检查 git 状态,不推进未完成项**
 
-local 模式读到的内容,在总结开头标注:「本地模式,无 supersedes 链、无关单、读不到远端进度」。
+读到的正文含 H1 → 该文件不是 handoff v2 产物(check.py 第 0 项会拦),按坏格式上报。
+local 模式读到的内容，在总结开头标注:「本地模式,无 supersedes 链、无关单、读不到远端进度」。
 
 ---
 
@@ -79,7 +80,7 @@ python handoff/scripts/check.py draft.md --repo OWNER/REPO \
   --baseline <commit> --head <commit> --repo-dir . --mode issue|local
 ```
 
-八项全过才允许发布;任一条失败 → abort,把失败项 + 怎么修贴给用户,不许跳过、不许降级。
+九项全过才允许发布;任一条失败 → abort,把失败项 + 怎么修贴给用户,不许跳过、不许降级。
 
 ### 4. 发布(仅 issue 模式)
 

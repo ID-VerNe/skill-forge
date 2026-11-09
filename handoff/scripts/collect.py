@@ -34,6 +34,8 @@ os.environ["PYTHONIOENCODING"] = "utf-8"
 
 HANDOFF_LABEL = "handoff"
 
+REQUIRED_FM = ["schema", "repo", "window", "baseline_commit", "head_commit", "supersedes"]
+
 
 def _env() -> dict:
     e = os.environ.copy()
@@ -235,8 +237,6 @@ def collect(repo: str, repo_dir: Path, baseline: str, head: str,
     L.append(f"supersedes: {supersedes if supersedes else 'null'}")
     L.append("---")
     L.append("")
-    L.append(f"# handoff:{today} {head[:7]} 窗口交付(collect.py 生成,待 agent 补 §3/§5/§6/§7)")
-    L.append("")
     L.append("## 1. 数据口径")
     L.append("")
     L.append("全部数字由 collect.py 从 git/gh API 取数,复算命令见右列。open issue 口径排除 label `handoff` 自身。")
@@ -315,46 +315,90 @@ def collect(repo: str, repo_dir: Path, baseline: str, head: str,
     return "\n".join(L)
 
 
+def read_handoff(path: Path) -> int:
+    """--read:给 agent 用的结构化读取器。只解析,不取数、不联网。"""
+    txt = path.read_text(encoding="utf-8")
+    fm = parse_frontmatter(path)
+    for f in REQUIRED_FM:
+        if not fm.get(f):
+            print(f"[read] 错误:frontmatter 缺 {f}", file=sys.stderr)
+            return 2
+
+    def sec(title: str) -> str:
+        m = re.search(rf"^## {re.escape(title)}\n(.*?)(?=^## |\Z)", txt, re.M | re.S)
+        return m.group(1).strip("\n") if m else ""
+
+    rows = re.findall(r"^\| (.+?) \| (.+?) \| `.+?` \|$", sec("1. 数据口径"), re.M)
+    facts = {name.strip(): val.strip() for name, val in rows}
+    pr_rows = re.findall(r"^\| #(\d+) \| (.+?) \| (.+?) \| (.+?) \|$", sec("2. 本窗口交付"), re.M)
+    buckets = {}
+    for b in ("verify-pending", "merged-unclosed", "needs-repro", "code-needed"):
+        # 桶标题后可能跟 agent 拆的子节(####),子节标题也带桶名,只数桶自己的表行
+        m = re.search(rf"^### 4\.\d .*{re.escape(b)}\)\n(.*?)(?=^### |\Z)",
+                      sec("4. 遗留与阻塞"), re.M | re.S)
+        buckets[b] = len(re.findall(r"^\| #\d+ ", m.group(1), re.M)) if m else 0
+    out = {
+        "schema": fm["schema"], "repo": fm["repo"], "window": fm["window"],
+        "baseline_commit": fm["baseline_commit"], "head_commit": fm["head_commit"],
+        "supersedes": fm["supersedes"],
+        "facts": facts,
+        "deliveries": [{"pr": int(n), "title": t, "linked": l, "verify_state": v}
+                       for n, t, l, v in pr_rows],
+        "leftovers": buckets,
+        "sections_filled": {s: bool(sec(s).strip()) for s in
+                            ("3. 决策与理由", "5. 下一步", "6. 环境与坑", "7. 无法追溯与不确定项")},
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="handoff 事实底盘取数器")
-    ap.add_argument("--repo", required=True, help="OWNER/REPO")
-    ap.add_argument("--baseline", required=True, help="基线 commit(上一份 frontmatter.baseline_commit)")
-    ap.add_argument("--head", help="head commit,默认 HEAD")
-    ap.add_argument("--supersedes", type=int, default=None, help="上一份 handoff issue 号,首份省略")
-    ap.add_argument("--today", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                    help="窗口右界(默认今天 UTC)")
-    ap.add_argument("--window-start",
-                    help="窗口起点(YYYY-MM-DD),默认取上一份 handoff 的 head_commit 日期;首份必传")
-    ap.add_argument("--repo-dir", default=".", help="本地 git 仓路径,默认当前目录")
-    ap.add_argument("--out", help="输出文件,默认 stdout")
-    args = ap.parse_args()
+    ap.add_argument("--read", metavar="FILE",
+                    help="读取器模式:解析已生成的 handoff 草案/正文,输出结构化 JSON(不联网)")
+    args, rest = ap.parse_known_args()
+    if args.read:
+        return read_handoff(Path(args.read))
 
-    repo_dir = Path(args.repo_dir)
-    head = args.head or git(repo_dir, "rev-parse", "--short", "HEAD")
+    ap2 = argparse.ArgumentParser(description="handoff 事实底盘取数器")
+    ap2.add_argument("--repo", required=True, help="OWNER/REPO")
+    ap2.add_argument("--baseline", required=True, help="基线 commit(上一份 frontmatter.baseline_commit)")
+    ap2.add_argument("--head", help="head commit,默认 HEAD")
+    ap2.add_argument("--supersedes", type=int, default=None, help="上一份 handoff issue 号,首份省略")
+    ap2.add_argument("--today", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                     help="窗口右界(默认今天 UTC)")
+    ap2.add_argument("--window-start",
+                     help="窗口起点(YYYY-MM-DD),默认取上一份 handoff 的 head_commit 日期;首份必传")
+    ap2.add_argument("--repo-dir", default=".", help="本地 git 仓路径,默认当前目录")
+    ap2.add_argument("--out", help="输出文件,默认 stdout")
+    a = ap2.parse_args(rest)
+
+    repo_dir = Path(a.repo_dir)
+    head = a.head or git(repo_dir, "rev-parse", "--short", "HEAD")
 
     # supersedes 未传 → 自动找当前 open handoff(D1 链)
-    prev = find_prev_handoff(repo_dir, args.repo)
-    sup = args.supersedes if args.supersedes is not None else (prev["number"] if prev else None)
-    base = args.baseline or (prev["baseline_commit"] if prev else None)
+    prev = find_prev_handoff(repo_dir, a.repo)
+    sup = a.supersedes if a.supersedes is not None else (prev["number"] if prev else None)
+    base = a.baseline or (prev["baseline_commit"] if prev else None)
     if not base:
         sys.stderr.write("[collect] 错误:无上一份 handoff 且未传 --baseline;首份请手工指定基线\n")
         return 2
 
     # window_start:显式传入 > 上一份 head 日期 > 报错(首份必须给)
-    ws = args.window_start
+    ws = a.window_start
     if not ws:
         if prev and prev.get("head_commit"):
-            ws = gh(args.repo, f"commits/{prev['head_commit']}")["commit"]["committer"]["date"][:10]
+            ws = gh(a.repo, f"commits/{prev['head_commit']}")["commit"]["committer"]["date"][:10]
         else:
             sys.stderr.write("[collect] 错误:无上一份 handoff 且未传 --window-start;首份请手工指定窗口起点\n")
             return 2
 
-    body = collect(args.repo, repo_dir, base, head, sup, args.today, ws)
-    if args.out:
-        out_path = Path(args.out)
+    body = collect(a.repo, repo_dir, base, head, sup, a.today, ws)
+    if a.out:
+        out_path = Path(a.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(body, encoding="utf-8")
-        print(f"[collect] 已写 {args.out}({len(body)} 字符)")
+        print(f"[collect] 已写 {a.out}({len(body)} 字符)")
     else:
         print(body)
     return 0

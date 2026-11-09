@@ -46,6 +46,10 @@ collect.py / check.py / SKILL.md 的行为都由本文档推导;改行为先改�
   5. 下一步(agent 写,带前置 + 验收命令)
   6. 环境与坑(agent 写,环境事实 + 复现命令)
   7. 无法追溯与不确定项(agent 写,允许为空不允许省)
+- 正文不放 H1:标题信息已由 frontmatter 承载,H1 属禁止项(check.py 断言无 `^# `)。
+- agent 读取入口:`python handoff/scripts/collect.py --read <file>` 输出结构化 JSON
+  (frontmatter + §1 事实表 + §2 交付行 + §4 四桶计数 + §3/§5/§6/§7 是否已填),
+  只解析不取数不联网;读路由不再人工逐节摘。
 - frontmatter 固定字段:schema / repo / window.from / window.to / baseline_commit /
   head_commit / supersedes。window.from 是日期不是 commit。
 - local 模式与 issue 模式共用同一骨架,只是写出口不同(local 写 .handoffs/ 最新文件)。
@@ -77,11 +81,13 @@ collect.py / check.py / SKILL.md 的行为都由本文档推导;改行为先改�
 
 ## 6. 发布前硬门禁(D12/D21 + 三条补充)
 
-check.py 八项,全过才允许创建 issue,任一条失败 abort 并打印具体哪条 + 怎么修:
+check.py 九项,全过才允许创建 issue,任一条失败 abort 并打印具体哪条 + 怎么修:
 
+0. 正文无 H1 行(标题信息由 frontmatter 承载,H1 属禁止项)
 1. frontmatter 必填字段齐且格式对(schema 值 = handoff/v1,repo/baseline/head 与 CLI 参数一致)
 2. baseline_commit 是 head_commit 的祖先
 3. §1 口径表每行的复算命令在本机重跑结果与表中数字一致(能本地跑的全跑;需特殊环境的 skip)
+   §1 复算命令不变量:值列 = 表中数字,命令列 = 可本机重跑的 gh/git 命令;命令里不得出现仓名字面量(check_sensitive private-repo 规则会红),用 --repo 参数值代替
 4. 正文 #N 引用全部存在于该仓(issue 或 PR 均可)
 5. 8 节骨架标题文字齐全(§7 允许空但不许省)
 6. issue 模式下 HANDOFF.md 相对 git HEAD 无 diff
