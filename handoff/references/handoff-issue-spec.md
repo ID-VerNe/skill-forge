@@ -88,6 +88,8 @@ check.py 九项,全过才允许创建 issue,任一条失败 abort 并打印具�
 2. baseline_commit 是 head_commit 的祖先
 3. §1 口径表每行的复算命令在本机重跑结果与表中数字一致(能本地跑的全跑;需特殊环境的 skip)
    §1 复算命令不变量:值列 = 表中数字,命令列 = 可本机重跑的 gh/git 命令;命令里不得出现仓名字面量(check_sensitive private-repo 规则会红),用 --repo 参数值代替
+   已发布快照对 check 3 会红属预期,不加降级:issue 之间不是串行推进,而是按需选择性推进,
+   窗口外的合并/开闭会让复算值偏离快照值;读方按快照读,不要求它等于现在
 4. 正文 #N 引用全部存在于该仓(issue 或 PR 均可)
 5. 8 节骨架标题文字齐全(§7 允许空但不许省)
 6. issue 模式下 HANDOFF.md 相对 git HEAD 无 diff
