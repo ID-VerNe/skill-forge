@@ -18,6 +18,7 @@
 | **subtitle-polish** | `subtitle-polish/` | v1.0.0 | 字幕精校 Skill。输入 ASS 双语成品 + SRT 源，走 审计 → 人确认 → 修复 全流程。多 agent 并行审计（按 srt 块自适应切片 + overlap）、adversarial 验证轮去幻觉、脚本执行修复（replace/delete/swap + dry-run/accept/rollback）。按 srt_id+track 定位，自动还原 `{\be3}` 等特效标签；标点预检对照 translate_principle pipeline 规则规范化中文行 |
 | **web-search-routing** | `web-search-routing/` | v1.0.0 | Web 搜索路由器。串联 keenable（雷达，远程 LLM 增强搜索，抓新鲜源 + 厚 snippet + 发布日期）与 wigolo（工作台，本地缓存 + 引用 + 深挖）：keenable 发现值得用的 URL，wigolo `fetch` 落库，引用走 wigolo cache（`citation_id` + `source_span`）。触发词"搜一下/查一下/找一下最新 xxx"。含按任务类型分工的路由表与铁律 |
 | **apple-ui-principles** | `apple-ui-principles/` | v2.0.0 | Apple Design Engineering (苹果设计工程)。合并了光学校正 (The Look) 与流体交互 (The Feel)。涵盖视觉重量补偿、错觉校正等静态打磨，以及可打断性、弹簧动画 (Springs)、直接操作 (1:1 Tracking)、动量投射、毛玻璃层级与动态排版规范。指导 AI 编写原生级顺滑的现代 Web UI。 |
+| **quidot-motion-choreography** | `quidot-motion-choreography/` | v1.0.0 | 跨端交互形变编排扩展包（Motion Choreography Add-on）。灵感源自 quidot/yui，严格独立于颜色、固定几何与材质，纯粹负责交互瞬间的拓扑形变、拉伸、弯曲与主从联动。支持 Web (React/Framer Motion) 与 Android/跨端 (Kotlin/Jetpack Compose)。 |
 
 ---
 
