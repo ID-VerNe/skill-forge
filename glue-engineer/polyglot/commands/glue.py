@@ -1,6 +1,7 @@
 """polyglot/commands/glue.py — cross-search / cap-list / cap-match / bridge / strategies / mvp-scope."""
 
 import json
+import sys
 
 
 def add_args(sub):
