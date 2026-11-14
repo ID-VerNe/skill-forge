@@ -36,11 +36,7 @@ def generate_glue(schema: GlueSchema, output_dir: str = ".glue/search") -> GlueO
     Routes to the correct generator based on strategy mode.
     Returns a GlueOutputPackage with all generated paths and verification results.
     """
-    if not schema.strategy:
-        raise ValueError("GlueSchema has no strategy — cannot select generator")
-
-    mode = schema.strategy.mode
-    generator = _get_generator(mode)
+    generator = get_generator_for_schema(schema)
 
     package = generator.generate(schema, output_dir)
 
@@ -50,13 +46,24 @@ def generate_glue(schema: GlueSchema, output_dir: str = ".glue/search") -> GlueO
     return package
 
 
+def get_generator_for_schema(schema: GlueSchema):
+    """Resolve a generator and reject language pairs outside its metadata."""
+    return PluginRegistry.get_instance_for(schema)
+
+
 def list_generators() -> list[dict]:
     """List available generators with descriptions.
 
     Uses PluginRegistry for dynamic discovery.
     """
     return [
-        {"mode": meta.mode, "description": meta.description}
+        {
+            "mode": meta.mode,
+            "description": meta.description,
+            "source_languages": list(meta.source_languages),
+            "target_languages": list(meta.target_languages),
+            "implementation_status": meta.implementation_status,
+        }
         for meta in PluginRegistry.list_plugins()
     ]
 

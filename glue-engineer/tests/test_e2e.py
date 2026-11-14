@@ -283,18 +283,19 @@ def test_v3_glue_schema():
         src=src, dst=dst, pair_id=build_pair_id("orjson", "serde_json"),
         strategy=strategy, mappings=[mapping], capability_alignment=alignment,
     )
-    assert schema.pair_id == "orjson_serde_json"
+    expected_pair_id = build_pair_id("orjson", "serde_json")
+    assert schema.pair_id == expected_pair_id
     assert len(schema.mappings) == 1
 
     js = schema.to_json()
     assert '"glue-schema-v1"' in js
-    assert '"orjson_serde_json"' in js
+    assert f'"{expected_pair_id}"' in js
 
     # Round-trip
     import json as _json
     data = _json.loads(js)
     restored = GlueSchema.from_json(data)
-    assert restored.pair_id == "orjson_serde_json"
+    assert restored.pair_id == expected_pair_id
     assert restored.src.name == "orjson"
     assert restored.dst.name == "serde_json"
     assert restored.strategy.mode == "import"

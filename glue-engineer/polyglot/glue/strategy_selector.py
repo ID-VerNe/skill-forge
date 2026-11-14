@@ -96,9 +96,23 @@ def select_strategy(
 
 
 def list_available_strategies() -> list[dict]:
-    """List all registered strategy rules (for CLI display)."""
+    """List strategy routes, annotated with actual generator availability.
+
+    A strategy rule describes a possible routing mode; it does not by itself
+    guarantee that a registered generator accepts that language pair.
+    """
+    from polyglot.glue.generators import list_generators
+
+    generators = {item["mode"]: item for item in list_generators()}
     result = []
     for (src_lang, dst_lang), (mode, bridge_lang, framework, tools) in sorted(STRATEGY_RULES.items()):
+        generator = generators.get(mode)
+        supported = bool(
+            generator
+            and (not generator["source_languages"] or src_lang in generator["source_languages"])
+            and (not generator["target_languages"] or dst_lang in generator["target_languages"])
+        )
+        availability = generator["implementation_status"] if supported else "unsupported"
         result.append({
             "from": src_lang,
             "to": dst_lang,
@@ -106,5 +120,7 @@ def list_available_strategies() -> list[dict]:
             "bridge_lang": bridge_lang,
             "framework": framework,
             "tools": tools,
+            "generator_supported": supported,
+            "generator_status": availability,
         })
     return result

@@ -43,6 +43,7 @@ class FFICffiGenerator(PluginInterface):
         target_languages=("c_cpp",),
         confidence="low",
         version="1.0.0",
+        implementation_status="scaffold",
     )
 
     def generate(self, schema: GlueSchema, output_dir: str = ".glue/search") -> GlueOutputPackage:
