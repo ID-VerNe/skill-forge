@@ -80,7 +80,7 @@ python -m polyglot cap-match python requests rust reqwest
 基于策略矩阵生成桥接代码。正式生成必须提供显式审核的 JSON 映射；空映射仅能通过 `--scaffold-only` 明确生成。当前可运行纵向切片为 Python→Python 的 identity 参数映射，其他生成器按 metadata 标记为 scaffold。验证器做结构和 Python 语法检查，不会执行桥接调用。
 
 ```bash
-# 查看可用桥接策略
+# 查看桥接策略路线及生成器状态（functional / scaffold / unsupported）
 python -m polyglot strategies
 
 # Dry-run：只看 schema，不生成文件（缺少审核映射时会报告 mappings_required）

@@ -5,6 +5,7 @@ Produces a Python host that launches a foreign-language child process and
 communicates via JSON-over-stdin/stdout. Universal fallback strategy.
 """
 
+import json
 import os
 from polyglot.glue.glue_schema import (
     GlueSchema,
@@ -261,7 +262,7 @@ class SubprocessGenerator(PluginInterface):
             f"// GENERATED — {schema.pair_id} JS bridge",
             f"// SPI Protocol: JSON stdin -> JSON stdout",
             f"const readline = require('readline');",
-            f"const {dst_name} = require('{dst_name}');",
+            f"const destinationModule = require({json.dumps(dst_name)});",
             f"",
             f"const rl = readline.createInterface({{ input: process.stdin, output: process.stdout, terminal: false }});",
             f"",
@@ -277,9 +278,11 @@ class SubprocessGenerator(PluginInterface):
         ]
         for mapping in schema.mappings:
             m = self._ensure_mapping(mapping)
-            lines.append(f"            case '{m.dst_function}':")
+            lines.append(f"            case {json.dumps(m.dst_function)}:")
             lines.append(f"                // TODO: map params: {', '.join(pm.src_name for pm in (m.param_mappings or []))}")
-            lines.append(f"                result = {dst_name}.{m.dst_function}(...params);")
+            lines.append(
+                f"                result = destinationModule[{json.dumps(m.dst_function)}](...params);"
+            )
             lines.append(f"                break;")
 
         lines += [

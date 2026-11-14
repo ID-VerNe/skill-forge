@@ -4,6 +4,7 @@ import json
 import keyword
 import sys
 import ast
+import re
 
 
 def add_args(sub):
@@ -143,6 +144,18 @@ def cmd_bridge(args):
     def valid_identifier(value):
         return isinstance(value, str) and value.isidentifier() and not keyword.iskeyword(value)
 
+    def valid_library_name(value, language):
+        if not isinstance(value, str):
+            return False
+        if language == "javascript":
+            # npm package names can be scoped, e.g. @scope/package. Keep the
+            # accepted syntax narrow so values remain safe in generated code.
+            return re.fullmatch(
+                r"(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*",
+                value,
+            ) is not None
+        return re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", value) is not None
+
     def valid_default_expression(value):
         if not isinstance(value, str):
             return False
@@ -220,6 +233,7 @@ def cmd_bridge(args):
                 raise ValueError(f"Mapping {mapping_id} param_mappings must be an array")
             source_params = set()
             destination_params = set()
+            saw_source_default = False
             for param_index, param in enumerate(param_mappings):
                 if not isinstance(param, dict):
                     raise ValueError(f"Mapping {mapping_id} parameter {param_index} must be an object")
@@ -235,8 +249,15 @@ def cmd_bridge(args):
                     raise ValueError(f"Mapping {mapping_id} contains duplicate parameter mappings")
                 source_params.add(param["src_name"])
                 destination_params.add(param["dst_name"])
-                if not valid_default_expression(param.get("src_default", "")) or not valid_default_expression(param.get("dst_default", "")):
+                source_default = param.get("src_default", "")
+                if not valid_default_expression(source_default) or not valid_default_expression(param.get("dst_default", "")):
                     raise ValueError(f"Mapping {mapping_id} parameter defaults must be valid Python expressions")
+                if source_default:
+                    saw_source_default = True
+                elif saw_source_default:
+                    raise ValueError(
+                        f"Mapping {mapping_id} cannot place a required source parameter after a defaulted parameter"
+                    )
                 transform = param.get("transform")
                 if transform is not None:
                     if not isinstance(transform, dict):
@@ -261,6 +282,26 @@ def cmd_bridge(args):
                     raise ValueError(f"Mapping {mapping_id} return transform fields are invalid")
             reviewed.append(dict(raw))
         return reviewed
+
+    for endpoint_name, library_name, language in (
+        ("source", args.src, args.src_lang),
+        ("destination", args.dst, args.dst_lang),
+    ):
+        if not valid_library_name(library_name, language):
+            fail(
+                "input_invalid",
+                f"The {endpoint_name} library name contains unsupported characters.",
+                endpoint=endpoint_name,
+            )
+
+    if args.src_lang == "python" and args.dst_lang == "python":
+        for endpoint_name, library_name in (("source", args.src), ("destination", args.dst)):
+            if not valid_identifier(library_name):
+                fail(
+                    "input_invalid",
+                    f"The {endpoint_name} Python library name must be an importable module identifier.",
+                    endpoint=endpoint_name,
+                )
 
     try:
         mappings = load_reviewed_mappings(getattr(args, "mappings", None))
@@ -415,6 +456,9 @@ def cmd_strategies(args):
     if args.format == "json":
         print(json.dumps(strategies, indent=2, ensure_ascii=False))
     else:
-        print("Available bridge strategies:")
+        print("Bridge strategy routes (generator availability shown):")
         for s in strategies:
-            print(f"  {s['from']:15s} -> {s['to']:15s}  [{s['mode']:15s}]  tools={s['tools']}")
+            print(
+                f"  {s['from']:15s} -> {s['to']:15s}  [{s['mode']:15s}]  "
+                f"generator={s['generator_status']}  tools={s['tools']}"
+            )

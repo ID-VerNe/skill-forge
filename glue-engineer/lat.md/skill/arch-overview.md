@@ -98,9 +98,10 @@ gen 产物目录结构,分同语言和跨语言两种场景。
 ### 跨语言桥接 (Python → Rust: orjson → serde_json)
 
 跨语言 subprocess 桥接的产物布局:Python BridgeClient + Rust CLI + build.sh 编译脚本。
+Pair 目录名以库名生成可读前缀，并附带源/目标完整名称的摘要，以避免不同库对发生路径冲突。
 
 ```
-.glue/search/orjson_serde_json/
+.glue/search/orjson_serde_json_<pair-hash>/
 ├── generated/
 │   ├── glue.py              # Python 端 BridgeClient
 │   ├── bridge.rs             # Rust 端 stdin/stdout CLI
