@@ -81,7 +81,7 @@ class DeepValidationDependencyTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0][0], "x")
         self.assertIn("jsonschema", results[0][1])
-        self.assertIn("requirements.txt", results[0][1])
+        self.assertIn('python -m pip install "jsonschema>=4.18"', results[0][1])
 
     # @lat: [[tests#Issue 59 Phase 1#jsonschema is declared as a runtime dependency]]
     def test_jsonschema_is_declared_as_a_runtime_dependency(self):

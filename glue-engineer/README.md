@@ -55,9 +55,10 @@ The CLI prepares workspaces, generates subagent task prompts, and validates arti
 - Python 3.10+
 - Git
 
-Install the Python CLI dependencies (including `jsonschema`, used by Deep Mode validation):
+From the `glue-engineer` skill root, install the Python CLI dependencies (including `jsonschema`, used by Deep Mode validation):
 
 ```bash
+# Run this command from the glue-engineer directory
 python -m pip install -r polyglot/requirements.txt
 ```
 

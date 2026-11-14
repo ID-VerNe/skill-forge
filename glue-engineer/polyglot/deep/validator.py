@@ -22,8 +22,7 @@ def validate_architecture_schema(arch: dict) -> list:
         return [(
             "x",
             "jsonschema is required for architecture validation; "
-            "install it with `python -m pip install -r "
-            "polyglot/requirements.txt`.",
+            'install it with `python -m pip install "jsonschema>=4.18"`.',
         )]
 
     schema_path = os.path.join(os.path.dirname(__file__), "schemas", "architecture.schema.json")

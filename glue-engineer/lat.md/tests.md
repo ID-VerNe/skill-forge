@@ -43,7 +43,7 @@ Verify that Deep Mode commands accept the documented `--dir` workspace option.
 Verify that `deep-init --requirements` preserves each independently supplied requirement.
 
 ### Missing jsonschema reports installation guidance
-Verify that architecture validation reports how to install `jsonschema` when it is unavailable.
+Verify that architecture validation gives a `jsonschema` install command that works regardless of the caller's current directory.
 
 ### jsonschema is declared as a runtime dependency
 Verify that `jsonschema` is listed in the Polyglot runtime requirements.
