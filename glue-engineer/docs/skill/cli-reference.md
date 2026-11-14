@@ -120,26 +120,26 @@ python -m polyglot analyze python src/main.py
 
 ## Deep Mode 命令
 
-6 个 deep pipeline 命令:deep-init → deep-pack → deep-validate → deep-compare → deep-summarize → deep-clean。
+6 个 deep pipeline 命令:deep-init → deep-pack → deep-validate → deep-compare → deep-summarize → deep-clean。除 `deep-init` 外，Deep Mode 命令用 `--dir <path>` 指定 workspace；`--requirements` 的每条需求需作为独立参数传入。CLI 不会启动 subagent，需由调用环境启动任务 prompt 对应的 agent。
 
 ```bash
 # 初始化 workspace + 克隆仓库
-python -m polyglot deep-init --project <name> --requirements "req1,req2" --repos <url1> <url2>
+python -m polyglot deep-init --project <name> --requirements "req1" "req2" --repos <url1> <url2>
 
 # 生成子 agent task prompt
-python -m polyglot deep-pack [dir]
+python -m polyglot deep-pack [--dir <dir>]
 
 # 验证子 agent 产物
-python -m polyglot deep-validate [dir]
-python -m polyglot deep-validate [dir] --include-reuse-map
+python -m polyglot deep-validate [--dir <dir>]
+python -m polyglot deep-validate [--dir <dir>] --include-reuse-map
 
 # 对比架构报告
-python -m polyglot deep-compare [dir]
+python -m polyglot deep-compare [--dir <dir>]
 
 # 生成报告草稿
-python -m polyglot deep-summarize [dir]
+python -m polyglot deep-summarize [--dir <dir>]
 
 # 清理克隆仓库
-python -m polyglot deep-clean [dir]
-python -m polyglot deep-clean [dir] --all
+python -m polyglot deep-clean [--dir <dir>]
+python -m polyglot deep-clean [--dir <dir>] --all
 ```

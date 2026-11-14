@@ -13,7 +13,7 @@
 ```bash
 python -m polyglot deep-init \
   --project "test-project" \
-  --requirements "device detection,cycle layer switching" \
+  --requirements "device detection" "cycle layer switching" \
   --target-license MIT \
   --repos https://github.com/jtroo/kanata
 ```
@@ -31,7 +31,7 @@ python -m polyglot deep-init \
 ## Step 2: deep-pack
 
 ```bash
-python -m polyglot deep-pack .glue/deep/
+python -m polyglot deep-pack --dir .glue/deep/
 ```
 
 **Checklist:**
@@ -55,7 +55,7 @@ _In Claude Code: spawn one glue-repo-architect subagent for kanata_
 ## Step 4: deep-validate
 
 ```bash
-python -m polyglot deep-validate .glue/deep/
+python -m polyglot deep-validate --dir .glue/deep/
 ```
 
 **Checklist:**
@@ -76,7 +76,7 @@ python -m polyglot deep-validate .glue/deep/
 ## Deep-Clean (verify cleanup)
 
 ```bash
-python -m polyglot deep-clean .glue/deep/
+python -m polyglot deep-clean --dir .glue/deep/
 ```
 
 - [ ] Source directories removed

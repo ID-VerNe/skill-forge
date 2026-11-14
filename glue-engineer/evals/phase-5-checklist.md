@@ -30,7 +30,7 @@
 # Create test workspace
 python -m polyglot deep-init --project "clean-test" --requirements "test" --repos https://github.com/jtroo/kanata
 # Run clean
-python -m polyglot deep-clean .glue/deep/ --force
+python -m polyglot deep-clean --dir .glue/deep/ --force
 # Verify
 ls .glue/deep/repos/kanata/source/  # should fail (source removed)
 ls .glue/deep/repos/kanata/architecture.json  # should exist (report preserved)

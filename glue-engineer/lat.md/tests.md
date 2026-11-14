@@ -29,6 +29,25 @@ Verify that `python -m polyglot deep-init` creates the `.glue/deep/` directory s
 ### Validation catches missing fields
 Verify that `deep-validate` correctly reports missing required fields in subagent outputs.
 
+## Issue 59 Phase 1
+
+Regression tests for issue #59 phase 1 cover CLI failure behavior, documented Deep Mode argument parsing, and the required JSON Schema dependency.
+
+### cap-match missing registry entry is a CLI error
+Verify that a missing capability entry reports a readable error and exits non-zero instead of raising `NameError`.
+
+### Deep Mode directory options parse
+Verify that Deep Mode commands accept the documented `--dir` workspace option.
+
+### Deep Mode requirements parse as separate values
+Verify that `deep-init --requirements` preserves each independently supplied requirement.
+
+### Missing jsonschema reports installation guidance
+Verify that architecture validation reports how to install `jsonschema` when it is unavailable.
+
+### jsonschema is declared as a runtime dependency
+Verify that `jsonschema` is listed in the Polyglot runtime requirements.
+
 ### License compatibility engine
 Verify that `license.py` correctly classifies SPDX identifiers into the right reuse mode categories.
 

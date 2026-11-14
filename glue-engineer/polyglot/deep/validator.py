@@ -16,7 +16,15 @@ def validate_architecture_schema(arch: dict) -> list:
     Returns:
         List of (status, message) tuples — each violation is a hard error ('x').
     """
-    import jsonschema
+    try:
+        import jsonschema
+    except ImportError:
+        return [(
+            "x",
+            "jsonschema is required for architecture validation; "
+            "install it with `python -m pip install -r "
+            "polyglot/requirements.txt`.",
+        )]
 
     schema_path = os.path.join(os.path.dirname(__file__), "schemas", "architecture.schema.json")
     with open(schema_path, encoding="utf-8") as f:

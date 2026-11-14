@@ -6,6 +6,8 @@
 
 glue-engineer v4 is a Claude Code skill that orchestrates a multi-phase pipeline:
 
+The CLI prepares workspaces, generates subagent task prompts, and validates artifacts; it does **not** start or schedule subagents. The calling agent/session must launch them.
+
 | Phase | What happens | Output |
 |:-----:|-------------|--------|
 | **1** | `deep-init` → `deep-pack` → **parallel subagents** → `deep-validate` | Per-repo architecture reports (`architecture.json`, `architecture.md`, `source_manifest.json`, `unresolved.md`) |
@@ -52,6 +54,12 @@ glue-engineer v4 is a Claude Code skill that orchestrates a multi-phase pipeline
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview)
 - Python 3.10+
 - Git
+
+Install the Python CLI dependencies (including `jsonschema`, used by Deep Mode validation):
+
+```bash
+python -m pip install -r polyglot/requirements.txt
+```
 
 ### 1. Install the Skill
 
@@ -113,12 +121,12 @@ python <path-to-glue-engineer>/polyglot/__main__.py --help
 # 1. Create workspace and clone candidate repos
 python -m polyglot deep-init \
   --project "keyboard-remapper" \
-  --requirements "device detection,cycle layer switching,macro support" \
+  --requirements "device detection" "cycle layer switching" "macro support" \
   --target-license MIT \
   --repos https://github.com/jtroo/kanata https://github.com/qmk/qsk
 
 # 2. Generate task prompts for subagents
-python -m polyglot deep-pack .glue/deep/
+python -m polyglot deep-pack --dir .glue/deep/
 
 # 3. (In Claude Code) Spawn subagents in parallel
 #    Spawn one glue-repo-architect per repo
@@ -126,24 +134,24 @@ python -m polyglot deep-pack .glue/deep/
 #    → They return only short summaries
 
 # 4. Validate subagent outputs
-python -m polyglot deep-validate .glue/deep/
+python -m polyglot deep-validate --dir .glue/deep/
 
 # 5. Generate comparison matrix
-python -m polyglot deep-compare .glue/deep/
+python -m polyglot deep-compare --dir .glue/deep/
 
 # 6. Generate report draft
-python -m polyglot deep-summarize .glue/deep/
+python -m polyglot deep-summarize --dir .glue/deep/
 
 # 7. (In Claude Code) Spawn glue-reuse-mapper for reuse analysis
 #    → Spawn glue-integration-planner for integration plans
 #    → Spawn glue-synthesizer for final recommendation
 
 # 8. Validate including reuse maps
-python -m polyglot deep-validate .glue/deep/ --include-reuse-map
+python -m polyglot deep-validate --dir .glue/deep/ --include-reuse-map
 
 # 9. Clean up cloned repos when done
-python -m polyglot deep-clean .glue/deep/
-python -m polyglot deep-clean .glue/deep/ --all   # also clean tasks/ and logs/
+python -m polyglot deep-clean --dir .glue/deep/
+python -m polyglot deep-clean --dir .glue/deep/ --all   # also clean tasks/ and logs/
 ```
 
 ### Session File
@@ -174,15 +182,15 @@ Create workspace and clone candidate repos.
 ```bash
 python -m polyglot deep-init \
   --project <name> \
-  --requirements "<req1>,<req2>" \
+  --requirements "<req1>" "<req2>" \
   --target-license <SPDX> \
   --repos <url1> <url2>
 ```
 
 **Args:**
-- `dir` — Workspace directory (default: `.glue/deep`)
+- `--dir` — Workspace directory (default: `.glue/deep`)
 - `--project` — Project name (required)
-- `--requirements` — Comma-separated list (required)
+- `--requirements` — Optional requirement strings; pass each requirement as a separate argument
 - `--target-license` — SPDX identifier (default: `""`)
 - `--repos` — GitHub URL(s) to clone
 
@@ -191,7 +199,7 @@ python -m polyglot deep-init \
 Generate task prompt files for subagents.
 
 ```bash
-python -m polyglot deep-pack [dir]
+python -m polyglot deep-pack [--dir <dir>]
 ```
 
 ### `deep-validate`
@@ -199,8 +207,8 @@ python -m polyglot deep-pack [dir]
 Validate subagent architecture outputs.
 
 ```bash
-python -m polyglot deep-validate [dir]
-python -m polyglot deep-validate [dir] --include-reuse-map   # also check reuse maps
+python -m polyglot deep-validate [--dir <dir>]
+python -m polyglot deep-validate [--dir <dir>] --include-reuse-map   # also check reuse maps
 ```
 
 **Checks:**
@@ -217,7 +225,7 @@ python -m polyglot deep-validate [dir] --include-reuse-map   # also check reuse 
 Generate structured comparison between repos.
 
 ```bash
-python -m polyglot deep-compare [dir]
+python -m polyglot deep-compare [--dir <dir>]
 ```
 
 **Outputs:** `comparison.json` + `comparison.md` with coverage matrix and ranking.
@@ -227,7 +235,7 @@ python -m polyglot deep-compare [dir]
 Generate draft report from all available artifacts.
 
 ```bash
-python -m polyglot deep-summarize [dir]
+python -m polyglot deep-summarize [--dir <dir>]
 ```
 
 **Output:** `final-report-draft.md`
@@ -237,8 +245,8 @@ python -m polyglot deep-summarize [dir]
 Clean cloned repos but keep architecture reports.
 
 ```bash
-python -m polyglot deep-clean [dir]
-python -m polyglot deep-clean [dir] --all   # also clean tasks/ and logs/
+python -m polyglot deep-clean [--dir <dir>]
+python -m polyglot deep-clean [--dir <dir>] --all   # also clean tasks/ and logs/
 ```
 
 ### v3 Commands (still available)

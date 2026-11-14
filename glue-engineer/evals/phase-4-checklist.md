@@ -31,7 +31,7 @@ _In Claude Code: spawn one glue-integration-planner subagent_
 ## Step 2: deep-summarize (integration section)
 
 ```bash
-python -m polyglot deep-summarize .glue/deep/
+python -m polyglot deep-summarize --dir .glue/deep/
 ```
 
 **Checklist:**

@@ -17,7 +17,7 @@ Deep Mode 是对候选库的源码级深度分析。
 
 ## 执行流程
 
-deep-init → deep-pack → 并行 subagent → deep-validate（jsonschema 严格 12 字段校验）→ deep-compare（coverage×0.4+confidence×0.3+evidence×0.3, DATA INCOMPLETE 抑制排名）→ deep-summarize → deep-clean 的完整管道。
+deep-init → deep-pack → 由调用环境启动并行 subagent → deep-validate（jsonschema 严格 12 字段校验）→ deep-compare（coverage×0.4+confidence×0.3+evidence×0.3, DATA INCOMPLETE 抑制排名）→ deep-summarize → deep-clean 的完整管道。CLI 只准备 workspace 并生成任务 prompt，不会自行启动或调度 subagent。
 
 ```bash
 # 重要：polyglot CLI 可以从任何目录运行，所有输出都放在当前 CWD 的 .glue/ 下。
@@ -27,8 +27,8 @@ deep-init → deep-pack → 并行 subagent → deep-validate（jsonschema 严�
 # Phase 1: 初始化 + 克隆
 # 必须包含 Search Mode 输出的所有候选库的 repo URL，不能主观跳过任何一个
 #    （subagent 会做代码级分析来判断优劣，主 agent 不应先替用户过滤）
-python -m polyglot deep-init --project <name> --requirements "req1,req2" --repos <url1> <url2> <url3> <...>
-python -m polyglot deep-pack .glue/deep/
+python -m polyglot deep-init --project <name> --requirements "req1" "req2" --repos <url1> <url2> <url3> <...>
+python -m polyglot deep-pack --dir .glue/deep/
 
 # 并行启动 glue-repo-architect subagent（每个 repo 一个）
 # → Subagent prompt 必须包含 CLI 指令（见子 agent 规则）
@@ -49,6 +49,8 @@ python -m polyglot deep-summarize --dir .glue/deep/
 
 # Phase 5: 清理（使用 -f 跳过交互确认，因为 Bash 环境 input() 可能异常）
 python -m polyglot deep-clean --dir .glue/deep/ --force
+
+# --requirements 使用 nargs="+"：每条需求作为独立参数传入，不会自动拆分逗号分隔字符串。
 ```
 
 ## Subagent 规则

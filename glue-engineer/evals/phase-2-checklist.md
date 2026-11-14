@@ -12,7 +12,7 @@
 ```bash
 python -m polyglot deep-init \
   --project "multi-repo-test" \
-  --requirements "config parsing,device detection,cycle layer switching,macro support" \
+  --requirements "config parsing" "device detection" "cycle layer switching" "macro support" \
   --target-license MIT \
   --repos https://github.com/jtroo/kanata https://github.com/qmk/qsk
 ```
@@ -27,7 +27,7 @@ python -m polyglot deep-init \
 ## Step 2: deep-pack
 
 ```bash
-python -m polyglot deep-pack .glue/deep/
+python -m polyglot deep-pack --dir .glue/deep/
 ```
 
 **Checklist:**
@@ -50,7 +50,7 @@ _In Claude Code: spawn N glue-repo-architect subagents simultaneously (one per r
 ## Step 4: deep-validate
 
 ```bash
-python -m polyglot deep-validate .glue/deep/
+python -m polyglot deep-validate --dir .glue/deep/
 ```
 
 **Checklist:**
@@ -63,7 +63,7 @@ python -m polyglot deep-validate .glue/deep/
 ## Step 5: deep-compare
 
 ```bash
-python -m polyglot deep-compare .glue/deep/
+python -m polyglot deep-compare --dir .glue/deep/
 ```
 
 **Checklist:**
@@ -79,7 +79,7 @@ python -m polyglot deep-compare .glue/deep/
 ## Step 6: deep-summarize
 
 ```bash
-python -m polyglot deep-summarize .glue/deep/
+python -m polyglot deep-summarize --dir .glue/deep/
 ```
 
 **Checklist:**
