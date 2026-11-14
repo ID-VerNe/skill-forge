@@ -46,6 +46,8 @@ class GeneratorMetadata:
         confidence: Confidence tier: "high" | "medium" | "low"
         version: Plugin version string
         license: SPDX license identifier for the plugin code itself
+        implementation_status: "functional" for an implemented slice or "scaffold"
+            when generated bridge code still contains unimplemented behavior
     """
     mode: str
     description: str
@@ -54,6 +56,7 @@ class GeneratorMetadata:
     confidence: str = "medium"
     version: str = "1.0.0"
     license: str = "MIT"
+    implementation_status: str = "scaffold"
 
 
 class PluginInterface(ABC):
@@ -241,13 +244,28 @@ class PluginRegistry:
             raise ValueError("GlueSchema has no strategy — cannot select generator")
         mode = schema.strategy.mode
         try:
-            return cls.get(mode)
+            generator = cls.get(mode)
         except KeyError:
             raise ValueError(
                 f"Unknown generator mode: '{mode}'. "
                 f"Available: {', '.join(cls._registry.keys()) or '(none)'}. "
                 f"Did you register a plugin for this mode?"
             )
+
+        metadata = generator.get_metadata()
+        for endpoint_name, endpoint, supported_languages in (
+            ("source", schema.src, metadata.source_languages),
+            ("destination", schema.dst, metadata.target_languages),
+        ):
+            if endpoint is None:
+                raise ValueError(f"Missing {endpoint_name} endpoint for generator '{mode}'")
+            if supported_languages and endpoint.language not in supported_languages:
+                supported = ", ".join(supported_languages)
+                raise ValueError(
+                    f"Generator '{mode}' does not support {endpoint_name} language "
+                    f"'{endpoint.language}' (supported: {supported})"
+                )
+        return generator
 
 
 # ---------------------------------------------------------------------------

@@ -27,8 +27,8 @@ from polyglot.glue.glue_schema import (
 )
 
 VERIFICATION_DISCLAIMER = (
-    "This verification confirms the generated code runs at scaffold level. "
-    "It does NOT confirm production readiness. "
+    "This report covers structural checks and Python syntax compilation only. "
+    "It does NOT confirm runtime behavior, foreign-language compilation, or production readiness. "
     "Manual review of type conversions, error handling, and edge cases is required before deployment."
 )
 
@@ -63,6 +63,10 @@ class VerificationReport:
             "levels": {k: {"status": v.status, "detail": v.detail if isinstance(v.detail, str) else str(v.detail), "duration_ms": v.duration_ms}
                        for k, v in self.levels.items()},
             "overall": self.overall,
+            "verification_scope": (
+                "Structural/static checks and Python syntax compilation only; "
+                "runtime execution and foreign-language compilation are not performed."
+            ),
             "disclaimer": self.disclaimer,
         }
 
@@ -126,6 +130,13 @@ class Verifier:
         if self.report.levels.get("file_integrity", VerificationLevel()).status != "failed":
             self._verify_level("edge_cases", self._check_edge_cases)
 
+        # Runtime calls are deliberately not inferred from structural checks.
+        self.report.levels["runtime_check"] = VerificationLevel(
+            name="runtime_check",
+            status="not_run",
+            detail="Runtime behavior is not executed by this verifier; use a dedicated integration test.",
+        )
+
         # Compute overall
         self.report.overall = self._compute_overall()
         return self.report
@@ -159,12 +170,13 @@ class Verifier:
             issues.append("Missing dst endpoint")
         if not schema.strategy:
             issues.append("Missing strategy")
-        if not schema.mappings:
+        if not schema.mappings and not schema.scaffold_only:
             issues.append("No function mappings defined")
 
         if issues:
             return {"status": "failed", "detail": "; ".join(issues)}
-        return {"status": "passed", "detail": f"Schema valid: {len(schema.mappings)} mappings, strategy={schema.strategy.mode if schema.strategy else '?'}"}
+        state = "scaffold-only schema" if schema.scaffold_only else "mapped schema"
+        return {"status": "passed", "detail": f"Schema valid ({state}): {len(schema.mappings)} mappings, strategy={schema.strategy.mode if schema.strategy else '?'}"}
 
     def _check_files(self) -> dict:
         """Level 2: Check that all generated output files exist."""
@@ -216,7 +228,8 @@ class Verifier:
         """Level 4: Verify that function mappings are structurally consistent."""
         schema = self.schema
         if not schema or not schema.mappings:
-            return {"status": "passed", "detail": "No mappings to verify"}
+            detail = "No mappings to verify; explicit scaffold-only schema" if schema and schema.scaffold_only else "No mappings to verify"
+            return {"status": "passed_with_warnings" if schema and schema.scaffold_only else "passed", "detail": detail}
 
         warnings = []
         total = len(schema.mappings)
@@ -373,7 +386,7 @@ class Verifier:
             return "passed"
         if any(s == "failed" for s in statuses):
             return "failed"
-        if any(s == "passed_with_warnings" for s in statuses):
+        if any(s in ("passed_with_warnings", "not_run") for s in statuses):
             return "passed_with_warnings"
         return "not_run"
 

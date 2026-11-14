@@ -10,6 +10,8 @@ from polyglot.glue.glue_schema import (
     GlueSchema,
     GlueOutputPackage,
     FunctionMapping,
+    ParamMapping,
+    TransformRule,
     now_iso,
     SCAFFOLD_DISCLAIMER,
 )
@@ -35,15 +37,12 @@ class ImportGenerator(PluginInterface):
 
     metadata = GeneratorMetadata(
         mode="import",
-        description="Same-language import wrapper (highest confidence)",
-        source_languages=(
-            "python", "javascript", "rust", "java", "kotlin", "c_cpp",
-        ),
-        target_languages=(
-            "python", "javascript", "rust", "java", "kotlin", "c_cpp",
-        ),
+        description="Python same-language import wrapper",
+        source_languages=("python",),
+        target_languages=("python",),
         confidence="high",
         version="1.0.0",
+        implementation_status="functional",
     )
 
     def generate(self, schema: GlueSchema, output_dir: str = ".glue/search") -> GlueOutputPackage:
@@ -177,24 +176,17 @@ class ImportGenerator(PluginInterface):
         src_func = mapping.src_function
         dst_func = mapping.dst_function
 
-        # Collect parameters
-        src_params = []
-        param_body = []
-        for pm in mapping.param_mappings:
-            pm = self._ensure_param_mapping(pm)
-            if pm.dst_name == "#MISSING":
-                src_params.append(pm.src_name)
-                param_body.append(f"    # TODO: src param '{pm.src_name}' has no dst match")
-            elif pm.transform and pm.transform.kind == "identity":
-                src_params.append(pm.src_name)
-            else:
-                src_params.append(pm.src_name)
-
-        params_str = ", ".join(src_params) if src_params else "*args, **kwargs"
+        # Preserve source parameter defaults while mapping names to the destination.
+        param_mappings = [self._ensure_param_mapping(pm) for pm in mapping.param_mappings]
+        params_str = ", ".join(
+            f"{pm.src_name}={pm.src_default}" if pm.src_default else pm.src_name
+            for pm in param_mappings
+        ) if param_mappings else "*args, **kwargs"
         params_fwd = ", ".join(
-            pm.dst_name if pm.dst_name != "#MISSING" else f"# TODO: {pm.src_name}"
-            for pm in mapping.param_mappings
-        ) if mapping.param_mappings else "*args, **kwargs"
+            f"{pm.dst_name}={pm.src_name}"
+            for pm in param_mappings
+            if pm.dst_name != "#MISSING"
+        )
 
         lines = []
         lines.append(f"")
@@ -202,8 +194,7 @@ class ImportGenerator(PluginInterface):
         lines.append(f'    """Bridge: {src_name}.{src_func} -> {dst_name}.{dst_func}"""')
 
         # Add TODO markers for low-confidence params
-        for pm in mapping.param_mappings:
-            pm = self._ensure_param_mapping(pm)
+        for pm in param_mappings:
             if pm.dst_name == "#MISSING":
                 lines.append(f'    # TODO: param "{pm.src_name}" not mapped — may need manual handling')
             elif pm.transform and pm.transform.kind != "identity":
@@ -213,10 +204,10 @@ class ImportGenerator(PluginInterface):
             lines.append(f"    # TODO: return type transform needed")
 
         lines.append(f"    try:")
-        if mapping.param_mappings:
+        if params_fwd:
             lines.append(f"        result = {dst_name}.{dst_func}({params_fwd})")
         else:
-            lines.append(f"        result = {dst_name}.{dst_func}()")
+            lines.append(f"        result = {dst_name}.{dst_func}(*args, **kwargs)")
         lines.append(f"        return result")
         lines.append(f"    except Exception as e:")
         lines.append(f'        raise RuntimeError(f"Bridge error in {src_func} -> {dst_func}: {{e}}") from e')
@@ -412,17 +403,19 @@ class ImportGenerator(PluginInterface):
     def _ensure_mapping(self, m):
         """Normalize mapping to FunctionMapping object."""
         if isinstance(m, dict):
-            return FunctionMapping(**m)
+            mapping_data = dict(m)
+            return_transform = mapping_data.get("return_transform")
+            if isinstance(return_transform, dict):
+                mapping_data["return_transform"] = TransformRule(**return_transform)
+            return FunctionMapping(**mapping_data)
         return m
 
     def _ensure_param_mapping(self, pm):
         """Normalize param mapping to ParamMapping object."""
         if isinstance(pm, dict):
-            return type("Obj", (), {
-                "src_name": pm.get("src_name", ""),
-                "dst_name": pm.get("dst_name", ""),
-                "transform": type("Obj", (), {"kind": "identity", "expr": ""})() if pm.get("transform") else None,
-                "src_default": pm.get("src_default", ""),
-                "dst_default": pm.get("dst_default", ""),
-            })()
+            param_data = dict(pm)
+            transform = param_data.get("transform")
+            if isinstance(transform, dict):
+                param_data["transform"] = TransformRule(**transform)
+            return ParamMapping(**param_data)
         return pm

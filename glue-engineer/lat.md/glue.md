@@ -49,9 +49,17 @@ Reference: [[polyglot/glue/glue_schema.py]]
 
 ### Verification
 
-`verifier.py` validates glue plans against the schema and checks for consistency.
+`verifier.py` validates schema/file integrity, mapping consistency, and Python syntax. It explicitly reports runtime behavior as `not_run`; a passing structural report is not evidence that generated bridge calls execute correctly.
 
 Reference: [[polyglot/glue/verifier.py]]
+
+### Reviewed mapping generation
+
+Bridge generation consumes reviewed mappings only. Empty mappings require explicit scaffold mode.
+
+`polyglot bridge --mappings <file.json>` accepts a top-level `mappings` array and sends only entries marked `review_status: "reviewed"` to the schema and generator. The currently functional vertical slice is Python-to-Python identity parameter mapping; the remaining generators are identified as scaffold through `GeneratorMetadata.implementation_status` and supported-language metadata.
+
+Reference: [[polyglot/commands/glue.py]]
 
 ## Dependencies
 
