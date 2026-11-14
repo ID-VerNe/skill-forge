@@ -65,7 +65,7 @@ Write all outputs to: {os.path.join(workspace_dir, 'repos', slug)}
    - `core_modules` (array) — 3 to 10 major modules, each {{`name`, `path`, `purpose`}}
    - `key_types` (array, non-empty) — key structs/enums/traits/interfaces, each {{`name`, `kind`, `file`, `line`, `purpose`}}
    - `platform_apis` (array) — OS-specific API usage, each {{`api`, `purpose`, `file`, `line`}} (use `[]` if genuinely none)
-   - `known_gaps` (array, non-empty) — **for EVERY requirement in the Requirements section above**, one entry {{`requirement`, `status`, `details`, `effort`}}. MUST use the exact field names `requirement` and `status` — NOT custom names like `gap`, `severity`, or `requirement_id`. `status` ∈ `supported`/`partial`/`missing`, `effort` ∈ `low`/`medium`/`high`/`unknown`
+    - `known_gaps` (array, non-empty) — **for EVERY requirement in the Requirements section above, exactly one entry**, with the requirement text copied exactly: {{`requirement`, `status`, `details`, `effort`}}. Do not omit, duplicate, or add unrelated requirement rows. MUST use the exact field names `requirement` and `status` — NOT custom names like `gap`, `severity`, or `requirement_id`. `status` ∈ `supported`/`partial`/`missing`, `effort` ∈ `low`/`medium`/`high`/`unknown`
    - `confidence` (number 0.0-1.0) — MUST be a plain number (e.g. `0.9`), NOT an object with `overall`/`notes` keys
    - `evidence` (array, non-empty) — every entry MUST have `claim` (string), `file` (string), `line_start` (integer), `line_end` (integer) — NOT a `lines` string like "1808,1824,1841"
 7. `confidence` must be in range 0.0-1.0.
@@ -100,10 +100,15 @@ def generate_tasks(workspace_dir: str) -> list:
         List of (slug, task_path) tuples
     """
     from polyglot.deep.outputs import load_session, task_dir
+    from polyglot.deep.validator import validate_session_completeness
 
     session = load_session(workspace_dir)
     if not session:
         raise FileNotFoundError(f"No session.json found in {workspace_dir}")
+
+    errors = [message for status, message in validate_session_completeness(session) if status == "x"]
+    if errors:
+        raise ValueError("Cannot generate tasks from incomplete candidate session: " + "; ".join(errors))
 
     tdir = task_dir(workspace_dir)
     os.makedirs(tdir, exist_ok=True)

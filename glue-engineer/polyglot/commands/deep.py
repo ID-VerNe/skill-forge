@@ -45,8 +45,12 @@ def add_args(sub):
 
 def cmd_deep_init(args):
     """Create deep analysis workspace with cloned repos."""
-    from polyglot.deep.outputs import create_workspace, create_session, add_repo_to_session, repo_dir
+    from polyglot.deep.outputs import (
+        create_workspace, create_session, add_repo_to_session, record_clone_result,
+        repo_dir, save_session,
+    )
     from polyglot.deep.repo_resolver import url_to_slug, resolve_repo_url, clone_repo
+    import hashlib
 
     workspace = os.path.abspath(args.dir)
     create_workspace(workspace)
@@ -57,12 +61,25 @@ def cmd_deep_init(args):
         requirements=args.requirements,
         target_license=args.target_license or "",
     )
+    session["candidate_count"] = len(args.repos)
+    save_session(workspace, session)
 
     success_count = 0
     fail_count = 0
 
-    for url in args.repos:
-        slug = url_to_slug(url)
+    requested_slug_keys = set()
+    for candidate_index, url in enumerate(args.repos, start=1):
+        base_slug = url_to_slug(url)
+        slug = base_slug
+        if slug.casefold() in requested_slug_keys:
+            digest = hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:10]
+            suffix = f"{digest}-{candidate_index}"
+            slug = f"{base_slug}-{suffix}"
+            collision_index = 1
+            while slug.casefold() in requested_slug_keys:
+                slug = f"{base_slug}-{suffix}-{collision_index}"
+                collision_index += 1
+        requested_slug_keys.add(slug.casefold())
         rd = repo_dir(workspace, slug)
         src = os.path.join(rd, "source")
 
@@ -75,18 +92,26 @@ def cmd_deep_init(args):
                 name=slug, url=url, slug=slug,
                 local_path=src, commit=result["commit"],
             )
+            record_clone_result(
+                workspace, session, name=slug, url=url, slug=slug,
+                success=True, commit=result["commit"],
+            )
             print(f"    commit: {result['commit'][:12]}")
             success_count += 1
         else:
+            record_clone_result(
+                workspace, session, name=slug, url=url, slug=slug,
+                success=False, error=result.get("error", "unknown clone error"),
+            )
             print(f"    [!] Clone failed: {result['error'][:120]}")
             fail_count += 1
 
-    if success_count == 0 and fail_count > 0:
-        print(f"\n[x] All {fail_count} clones failed — workspace is incomplete")
+    if fail_count:
+        print(f"\n[x] {fail_count}/{len(args.repos)} clone(s) failed — candidate set is incomplete")
         sys.exit(1)
 
     print(f"\n[v] Workspace ready: {workspace}")
-    print(f"    {len(session['candidate_repos'])} repos, {len(session['requirements'])} requirements")
+    print(f"    {success_count}/{session['candidate_count']} candidates cloned, {len(session['requirements'])} requirements")
 
 
 def cmd_deep_pack(args):

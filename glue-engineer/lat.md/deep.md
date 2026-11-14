@@ -26,11 +26,13 @@ Reference: [[polyglot/deep/outputs.py]]
 
 ### Validation
 
-`validator.py` checks that subagent outputs meet minimum requirements:
-- `architecture.md` exists
-- `architecture.json` is valid JSON with required fields (confidence, evidence)
-- `source_manifest.json` exists
-- `unresolved.md` exists
+`validator.py` checks completeness before comparison can rank candidates:
+- Every requested repository has a clone result, and candidate counts, unique safe slugs, successful clone entries, and `candidate_repos` agree.
+- `architecture.md`, `source_manifest.json` (with a non-empty `files_read` list), and `unresolved.md` exist for each successful clone.
+- `architecture.json` is valid JSON and passes the strict schema (required fields, types, structures, enums, non-empty evidence with line ranges).
+- The report slug and commit match the cloned candidate.
+- Each session requirement appears exactly once in `known_gaps`; matching is whitespace-normalized, case-insensitive exact equality.
+- Missing/corrupt/malformed session and artifacts are hard errors, not warnings.
 
 With `--include-reuse-map`, also validates `reuse-map.json` structure.
 
@@ -38,7 +40,11 @@ Reference: [[polyglot/deep/validator.py]]
 
 ### Comparison
 
-`comparer.py` generates a coverage matrix comparing all repos across dimensions (architecture, features, API surface, etc.), then ranks repos by coverage score.
+`comparer.py` creates requirement coverage matrices and ranks candidates only when all inputs are complete.
+
+Clone failures, invalid candidate accounting, or validation errors produce a `data_incomplete` result with reasons, suppress ranking, and return a non-zero CLI exit code.
+
+`summarizer.py` revalidates the current session/artifacts and recomputes the deterministic matrix and ranking. It does not trust a saved `comparison.json` solely because its status says `complete`; missing, corrupt, stale, or inconsistent comparison data results in a `DATA INCOMPLETE` report with no top candidate and a non-zero CLI exit code.
 
 Reference: [[polyglot/deep/comparer.py]]
 

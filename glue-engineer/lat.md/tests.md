@@ -48,6 +48,19 @@ Verify that architecture validation gives a `jsonschema` install command that wo
 ### jsonschema is declared as a runtime dependency
 Verify that `jsonschema` is listed in the Polyglot runtime requirements.
 
+## Issue 59 Phase 3
+
+Offline regression tests for candidate accounting, requirement coverage, and ranking integrity live in `test_issue59_phase3.py`.
+
+### deep-summarize returns nonzero for incomplete data
+Verify that `deep-summarize` writes its diagnostic report but exits nonzero when session or comparison data is incomplete, and exits zero for a complete report.
+
+### deep-summarize handles malformed comparison shapes
+Verify that valid JSON with incorrectly typed comparison matrix fields produces a diagnostic report and non-zero exit rather than an uncaught exception.
+
+### deep-init avoids case-insensitive slug collisions
+Verify that repository URLs differing only by letter case are assigned distinct slugs so their checkout directories cannot alias on case-insensitive filesystems.
+
 ### License compatibility engine
 Verify that `license.py` correctly classifies SPDX identifiers into the right reuse mode categories.
 

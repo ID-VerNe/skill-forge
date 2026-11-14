@@ -54,14 +54,15 @@
     "core_modules": {
       "type": "array",
       "description": "Core module names/paths",
+      "minItems": 1,
       "items": {
         "type": "object",
+        "required": ["name", "path"],
         "properties": {
           "name": { "type": "string" },
           "path": { "type": "string" },
           "purpose": { "type": "string" }
-        },
-        "required": ["name", "path"]
+        }
       }
     },
     "data_flow": {
@@ -72,16 +73,17 @@
     "key_types": {
       "type": "array",
       "description": "Key structs, enums, types",
+      "minItems": 1,
       "items": {
         "type": "object",
+        "required": ["name", "kind", "file", "line"],
         "properties": {
           "name": { "type": "string" },
           "kind": { "type": "string", "enum": ["struct", "enum", "trait", "type", "interface", "class"] },
           "file": { "type": "string" },
           "line": { "type": "integer" },
           "purpose": { "type": "string" }
-        },
-        "required": ["name", "kind", "file", "line"]
+        }
       }
     },
     "platform_apis": {
@@ -89,13 +91,13 @@
       "description": "Platform-specific API usage",
       "items": {
         "type": "object",
+        "required": ["api", "purpose"],
         "properties": {
           "api": { "type": "string" },
           "purpose": { "type": "string" },
           "file": { "type": "string" },
           "line": { "type": "integer" }
-        },
-        "required": ["api", "purpose"]
+        }
       }
     },
     "extension_points": {
@@ -106,15 +108,16 @@
     "known_gaps": {
       "type": "array",
       "description": "Known capability gaps vs requirements",
+      "minItems": 1,
       "items": {
         "type": "object",
+        "required": ["requirement", "status"],
         "properties": {
-          "requirement": { "type": "string" },
+          "requirement": { "type": "string", "minLength": 1 },
           "status": { "type": "string", "enum": ["supported", "partial", "missing"] },
           "details": { "type": "string" },
           "effort": { "type": "string", "enum": ["low", "medium", "high", "unknown"] }
-        },
-        "required": ["requirement", "status"]
+        }
       }
     },
     "reuse_candidates": {
@@ -122,6 +125,7 @@
       "description": "Potentially reusable modules",
       "items": {
         "type": "object",
+        "required": ["module", "file", "line_start", "line_end"],
         "properties": {
           "module": { "type": "string" },
           "file": { "type": "string" },
@@ -142,14 +146,14 @@
       "description": "Evidence backing key claims",
       "items": {
         "type": "object",
+        "required": ["claim", "file", "line_start", "line_end"],
         "properties": {
-          "claim": { "type": "string" },
-          "file": { "type": "string" },
-          "line_start": { "type": "integer" },
-          "line_end": { "type": "integer" },
+          "claim": { "type": "string", "minLength": 1 },
+          "file": { "type": "string", "minLength": 1 },
+          "line_start": { "type": "integer", "minimum": 1 },
+          "line_end": { "type": "integer", "minimum": 1 },
           "note": { "type": "string" }
-        },
-        "required": ["claim", "file", "line_start", "line_end"]
+        }
       },
       "minItems": 1
     },

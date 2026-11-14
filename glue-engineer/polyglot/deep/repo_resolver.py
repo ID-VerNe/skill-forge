@@ -3,7 +3,8 @@
 import os
 import subprocess
 import re
-import json
+import hashlib
+from urllib.parse import urlparse
 
 
 def url_to_slug(url: str) -> str:
@@ -16,26 +17,47 @@ def url_to_slug(url: str) -> str:
         /path/to/my-repo → my-repo
         C:\\Users\\me\\project → project
     """
-    # Strip trailing .git
-    url = url.strip()
-    if url.endswith(".git"):
-        url = url[:-4]
+    original = url.strip()
 
-    # Handle Windows paths
-    if "://" not in url and (url.startswith("/") or re.match(r"^[A-Za-z]:\\", url)):
-        return os.path.basename(os.path.normpath(url))
+    # Local paths retain their original final component and don't collide merely
+    # because they aren't URL-shaped.
+    if "://" not in original and (original.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", original)):
+        name = os.path.basename(os.path.normpath(original))
+        return _safe_slug(name) or "repo"
 
-    # Handle SSH-style: git@github.com:user/repo
-    if "@" in url and ":" in url:
-        url = url.split(":")[-1]
+    value = original
+    owner = ""
+    if value.startswith("git@") and ":" in value:
+        host, path = value.split(":", 1)
+        owner = path.rsplit("/", 1)[0].split("/")[-1]
+        name = path.rsplit("/", 1)[-1]
+    elif "://" in value:
+        parsed = urlparse(value)
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2:
+            owner, name = parts[-2], parts[-1]
+        else:
+            name = parts[-1] if parts else "repo"
+    else:
+        parts = [part for part in value.split("/") if part]
+        if len(parts) >= 2:
+            owner, name = parts[-2], parts[-1]
+        else:
+            name = parts[-1] if parts else "repo"
 
-    # Extract last path component
-    slug = os.path.basename(url)
-    # Sanitize: keep only alphanumeric, dash, underscore
-    slug = re.sub(r"[^a-zA-Z0-9_-]", "", slug)
-    if not slug:
-        slug = "repo"
-    return slug
+    if name.endswith(".git"):
+        name = name[:-4]
+    safe_name = _safe_slug(name) or "repo"
+    safe_owner = _safe_slug(owner)
+    if safe_owner:
+        identity = f"{owner.lower()}/{name.lower()}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
+        return f"{safe_owner}-{safe_name}-{digest}"
+    return safe_name
+
+
+def _safe_slug(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "-", value).strip("-_")
 
 
 def resolve_repo_url(url: str) -> str:

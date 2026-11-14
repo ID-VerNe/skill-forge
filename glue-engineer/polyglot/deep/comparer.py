@@ -16,7 +16,7 @@ def _load_architecture(workspace_dir: str, slug: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (json.JSONDecodeError, IOError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
 
 
@@ -47,6 +47,25 @@ def _normalize_status(val) -> str:
     return "missing"
 
 
+def _normalize_requirement(value) -> str:
+    return " ".join(value.split()).casefold() if isinstance(value, str) else ""
+
+
+def _candidate_count(session: dict) -> int:
+    count = session.get("candidate_count")
+    return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else 0
+
+
+def _clone_failures(session: dict) -> list:
+    clone_results = session.get("clone_results")
+    if not isinstance(clone_results, list):
+        return []
+    return [
+        item for item in clone_results
+        if isinstance(item, dict) and item.get("status") != "cloned"
+    ]
+
+
 # @lat: [[deep#Key Concepts#Comparison]]
 def build_coverage_matrix(workspace_dir: str, session: dict, archs: dict = None) -> dict:
     """Build a requirements-coverage matrix from all architecture reports.
@@ -73,10 +92,11 @@ def build_coverage_matrix(workspace_dir: str, session: dict, archs: dict = None)
             slug = repo["slug"]
             arch = archs.get(slug, {})
             gaps = arch.get("known_gaps", [])
-            # Find matching gap
+            # Exact normalized equality; substring matching can map unrelated
+            # requirements to the same coverage row.
             status = "missing"
             for gap in gaps:
-                if req.lower() in gap.get("requirement", "").lower() or gap.get("requirement", "").lower() in req.lower():
+                if _normalize_requirement(req) == _normalize_requirement(gap.get("requirement")):
                     status = _normalize_status(gap.get("status", "missing"))
                     break
             row[slug] = status
@@ -211,24 +231,64 @@ def compare_all(workspace_dir: str) -> dict:
 
     session = load_session(workspace_dir)
     if not session:
-        return {"error": "No session.json found"}
+        session_path = os.path.join(workspace_dir, "session.json")
+        session_error = (
+            "session.json is missing" if not os.path.exists(session_path)
+            else "session.json is invalid or unreadable"
+        )
+        return {
+            "status": "data_incomplete",
+            "error": session_error,
+            "project": "",
+            "candidate_count": 0,
+            "cloned_count": 0,
+            "clone_failures": [],
+            "matrix": {"requirements": [], "repos": [], "matrix": []},
+            "comparisons": [],
+            "ranking": [],
+            "validation_failed": True,
+            "validation_errors": [session_error],
+            "warning": f"DATA INCOMPLETE: {session_error}; ranking has been suppressed.",
+        }
+
+    if not isinstance(session.get("candidate_repos"), list):
+        return {
+            "status": "data_incomplete",
+            "error": "session.json candidate_repos must be an array",
+            "project": session.get("project") if isinstance(session.get("project"), str) else "",
+            "candidate_count": _candidate_count(session),
+            "cloned_count": 0,
+            "clone_failures": [],
+            "matrix": {"requirements": [], "repos": [], "matrix": []},
+            "comparisons": [],
+            "ranking": [],
+            "validation_failed": True,
+            "validation_errors": ["session.json candidate_repos must be an array"],
+            "warning": "DATA INCOMPLETE: session.json candidate_repos must be an array; ranking has been suppressed.",
+        }
 
     # Validation gate: refuse to rank if architecture data is incomplete.
     validation = validate_all(workspace_dir)
     if not validation["all_pass"]:
-        errors = [entry[0] for entry in validation["summary"]
-                  if isinstance(entry, tuple) and entry and "[x]" in entry[0]]
+        errors = validation.get("errors") or [
+            entry[0] for entry in validation["summary"]
+            if isinstance(entry, tuple) and entry and "[x]" in entry[0]
+        ]
         return {
-            "project": session.get("project", ""),
+            "status": "data_incomplete",
+            "project": session.get("project") if isinstance(session.get("project"), str) else "",
+            "candidate_count": _candidate_count(session),
+            "cloned_count": len(session.get("candidate_repos", [])),
+            "clone_failures": _clone_failures(session),
             "matrix": {"requirements": [], "repos": [], "matrix": []},
             "comparisons": [],
             "ranking": [],
             "validation_failed": True,
             "validation_errors": errors,
             "warning": (
-                "DATA INCOMPLETE: architecture reports are missing required fields. "
+                "DATA INCOMPLETE: candidate or architecture data is missing or invalid. "
                 "Ranking is unreliable and has been suppressed. "
-                "Run subagents first, then `deep-validate` to confirm all checks pass."
+                "Resolve the listed errors, then rerun `deep-validate` and `deep-compare`."
             ),
         }
 
@@ -238,7 +298,11 @@ def compare_all(workspace_dir: str) -> dict:
     ranking = build_ranking(comparisons, matrix)
 
     return {
+        "status": "complete",
         "project": session.get("project", ""),
+        "candidate_count": _candidate_count(session),
+        "cloned_count": len(session.get("candidate_repos", [])),
+        "clone_failures": [],
         "matrix": matrix,
         "comparisons": comparisons,
         "ranking": ranking,
@@ -252,16 +316,24 @@ def format_matrix_markdown(result: dict) -> str:
     lines.append("")
 
     # Validation gate banner: surface incomplete data before any numbers.
-    if result.get("validation_failed"):
-        lines.append("> **DATA INCOMPLETE**: architecture reports are missing required fields.")
+    if result.get("status") == "data_incomplete" or result.get("validation_failed"):
+        lines.append("> **DATA INCOMPLETE**: candidate or architecture data is missing or invalid.")
         lines.append("> Ranking has been suppressed — it would be unreliable.")
-        lines.append("> Run subagents first, then `deep-validate` to confirm all checks pass.")
+        lines.append("> Resolve the listed errors, then rerun `deep-validate` and `deep-compare`.")
         lines.append("")
         errors = result.get("validation_errors", [])
         if errors:
             lines.append("**Validation errors:**")
             for err in errors[:10]:
                 lines.append(f"- {err}")
+            lines.append("")
+        for item in result.get("clone_failures", []):
+            if isinstance(item, dict):
+                lines.append(
+                    f"- Clone failed: `{item.get('url', item.get('slug', 'unknown'))}` — "
+                    f"{item.get('error') or 'unknown error'}"
+                )
+        if result.get("clone_failures"):
             lines.append("")
 
     matrix = result.get("matrix", {})
@@ -302,7 +374,7 @@ def format_matrix_markdown(result: dict) -> str:
                 f"| {r['rank']} | {r['slug']} | {r['score']} | "
                 f"{r.get('coverage_ratio', '?')} | {r['confidence']} | {r['evidence_count']} |"
             )
-    elif result.get("validation_failed"):
+    elif result.get("status") == "data_incomplete" or result.get("validation_failed"):
         lines.append("*Ranking suppressed — see DATA INCOMPLETE banner above.*")
     lines.append("")
 
@@ -333,11 +405,8 @@ def main(workspace_dir: str, output_dir: str = None):
 
     result = compare_all(workspace_dir)
 
-    if "error" in result:
-        print(f"[x] {result['error']}")
-        return 1
-
     # Write JSON
+    os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, "comparison.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
@@ -355,13 +424,15 @@ def main(workspace_dir: str, output_dir: str = None):
     req_count = len(matrix.get("requirements", []))
     repo_count = len(matrix.get("repos", []))
     ranking = result.get("ranking", [])
-    if result.get("validation_failed"):
-        print(f"\n[!] DATA INCOMPLETE — ranking suppressed.")
-        print(f"    Run subagents first, then `deep-validate` to confirm all checks pass.")
+    if result.get("status") == "data_incomplete" or result.get("validation_failed"):
+        print("\n[!] DATA INCOMPLETE — ranking suppressed.")
+        if result.get("error"):
+            print(f"    {result['error']}")
+        print("    Resolve the listed errors, then rerun `deep-validate` and `deep-compare`.")
         errors = result.get("validation_errors", [])
         if errors:
             print(f"    {len(errors)} validation error(s) — see comparison.md for details.")
-        return 0
+        return 1 if result.get("error") else 2
 
     print(f"\n[v] Compared {repo_count} repos across {req_count} requirements")
     if ranking:

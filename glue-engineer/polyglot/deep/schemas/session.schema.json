@@ -3,25 +3,42 @@
   "title": "Session",
   "description": "Deep analysis session configuration",
   "type": "object",
-  "required": ["project", "requirements", "candidate_repos", "created_at", "workflow"],
+  "required": ["project", "requirements", "candidate_repos", "candidate_count", "clone_results", "created_at", "workflow"],
   "properties": {
     "project": { "type": "string" },
     "requirements": {
       "type": "array",
-      "items": { "type": "string" }
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
     },
     "target_license": { "type": "string" },
     "candidate_repos": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["name", "url", "slug", "local_path"],
+        "required": ["name", "url", "slug", "local_path", "commit"],
         "properties": {
           "name": { "type": "string" },
           "url": { "type": "string" },
-          "slug": { "type": "string" },
+          "slug": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$" },
           "local_path": { "type": "string" },
           "commit": { "type": "string" }
+        }
+      }
+    },
+    "candidate_count": { "type": "integer", "minimum": 1 },
+    "clone_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "url", "slug", "status", "commit", "error"],
+        "properties": {
+          "name": { "type": "string" },
+          "url": { "type": "string" },
+          "slug": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$" },
+          "status": { "type": "string", "enum": ["cloned", "failed"] },
+          "commit": { "type": "string" },
+          "error": { "type": "string" }
         }
       }
     },

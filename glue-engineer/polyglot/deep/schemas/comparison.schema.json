@@ -3,9 +3,17 @@
   "title": "Comparison Report",
   "description": "Structured comparison of multiple repository architecture reports",
   "type": "object",
-  "required": ["project", "matrix", "comparisons", "ranking"],
+  "required": ["status", "project", "candidate_count", "cloned_count", "clone_failures", "matrix", "comparisons", "ranking"],
   "properties": {
+    "status": { "type": "string", "enum": ["complete", "data_incomplete"] },
     "project": { "type": "string" },
+    "candidate_count": { "type": "integer", "minimum": 0 },
+    "cloned_count": { "type": "integer", "minimum": 0 },
+    "clone_failures": { "type": "array", "items": { "type": "object" } },
+    "validation_failed": { "type": "boolean" },
+    "validation_errors": { "type": "array", "items": { "type": "string" } },
+    "warning": { "type": "string" },
+    "error": { "type": "string" },
     "matrix": {
       "type": "object",
       "description": "Requirements coverage matrix",
@@ -23,11 +31,12 @@
           "items": {
             "type": "object",
             "properties": {
-              "requirement": { "type": "string" },
-              "patternProperties": {
-                "^[a-zA-Z0-9_-]+$": { "type": "string", "enum": ["supported", "partial", "missing"] }
-              }
-            }
+              "requirement": { "type": "string" }
+            },
+            "patternProperties": {
+              "^[A-Za-z0-9_-]+$": { "type": "string", "enum": ["supported", "partial", "missing"] }
+            },
+            "additionalProperties": false
           }
         }
       }

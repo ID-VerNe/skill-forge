@@ -46,7 +46,7 @@ DEFAULT_SESSION = {
     "project": "",
     "requirements": [],
     "target_license": "",
-    "candidate_repos": [],
+    "candidate_count": 0,
     "created_at": "",
     "workflow": "glue-engineer-v4",
 }
@@ -55,6 +55,8 @@ DEFAULT_SESSION = {
 def create_session(workspace_dir: str, project: str, requirements: list, target_license: str = ""):
     """Create a new session.json and return it."""
     session = dict(DEFAULT_SESSION)
+    session["candidate_repos"] = []
+    session["clone_results"] = []
     session["project"] = project
     session["requirements"] = requirements
     session["target_license"] = target_license
@@ -66,12 +68,16 @@ def create_session(workspace_dir: str, project: str, requirements: list, target_
 
 
 def load_session(workspace_dir: str) -> dict:
-    """Load session.json from workspace."""
+    """Load a valid object from session.json, returning None if unavailable."""
     session_path = os.path.join(workspace_dir, "session.json")
     if not os.path.exists(session_path):
         return None
-    with open(session_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(session_path, "r", encoding="utf-8") as f:
+            session = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    return session if isinstance(session, dict) else None
 
 
 def save_session(workspace_dir: str, session: dict):
@@ -90,8 +96,25 @@ def add_repo_to_session(workspace_dir: str, session: dict, name: str, url: str, 
         "local_path": local_path,
         "commit": commit,
     }
-    # dedup by slug
-    session["candidate_repos"] = [r for r in session["candidate_repos"] if r["slug"] != slug]
     session["candidate_repos"].append(entry)
     save_session(workspace_dir, session)
     return entry
+
+
+def record_clone_result(workspace_dir: str, session: dict, *, name: str, url: str,
+                        slug: str, success: bool, commit: str = "", error: str = ""):
+    """Record every requested clone, including failures, in session.json."""
+    result = {
+        "name": name,
+        "url": url,
+        "slug": slug,
+        "status": "cloned" if success else "failed",
+        "commit": commit,
+        "error": "" if success else error,
+    }
+    session.setdefault("clone_results", []).append(result)
+    session["candidate_count"] = max(
+        session.get("candidate_count", 0), len(session["clone_results"])
+    )
+    save_session(workspace_dir, session)
+    return result

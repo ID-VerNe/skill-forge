@@ -17,7 +17,7 @@ Deep Mode 是对候选库的源码级深度分析。
 
 ## 执行流程
 
-deep-init → deep-pack → 由调用环境启动并行 subagent → deep-validate（jsonschema 严格 12 字段校验）→ deep-compare（coverage×0.4+confidence×0.3+evidence×0.3, DATA INCOMPLETE 抑制排名）→ deep-summarize → deep-clean 的完整管道。CLI 只准备 workspace 并生成任务 prompt，不会自行启动或调度 subagent。
+deep-init → deep-pack → 由调用环境启动并行 subagent → deep-validate（JSON Schema、候选账目和逐条需求覆盖校验）→ deep-compare（coverage×0.4+confidence×0.3+evidence×0.3, DATA INCOMPLETE 抑制排名）→ deep-summarize → deep-clean 的完整管道。CLI 只准备 workspace 并生成任务 prompt，不会自行启动或调度 subagent。
 
 ```bash
 # 重要：polyglot CLI 可以从任何目录运行，所有输出都放在当前 CWD 的 .glue/ 下。
@@ -80,4 +80,13 @@ score = coverage_ratio × 0.4 + confidence × 0.3 + min(evidence_count / 20, 1.0
 
 **覆盖率主导**：一个"自信但缺功能"的 repo（高 confidence、低 coverage）排名会低于"谦虚但全覆盖"的 repo。
 
-**数据门禁**：如果 `deep-validate` 检测到任何 repo 缺失必填字段（architecture.json 的 repo/slug/source_path/commit/one_line_summary/language/core_modules/key_types/platform_apis/known_gaps/confidence/evidence），`deep-compare` 会**抑制 ranking** 并在 comparison.md 顶部打出 `DATA INCOMPLETE` 横幅。此时不要信任排名数字——先回去跑 subagent 补全架构报告。
+**数据门禁**：只有完整候选集和有效报告都通过校验时才会生成排名。
+
+- `deep-init` 会为每个请求候选记录一次 clone 结果（成功或失败）；即使部分 clone 失败，结果和错误原因也会保留在 `session.json`。候选集不完整时，`deep-compare` 退出非零并抑制排名，不能把成功 clone 的子集当成完整比较。
+- 每个成功 clone 的 `architecture.json` 必须包含全部必填字段，并通过 JSON Schema 的类型、结构和枚举校验；架构报告中的 `slug`、`commit` 必须与 session 中克隆结果一致。
+- 每条 session requirement 在每份架构报告的 `known_gaps` 中必须恰好出现一次。匹配规则是空格规范化后忽略大小写的精确匹配；缺项、重复项、额外项均阻止排名。
+- session 的候选计数/clone 记录、唯一安全 slug、成功克隆列表和架构产物必须互相一致。损坏或形状错误的 session、架构 JSON、证据、manifest 等也会阻止排名，而不是被当成空数据继续计算。
+- `deep-summarize` 会再次校验当前 session 和架构产物，并重算 coverage matrix 与 ranking；缺失/损坏/过期或被修改的 `comparison.json` 不能单靠 `status: complete` 通过门禁。任何不完整状态都会在总结中显示 `DATA INCOMPLETE`、失败原因并隐藏 top candidate，同时返回非零退出码。
+- `deep-init` 对 slug 做大小写不敏感的冲突检测，确保在 Windows 等大小写不敏感的文件系统上不同候选也不会写入同一目录。
+
+遇到 `DATA INCOMPLETE` 时不要信任或引用任何排名数字；按 `comparison.md` / `final-report-draft.md` 中列出的错误修复 session 或重新生成架构报告，然后依次重跑 `deep-validate`、`deep-compare` 和 `deep-summarize`。
