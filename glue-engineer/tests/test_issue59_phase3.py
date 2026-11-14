@@ -246,6 +246,69 @@ class DeepCompletenessTests(unittest.TestCase):
         self.assertIn("invalid", corrupt_result["error"])
         self.assertIn("invalid or unreadable", generate_draft(str(self.root)))
 
+    # @lat: [[tests#Issue 59 Phase 3#deep-summarize returns nonzero for incomplete data]]
+    def test_summarize_returns_nonzero_for_incomplete_data_and_zero_when_complete(self):
+        import argparse
+
+        from polyglot.commands.deep import cmd_deep_summarize
+        from polyglot.deep.comparer import compare_all
+        from polyglot.deep.summarizer import main
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(str(self.root)), 1)
+        self.assertIn("DATA INCOMPLETE", (self.root / "final-report-draft.md").read_text(encoding="utf-8"))
+        self.assertIn("incomplete data", output.getvalue())
+
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            cmd_deep_summarize(argparse.Namespace(dir=str(self.root)))
+        self.assertEqual(raised.exception.code, 1)
+
+        self.write_session()
+        self.write_valid_artifacts()
+        (self.root / "comparison.json").write_text(
+            json.dumps(compare_all(str(self.root))), encoding="utf-8"
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(str(self.root)), 0)
+
+        comparison = json.loads((self.root / "comparison.json").read_text(encoding="utf-8"))
+        comparison["status"] = "data_incomplete"
+        comparison["validation_failed"] = True
+        comparison["validation_errors"] = ["candidate data is incomplete"]
+        (self.root / "comparison.json").write_text(json.dumps(comparison), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(str(self.root)), 2)
+
+    # @lat: [[tests#Issue 59 Phase 3#deep-init avoids case-insensitive slug collisions]]
+    def test_deep_init_avoids_case_insensitive_slug_collisions(self):
+        import argparse
+
+        from polyglot.commands.deep import cmd_deep_init
+
+        args = argparse.Namespace(
+            dir=str(self.root / "initialized"),
+            project="test-project",
+            requirements=["device detection"],
+            target_license="",
+            repos=[
+                "https://github.com/Owner/Repo",
+                "https://github.com/owner/repo",
+            ],
+        )
+        with patch(
+            "polyglot.deep.repo_resolver.clone_repo",
+            return_value={"success": True, "commit": "abc123", "error": ""},
+        ):
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_deep_init(args)
+
+        session = json.loads((Path(args.dir) / "session.json").read_text(encoding="utf-8"))
+        slugs = [repo["slug"] for repo in session["candidate_repos"]]
+        self.assertEqual(len(slugs), 2)
+        self.assertEqual(len({slug.casefold() for slug in slugs}), 2)
+        self.assertEqual(session["candidate_count"], 2)
+
     def test_malformed_session_shapes_fail_closed_without_crashing(self):
         (self.root / "session.json").write_text(json.dumps({
             "project": "test-project",

@@ -44,7 +44,7 @@ Reference: [[polyglot/deep/validator.py]]
 
 Clone failures, invalid candidate accounting, or validation errors produce a `data_incomplete` result with reasons, suppress ranking, and return a non-zero CLI exit code.
 
-`summarizer.py` revalidates the current session/artifacts and recomputes the deterministic matrix and ranking. It does not trust a saved `comparison.json` solely because its status says `complete`; missing, corrupt, stale, or inconsistent comparison data results in a `DATA INCOMPLETE` report with no top candidate.
+`summarizer.py` revalidates the current session/artifacts and recomputes the deterministic matrix and ranking. It does not trust a saved `comparison.json` solely because its status says `complete`; missing, corrupt, stale, or inconsistent comparison data results in a `DATA INCOMPLETE` report with no top candidate and a non-zero CLI exit code.
 
 Reference: [[polyglot/deep/comparer.py]]
 

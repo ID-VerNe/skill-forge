@@ -52,6 +52,12 @@ Verify that `jsonschema` is listed in the Polyglot runtime requirements.
 
 Offline regression tests for candidate accounting, requirement coverage, and ranking integrity live in `test_issue59_phase3.py`.
 
+### deep-summarize returns nonzero for incomplete data
+Verify that `deep-summarize` writes its diagnostic report but exits nonzero when session or comparison data is incomplete, and exits zero for a complete report.
+
+### deep-init avoids case-insensitive slug collisions
+Verify that repository URLs differing only by letter case are assigned distinct slugs so their checkout directories cannot alias on case-insensitive filesystems.
+
 ### License compatibility engine
 Verify that `license.py` correctly classifies SPDX identifiers into the right reuse mode categories.
 

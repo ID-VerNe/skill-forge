@@ -67,13 +67,19 @@ def cmd_deep_init(args):
     success_count = 0
     fail_count = 0
 
-    requested_slugs = set()
+    requested_slug_keys = set()
     for candidate_index, url in enumerate(args.repos, start=1):
-        slug = url_to_slug(url)
-        if slug in requested_slugs:
+        base_slug = url_to_slug(url)
+        slug = base_slug
+        if slug.casefold() in requested_slug_keys:
             digest = hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:10]
-            slug = f"{slug}-{digest}-{candidate_index}"
-        requested_slugs.add(slug)
+            suffix = f"{digest}-{candidate_index}"
+            slug = f"{base_slug}-{suffix}"
+            collision_index = 1
+            while slug.casefold() in requested_slug_keys:
+                slug = f"{base_slug}-{suffix}-{collision_index}"
+                collision_index += 1
+        requested_slug_keys.add(slug.casefold())
         rd = repo_dir(workspace, slug)
         src = os.path.join(rd, "source")
 

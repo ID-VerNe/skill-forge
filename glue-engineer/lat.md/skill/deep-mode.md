@@ -86,6 +86,7 @@ score = coverage_ratio × 0.4 + confidence × 0.3 + min(evidence_count / 20, 1.0
 - 每个成功 clone 的 `architecture.json` 必须包含全部必填字段，并通过 JSON Schema 的类型、结构和枚举校验；架构报告中的 `slug`、`commit` 必须与 session 中克隆结果一致。
 - 每条 session requirement 在每份架构报告的 `known_gaps` 中必须恰好出现一次。匹配规则是空格规范化后忽略大小写的精确匹配；缺项、重复项、额外项均阻止排名。
 - session 的候选计数/clone 记录、唯一安全 slug、成功克隆列表和架构产物必须互相一致。损坏或形状错误的 session、架构 JSON、证据、manifest 等也会阻止排名，而不是被当成空数据继续计算。
-- `deep-summarize` 会再次校验当前 session 和架构产物，并重算 coverage matrix 与 ranking；缺失/损坏/过期或被修改的 `comparison.json` 不能单靠 `status: complete` 通过门禁。任何不完整状态都会在总结中显示 `DATA INCOMPLETE`、失败原因并隐藏 top candidate。
+- `deep-summarize` 会再次校验当前 session 和架构产物，并重算 coverage matrix 与 ranking；缺失/损坏/过期或被修改的 `comparison.json` 不能单靠 `status: complete` 通过门禁。任何不完整状态都会在总结中显示 `DATA INCOMPLETE`、失败原因并隐藏 top candidate，同时返回非零退出码。
+- `deep-init` 对 slug 做大小写不敏感的冲突检测，确保在 Windows 等大小写不敏感的文件系统上不同候选也不会写入同一目录。
 
 遇到 `DATA INCOMPLETE` 时不要信任或引用任何排名数字；按 `comparison.md` / `final-report-draft.md` 中列出的错误修复 session 或重新生成架构报告，然后依次重跑 `deep-validate`、`deep-compare` 和 `deep-summarize`。
