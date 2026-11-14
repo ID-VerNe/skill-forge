@@ -55,6 +55,9 @@ Offline regression tests for candidate accounting, requirement coverage, and ran
 ### deep-summarize returns nonzero for incomplete data
 Verify that `deep-summarize` writes its diagnostic report but exits nonzero when session or comparison data is incomplete, and exits zero for a complete report.
 
+### deep-summarize handles malformed comparison shapes
+Verify that valid JSON with incorrectly typed comparison matrix fields produces a diagnostic report and non-zero exit rather than an uncaught exception.
+
 ### deep-init avoids case-insensitive slug collisions
 Verify that repository URLs differing only by letter case are assigned distinct slugs so their checkout directories cannot alias on case-insensitive filesystems.
 

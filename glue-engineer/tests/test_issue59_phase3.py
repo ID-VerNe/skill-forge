@@ -280,6 +280,26 @@ class DeepCompletenessTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(main(str(self.root)), 2)
 
+    # @lat: [[tests#Issue 59 Phase 3#deep-summarize handles malformed comparison shapes]]
+    def test_summarize_fails_closed_when_matrix_repos_is_not_an_array(self):
+        from polyglot.deep.comparer import compare_all
+        from polyglot.deep.summarizer import main
+
+        self.write_session()
+        self.write_valid_artifacts()
+        comparison = compare_all(str(self.root))
+        self.assertEqual(comparison["status"], "complete")
+        comparison["matrix"]["repos"] = 7
+        (self.root / "comparison.json").write_text(json.dumps(comparison), encoding="utf-8")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(str(self.root)), 2)
+
+        draft = (self.root / "final-report-draft.md").read_text(encoding="utf-8")
+        self.assertIn("DATA INCOMPLETE", draft)
+        self.assertIn("comparison candidate details do not match the current session", draft)
+        self.assertNotIn("Top candidate", draft)
+
     # @lat: [[tests#Issue 59 Phase 3#deep-init avoids case-insensitive slug collisions]]
     def test_deep_init_avoids_case_insensitive_slug_collisions(self):
         import argparse

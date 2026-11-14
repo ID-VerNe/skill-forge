@@ -127,16 +127,18 @@ def _generate_draft(workspace_dir: str) -> tuple[str, int]:
         expected_slugs = {repo["slug"] for repo in repos}
         matrix = comparison.get("matrix")
         matrix_repos = matrix.get("repos", []) if isinstance(matrix, dict) else []
+        matrix_repos_valid = isinstance(matrix_repos, list)
         matrix_slugs = {
             slug for slug in matrix_repos if isinstance(slug, str)
-        } if isinstance(matrix_repos, list) else set()
+        } if matrix_repos_valid else set()
         reported_comparisons = comparison.get("comparisons")
         comparison_slugs = {
             item.get("slug") for item in reported_comparisons
             if isinstance(item, dict) and isinstance(item.get("slug"), str)
         } if isinstance(reported_comparisons, list) else set()
-        if (matrix_slugs != expected_slugs or comparison_slugs != expected_slugs
-                or len(matrix_repos) != len(expected_slugs)
+        if (not matrix_repos_valid
+                or matrix_slugs != expected_slugs or comparison_slugs != expected_slugs
+                or (matrix_repos_valid and len(matrix_repos) != len(expected_slugs))
                 or not isinstance(comparison.get("matrix"), dict)
                 or not isinstance(matrix.get("matrix"), list)
                 or not isinstance(reported_comparisons, list)
