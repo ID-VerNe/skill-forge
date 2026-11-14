@@ -1,7 +1,9 @@
 """polyglot/commands/glue.py — cross-search / cap-list / cap-match / bridge / strategies / mvp-scope."""
 
 import json
+import keyword
 import sys
+import ast
 
 
 def add_args(sub):
@@ -27,6 +29,15 @@ def add_args(sub):
     p_bridge.add_argument("dst_lang")
     p_bridge.add_argument("dst")
     p_bridge.add_argument("--output-dir", default=".glue/search")
+    p_bridge.add_argument(
+        "--mappings",
+        help="JSON file with a top-level mappings array; only reviewed mappings are generated",
+    )
+    p_bridge.add_argument(
+        "--scaffold-only",
+        action="store_true",
+        help="Allow an empty mapping set and explicitly generate scaffold-only files",
+    )
     p_bridge.add_argument("--dry-run", action="store_true", help="Print schema without generating")
     p_bridge.add_argument("--skip-verify", action="store_true", help="Skip verification step")
     p_bridge.add_argument("--format", choices=["json", "markdown"], default="json")
@@ -117,14 +128,154 @@ def cmd_cap_match(args):
 def cmd_bridge(args):
     """Generate glue code between two libraries."""
     from polyglot.glue.glue_schema import (
-        GlueSchema, LibraryEndpoint, FunctionMapping, ParamMapping,
-        TransformRule, GlueStrategy, CapabilityAlignment, build_pair_id, now_iso,
+        GlueSchema, LibraryEndpoint, CapabilityAlignment, build_pair_id, now_iso,
     )
-    from polyglot.glue.generators import generate_glue
+    from polyglot.glue.generators import generate_glue, get_generator_for_schema
     from polyglot.glue.strategy_selector import select_strategy
     from polyglot.glue.capability_ontology import get_registry
-    from polyglot.glue.function_matcher import FunctionMatcher
     from polyglot.glue.verifier import verify_package
+
+    def fail(status, message, **details):
+        result = {"status": status, "message": message, **details}
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        raise SystemExit(2)
+
+    def valid_identifier(value):
+        return isinstance(value, str) and value.isidentifier() and not keyword.iskeyword(value)
+
+    def valid_default_expression(value):
+        if not isinstance(value, str):
+            return False
+        if not value:
+            return True
+        try:
+            ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return False
+        return True
+
+    def load_reviewed_mappings(path):
+        if not path:
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as mapping_file:
+                data = json.load(mapping_file)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read mappings JSON: {exc}") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("mappings"), list):
+            raise ValueError("Mappings file must contain a top-level 'mappings' array")
+
+        reviewed = []
+        ids = set()
+        source_functions = set()
+        mapping_fields = {
+            "mapping_id", "src_function", "dst_function", "confidence",
+            "confidence_label", "review_status", "review_note", "param_mappings",
+            "return_transform", "error_map", "code_snippet",
+        }
+        param_fields = {"src_name", "dst_name", "transform", "src_default", "dst_default"}
+        transform_fields = {"kind", "expr", "params"}
+        for index, raw in enumerate(data["mappings"]):
+            if not isinstance(raw, dict):
+                raise ValueError(f"Mapping at index {index} must be an object")
+            review_status = raw.get("review_status", "unreviewed")
+            if review_status not in ("reviewed", "unreviewed", "rejected"):
+                raise ValueError(f"Mapping at index {index} has invalid review_status: {review_status}")
+            if review_status != "reviewed":
+                continue
+
+            unknown_fields = set(raw) - mapping_fields
+            if unknown_fields:
+                raise ValueError(
+                    f"Reviewed mapping at index {index} has unsupported fields: "
+                    f"{', '.join(sorted(unknown_fields))}"
+                )
+            mapping_id = raw.get("mapping_id")
+            src_function = raw.get("src_function")
+            dst_function = raw.get("dst_function")
+            if not isinstance(mapping_id, str) or not mapping_id.strip():
+                raise ValueError(f"Mapping at index {index} must have a non-empty mapping_id")
+            if mapping_id in ids:
+                raise ValueError(f"Duplicate mapping_id: {mapping_id}")
+            ids.add(mapping_id)
+            if not valid_identifier(src_function) or not valid_identifier(dst_function):
+                raise ValueError(f"Mapping {mapping_id} must use valid Python function identifiers")
+            if src_function in source_functions:
+                raise ValueError(f"Multiple reviewed mappings define source function: {src_function}")
+            source_functions.add(src_function)
+            confidence = raw.get("confidence")
+            if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+                raise ValueError(f"Mapping {mapping_id} confidence must be a number from 0 to 1")
+            confidence_label = raw.get("confidence_label")
+            if confidence_label not in ("identical", "similar"):
+                raise ValueError(f"Reviewed mapping {mapping_id} must provide confidence_label 'identical' or 'similar'")
+            if not isinstance(raw.get("review_note", ""), str):
+                raise ValueError(f"Mapping {mapping_id} review_note must be a string")
+            if not isinstance(raw.get("error_map", {}), dict):
+                raise ValueError(f"Mapping {mapping_id} error_map must be an object")
+            if not isinstance(raw.get("code_snippet", ""), str):
+                raise ValueError(f"Mapping {mapping_id} code_snippet must be a string")
+            param_mappings = raw.get("param_mappings", [])
+            if not isinstance(param_mappings, list):
+                raise ValueError(f"Mapping {mapping_id} param_mappings must be an array")
+            source_params = set()
+            destination_params = set()
+            for param_index, param in enumerate(param_mappings):
+                if not isinstance(param, dict):
+                    raise ValueError(f"Mapping {mapping_id} parameter {param_index} must be an object")
+                unknown_param_fields = set(param) - param_fields
+                if unknown_param_fields:
+                    raise ValueError(
+                        f"Mapping {mapping_id} parameter {param_index} has unsupported fields: "
+                        f"{', '.join(sorted(unknown_param_fields))}"
+                    )
+                if not valid_identifier(param.get("src_name")) or not valid_identifier(param.get("dst_name")):
+                    raise ValueError(f"Mapping {mapping_id} parameters must use valid Python identifiers")
+                if param["src_name"] in source_params or param["dst_name"] in destination_params:
+                    raise ValueError(f"Mapping {mapping_id} contains duplicate parameter mappings")
+                source_params.add(param["src_name"])
+                destination_params.add(param["dst_name"])
+                if not valid_default_expression(param.get("src_default", "")) or not valid_default_expression(param.get("dst_default", "")):
+                    raise ValueError(f"Mapping {mapping_id} parameter defaults must be valid Python expressions")
+                transform = param.get("transform")
+                if transform is not None:
+                    if not isinstance(transform, dict):
+                        raise ValueError(f"Mapping {mapping_id} parameter transform must be an object or null")
+                    unknown_transform_fields = set(transform) - transform_fields
+                    if unknown_transform_fields:
+                        raise ValueError(f"Mapping {mapping_id} parameter transform has unsupported fields")
+                    if transform.get("kind", "identity") != "identity":
+                        raise ValueError(f"Mapping {mapping_id} uses an unsupported parameter transform")
+                    if not isinstance(transform.get("expr", ""), str) or not isinstance(transform.get("params", {}), dict):
+                        raise ValueError(f"Mapping {mapping_id} parameter transform fields are invalid")
+            return_transform = raw.get("return_transform")
+            if return_transform is not None:
+                if not isinstance(return_transform, dict):
+                    raise ValueError(f"Mapping {mapping_id} return_transform must be an object or null")
+                unknown_transform_fields = set(return_transform) - transform_fields
+                if unknown_transform_fields:
+                    raise ValueError(f"Mapping {mapping_id} return transform has unsupported fields")
+                if return_transform.get("kind", "identity") != "identity":
+                    raise ValueError(f"Mapping {mapping_id} uses an unsupported return transform")
+                if not isinstance(return_transform.get("expr", ""), str) or not isinstance(return_transform.get("params", {}), dict):
+                    raise ValueError(f"Mapping {mapping_id} return transform fields are invalid")
+            reviewed.append(dict(raw))
+        return reviewed
+
+    try:
+        mappings = load_reviewed_mappings(getattr(args, "mappings", None))
+    except ValueError as exc:
+        fail("input_invalid", str(exc), mappings_path=getattr(args, "mappings", None))
+
+    scaffold_requested = bool(getattr(args, "scaffold_only", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    if not mappings and not scaffold_requested and not dry_run:
+        fail(
+            "mappings_required",
+            "No reviewed function mappings were provided. Use --mappings <json>; "
+            "use --scaffold-only only when you explicitly want an unmapped scaffold.",
+            mappings_count=0,
+        )
 
     # Build library endpoints
     src = LibraryEndpoint(name=args.src, language=args.src_lang, role="source")
@@ -148,47 +299,91 @@ def cmd_bridge(args):
     # Select strategy
     strategy = select_strategy(src, dst, alignment)
 
-    # Create empty mappings (user can augment with --mapping flags later)
-    mappings = []
-
     schema = GlueSchema(
         src=src,
         dst=dst,
         pair_id=pair_id,
         strategy=strategy,
         mappings=mappings,
+        scaffold_only=scaffold_requested and not mappings,
         capability_alignment=alignment,
         generated_at=now_iso(),
     )
 
-    if args.dry_run:
-        print(json.dumps(json.loads(schema.to_json()), indent=2, ensure_ascii=False))
+    if dry_run:
+        print(json.dumps({
+            "status": "mappings_required" if not mappings and not scaffold_requested else "dry_run",
+            "schema": json.loads(schema.to_json()),
+            "mappings_count": len(mappings),
+            "scaffold_only": schema.scaffold_only,
+        }, indent=2, ensure_ascii=False))
         return
+
+    # Resolve and validate the selected generator before creating any output.
+    try:
+        generator = get_generator_for_schema(schema)
+    except ValueError as exc:
+        fail("unsupported_strategy", str(exc), strategy=strategy.mode)
+
+    # Only the reviewed, identity-mapped Python import slice is executable today.
+    if strategy.mode == "import" and mappings:
+        src_language = src.language
+        dst_language = dst.language
+        if src_language != "python" or dst_language != "python":
+            fail(
+                "unsupported_strategy",
+                "The import generator currently implements only Python-to-Python mappings.",
+                strategy=strategy.mode,
+            )
+        for mapping in mappings:
+            if any(param.get("dst_name") == "#MISSING" for param in mapping.get("param_mappings", [])):
+                fail("mapping_unsupported", f"Mapping {mapping['mapping_id']} has an unmapped parameter")
+
+    schema.scaffold_only = schema.scaffold_only or generator.get_metadata().implementation_status != "functional"
 
     # Generate code
     output_dir = args.output_dir or ".glue/search"
     package = generate_glue(schema, output_dir)
 
     output_summary = {
+        "status": "scaffold_only" if schema.scaffold_only else "generated",
         "pair_id": pair_id,
         "strategy": strategy.mode,
         "files_generated": len(package.output_paths),
         "output_dir": output_dir,
         "alignment_score": alignment.overall_score,
+        "mappings_count": len(mappings),
+        "reviewed_mappings_count": len(mappings),
+        "scaffold_only": schema.scaffold_only,
+        "generator_status": generator.get_metadata().implementation_status,
     }
-    print(json.dumps(output_summary, indent=2, ensure_ascii=False))
-    print(f"\n[v] Generated {len(package.output_paths)} files in {output_dir}/{pair_id}/")
 
     # Run verification
     if not args.skip_verify:
-        print(f"\n[*] Running verification...")
         report = verify_package(package)
-        if args.format == "json":
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            from polyglot.glue.verifier import VerificationReport
-            vr = VerificationReport(**report)
-            print(vr.summary())
+        output_summary["verification"] = report
+
+    if getattr(args, "format", "json") == "json":
+        print(json.dumps(output_summary, indent=2, ensure_ascii=False))
+    else:
+        print(f"[{output_summary['status']}] {pair_id} via {strategy.mode}")
+        print(f"  Mappings: {len(mappings)} reviewed; files: {len(package.output_paths)}")
+        print(f"  Output: {output_dir}/{pair_id}/")
+        if "verification" in output_summary:
+            from polyglot.glue.verifier import VerificationReport, VerificationLevel
+
+            report_data = output_summary["verification"]
+            levels = {
+                name: VerificationLevel(name=name, **details)
+                for name, details in report_data["levels"].items()
+            }
+            print(VerificationReport(
+                package_id=report_data["package_id"],
+                verified_at=report_data["verified_at"],
+                levels=levels,
+                overall=report_data["overall"],
+                disclaimer=report_data["disclaimer"],
+            ).summary())
 
 
 def cmd_mvp_scope(args):

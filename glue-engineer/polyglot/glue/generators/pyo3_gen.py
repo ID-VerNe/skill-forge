@@ -44,6 +44,7 @@ class PyO3Generator(PluginInterface):
         target_languages=("rust",),
         confidence="low",
         version="1.0.0",
+        implementation_status="scaffold",
     )
 
     def generate(self, schema: GlueSchema, output_dir: str = ".glue/search") -> GlueOutputPackage:

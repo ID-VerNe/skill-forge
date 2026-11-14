@@ -51,6 +51,25 @@ Verify that `jsonschema` is listed in the Polyglot runtime requirements.
 ### License compatibility engine
 Verify that `license.py` correctly classifies SPDX identifiers into the right reuse mode categories.
 
+## Issue 59 Phase 2
+
+Regression tests for bridge mapping integrity and generator status live in `test_issue59_phase2.py`.
+
+### Bridge requires reviewed mappings or explicit scaffold mode
+Verify that an empty mapping set cannot generate files by default, while `--scaffold-only` emits an explicitly labeled scaffold.
+
+### Only reviewed mappings reach generation
+Verify that unreviewed candidates do not enter the serialized schema or generated wrapper, and reviewed Python mappings forward named parameters correctly.
+
+### Bridge rejects invalid input and unsupported language pairs
+Verify malformed mapping JSON and unsupported generator language combinations return machine-readable errors before creating output.
+
+### Python mapping calls execute against fixture modules
+Compile and execute generated Python glue against temporary source/destination fixture modules to verify the supported vertical slice.
+
+### Verification distinguishes syntax from runtime checks
+Verify Python syntax checks pass independently while runtime execution is reported as `not_run` by the structural verifier.
+
 ### MVP scoping produces P0/P1/P2
 Verify that `mvp-scope` assigns priority levels to features and produces a sorted output.
 

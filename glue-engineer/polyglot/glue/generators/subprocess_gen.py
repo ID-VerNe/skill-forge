@@ -40,6 +40,7 @@ class SubprocessGenerator(PluginInterface):
         target_languages=("javascript", "rust", "java", "kotlin", "c_cpp"),
         confidence="medium",
         version="1.0.0",
+        implementation_status="scaffold",
     )
 
     def generate(self, schema: GlueSchema, output_dir: str = ".glue/search") -> GlueOutputPackage:

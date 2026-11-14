@@ -89,6 +89,7 @@ class GlueSchema:
 
     # Interface mapping
     mappings: list = field(default_factory=list)  # list[FunctionMapping]
+    scaffold_only: bool = False      # true when no API mappings or generator is scaffold-only
 
     # Capability alignment (pre-computed compatibility)
     capability_alignment: Optional[CapabilityAlignment] = None
@@ -126,6 +127,7 @@ class GlueSchema:
         if "mappings" in data:
             schema.mappings = [GlueSchema._mapping_from_dict(m) for m in data["mappings"]]
         schema.pair_id = data.get("pair_id", "")
+        schema.scaffold_only = data.get("scaffold_only", False)
         schema.generated_at = data.get("generated_at", "")
         schema.version = data.get("version", "1.0.0")
         schema.output_dir = data.get("output_dir", "")
@@ -165,10 +167,16 @@ class GlueSchema:
             error_map=d.get("error_map", {}),
         )
         if "param_mappings" in d:
-            mapping.param_mappings = [
-                ParamMapping(**p) if isinstance(p, dict) else p
-                for p in d["param_mappings"]
-            ]
+            mapping.param_mappings = []
+            for p in d["param_mappings"]:
+                if not isinstance(p, dict):
+                    mapping.param_mappings.append(p)
+                    continue
+                param_data = dict(p)
+                transform = param_data.get("transform")
+                if isinstance(transform, dict):
+                    param_data["transform"] = TransformRule(**transform)
+                mapping.param_mappings.append(ParamMapping(**param_data))
         if "return_transform" in d and d["return_transform"]:
             rt = d["return_transform"]
             mapping.return_transform = TransformRule(**rt) if isinstance(rt, dict) else rt

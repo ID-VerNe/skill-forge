@@ -77,20 +77,25 @@ python -m polyglot cap-match python requests rust reqwest
 
 ## 胶水代码生成类
 
-基于策略矩阵自动生成桥接代码,支持 dry-run 和跳过验证。
+基于策略矩阵生成桥接代码。正式生成必须提供显式审核的 JSON 映射；空映射仅能通过 `--scaffold-only` 明确生成。当前可运行纵向切片为 Python→Python 的 identity 参数映射，其他生成器按 metadata 标记为 scaffold。验证器做结构和 Python 语法检查，不会执行桥接调用。
 
 ```bash
 # 查看可用桥接策略
 python -m polyglot strategies
 
-# Dry-run：只看 schema 不生成
+# Dry-run：只看 schema，不生成文件（缺少审核映射时会报告 mappings_required）
 python -m polyglot bridge --dry-run python orjson rust serde_json
 
-# 生成胶水代码 + 自动验证
-python -m polyglot bridge python orjson rust serde_json
+# mappings.json 至少包含 mappings 数组；只有 review_status=reviewed 的项目参与生成
+# 每项需要 mapping_id、src_function、dst_function、confidence、confidence_label（identical 或 similar）
+# 可选 param_mappings: [{"src_name":"url","dst_name":"address"}]
+python -m polyglot bridge python requests python httpx --mappings ./mappings.json
 
-# 跳过验证（只生成）
-python -m polyglot bridge python requests python httpx --skip-verify
+# 显式生成空映射 scaffold（不会声称实现了桥接行为）
+python -m polyglot bridge python requests python httpx --scaffold-only
+
+# 跳过结构/语法验证
+python -m polyglot bridge python requests python httpx --mappings ./mappings.json --skip-verify
 
 # 指定输出目录
 python -m polyglot bridge python pandas python polars --output-dir ./my-bridges
