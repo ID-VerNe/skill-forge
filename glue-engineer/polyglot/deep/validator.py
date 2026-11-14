@@ -2,7 +2,7 @@
 
 import json
 import os
-import sys
+import re
 
 
 def validate_architecture_schema(arch: dict) -> list:
@@ -38,7 +38,7 @@ def validate_architecture_schema(arch: dict) -> list:
             path = " → ".join(str(p) for p in err.absolute_path) if err.absolute_path else "root"
             errors.append(("x", f"schema violation at '{path}': {err.message}"))
     except jsonschema.SchemaError as e:
-        errors.append(("!", f"schema file itself is invalid: {e.message}"))
+        errors.append(("x", f"schema file itself is invalid: {e.message}"))
     return errors
 
 
@@ -149,8 +149,11 @@ def validate_repo_artifacts(workspace_dir: str, slug: str, include_reuse_map: bo
             with open(paths["architecture_json"], "r", encoding="utf-8") as f:
                 arch = json.load(f)
             results.append(("v", "architecture.json is valid JSON"))
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
             results.append(("x", f"architecture.json is invalid JSON: {e}"))
+            arch = {}
+        if not isinstance(arch, dict):
+            results.append(("x", "architecture.json root must be an object"))
             arch = {}
     else:
         results.append(("x", "architecture.json missing"))
@@ -170,6 +173,20 @@ def validate_repo_artifacts(workspace_dir: str, slug: str, include_reuse_map: bo
         # 3b. Strict schema validation (type/structure/enum) via jsonschema
         results.extend(validate_architecture_schema(arch))
 
+        repos = session.get("candidate_repos", []) if isinstance(session, dict) else []
+        repo = next(
+            (entry for entry in repos if isinstance(entry, dict) and entry.get("slug") == slug),
+            None,
+        ) if isinstance(repos, list) else None
+        if arch.get("slug") != slug:
+            results.append(("x", f"architecture.json slug does not match candidate slug: {slug}"))
+        if repo and arch.get("commit") != repo.get("commit"):
+            results.append(("x", f"architecture.json commit does not match cloned candidate commit: {slug}"))
+
+        # 3c. Every user requirement must have exactly one explicit coverage entry.
+        requirements = session.get("requirements", []) if isinstance(session, dict) else []
+        results.extend(validate_requirement_coverage(arch, requirements))
+
     # 4. confidence in 0-1
     conf = arch.get("confidence", -1)
     if isinstance(conf, (int, float)) and 0.0 <= conf <= 1.0:
@@ -179,26 +196,31 @@ def validate_repo_artifacts(workspace_dir: str, slug: str, include_reuse_map: bo
 
     # 5. evidence non-empty
     evidence = arch.get("evidence", [])
-    if evidence and len(evidence) > 0:
+    if isinstance(evidence, list) and evidence:
         # Check each evidence has required fields
-        bad_evidence = [e for e in evidence if not all(k in e for k in ("claim", "file", "line_start", "line_end"))]
+        bad_evidence = [
+            e for e in evidence
+            if not isinstance(e, dict) or not all(k in e for k in ("claim", "file", "line_start", "line_end"))
+        ]
         if bad_evidence:
-            results.append(("!", f"{len(bad_evidence)} evidence entries missing required fields"))
+            results.append(("x", f"{len(bad_evidence)} evidence entries missing required fields"))
         else:
             results.append(("v", f"{len(evidence)} evidence entries with complete fields"))
     else:
-        results.append(("x", "evidence array is empty or missing"))
+        results.append(("x", "evidence must be a non-empty array"))
 
     # 6. source_manifest.json exists
     if os.path.exists(paths["source_manifest"]):
         try:
             with open(paths["source_manifest"], "r", encoding="utf-8") as f:
                 manifest = json.load(f)
-            if "files_read" in manifest and len(manifest["files_read"]) > 0:
+            if not isinstance(manifest, dict):
+                results.append(("x", "source_manifest.json root must be an object"))
+            elif isinstance(manifest.get("files_read"), list) and manifest["files_read"]:
                 results.append(("v", f"source_manifest.json: {len(manifest['files_read'])} files read"))
             else:
-                results.append(("!", "source_manifest.json exists but files_read is empty"))
-        except json.JSONDecodeError:
+                results.append(("x", "source_manifest.json files_read must be a non-empty array"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             results.append(("x", "source_manifest.json is invalid JSON"))
     else:
         results.append(("x", "source_manifest.json missing"))
@@ -218,6 +240,170 @@ def validate_repo_artifacts(workspace_dir: str, slug: str, include_reuse_map: bo
     return results
 
 
+def validate_requirement_coverage(arch: dict, requirements: list) -> list:
+    """Require exactly one well-formed known-gap row for each session requirement."""
+    results = []
+    if not isinstance(requirements, list) or not requirements:
+        return [("x", "session requirements must contain at least one requirement")]
+    if not isinstance(arch, dict):
+        return [("x", "architecture report must be a JSON object")]
+
+    gaps = arch.get("known_gaps")
+    if not isinstance(gaps, list):
+        return [("x", "known_gaps must be an array to validate requirement coverage")]
+
+    def normalize(value):
+        return " ".join(value.split()).casefold() if isinstance(value, str) else ""
+
+    normalized_gaps = {}
+    for index, gap in enumerate(gaps):
+        if not isinstance(gap, dict):
+            results.append(("x", f"known_gaps[{index}] must be an object"))
+            continue
+        key = normalize(gap.get("requirement"))
+        if not key:
+            results.append(("x", f"known_gaps[{index}].requirement must be a non-empty string"))
+            continue
+        normalized_gaps.setdefault(key, []).append(index)
+
+    seen_requirements = set()
+    for index, requirement in enumerate(requirements):
+        key = normalize(requirement)
+        if not key:
+            results.append(("x", f"session requirements[{index}] must be a non-empty string"))
+            continue
+        if key in seen_requirements:
+            results.append(("x", f"duplicate session requirement: {requirement}"))
+            continue
+        seen_requirements.add(key)
+        matches = normalized_gaps.get(key, [])
+        if not matches:
+            results.append(("x", f"known_gaps has no entry for requirement: {requirement}"))
+        elif len(matches) > 1:
+            results.append(("x", f"known_gaps has duplicate entries for requirement: {requirement}"))
+
+    required_keys = {normalize(requirement) for requirement in requirements if normalize(requirement)}
+    for key, indexes in normalized_gaps.items():
+        if key not in required_keys:
+            results.append(("x", f"known_gaps[{indexes[0]}] does not match any session requirement: {key}"))
+
+    if not results:
+        results.append(("v", f"known_gaps covers all {len(requirements)} session requirements exactly once"))
+    return results
+
+
+def validate_session_completeness(session: dict) -> list:
+    """Validate candidate accounting and reject empty/incomplete sessions."""
+    results = []
+    if not isinstance(session, dict):
+        return [("x", "session.json must contain a JSON object")]
+    repos = session.get("candidate_repos", [])
+    clone_results = session.get("clone_results")
+    candidate_count = session.get("candidate_count")
+
+    if not isinstance(repos, list) or not repos:
+        results.append(("x", "session has no successfully cloned candidate repositories"))
+        repos = []
+    repo_slugs = []
+    for index, repo in enumerate(repos):
+        if not isinstance(repo, dict):
+            results.append(("x", f"candidate_repos[{index}] must be an object"))
+            continue
+        slug = repo.get("slug")
+        if not isinstance(slug, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", slug):
+            results.append(("x", f"candidate_repos[{index}].slug must be a non-empty filesystem-safe string"))
+        else:
+            repo_slugs.append(slug)
+        for field in ("name", "url", "local_path", "commit"):
+            value = repo.get(field)
+            if not isinstance(value, str) or not value.strip():
+                results.append(("x", f"candidate_repos[{index}].{field} must be a non-empty string"))
+    if len(repo_slugs) != len(set(repo_slugs)):
+        results.append(("x", "candidate_repos contains duplicate slugs"))
+    requirements = session.get("requirements")
+    if not isinstance(requirements, list) or not requirements:
+        results.append(("x", "session has no requirements; coverage ranking is undefined"))
+    elif any(not isinstance(requirement, str) or not requirement.strip()
+             for requirement in requirements):
+        results.append(("x", "session requirements must be non-empty strings"))
+    else:
+        normalized_requirements = [" ".join(requirement.split()).casefold() for requirement in requirements]
+        if len(normalized_requirements) != len(set(normalized_requirements)):
+            results.append(("x", "session requirements contain duplicates after normalization"))
+
+    for field in ("project", "created_at", "workflow"):
+        if not isinstance(session.get(field), str) or not session[field].strip():
+            results.append(("x", f"session {field} must be a non-empty string"))
+
+    if not isinstance(clone_results, list):
+        results.append(("x", "session clone_results must be an array recording every requested candidate"))
+        clone_results = []
+
+    if not isinstance(candidate_count, int) or isinstance(candidate_count, bool) or candidate_count < 1:
+        results.append(("x", "candidate_count must be a positive integer"))
+    if candidate_count != len(clone_results):
+        results.append(("x", f"candidate_count ({candidate_count}) does not match recorded clone results ({len(clone_results)})"))
+
+    if len(clone_results) != len(repos) and not any(
+        isinstance(item, dict) and item.get("status") == "failed" for item in clone_results
+    ):
+        results.append(("x", f"recorded candidate count ({len(clone_results)}) does not match cloned candidates ({len(repos)})"))
+
+    seen_slugs = set()
+    clone_results_by_slug = {}
+    for index, item in enumerate(clone_results):
+        if not isinstance(item, dict):
+            results.append(("x", f"clone_results[{index}] must be an object"))
+            continue
+        slug = item.get("slug")
+        if not isinstance(slug, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", slug):
+            results.append(("x", f"clone_results[{index}].slug must be a non-empty filesystem-safe string"))
+            slug = None
+        elif slug in seen_slugs:
+            results.append(("x", f"duplicate candidate slug in clone_results: {slug}"))
+        if slug is not None:
+            seen_slugs.add(slug)
+            clone_results_by_slug[slug] = item
+        for field in ("name", "url", "commit", "error"):
+            value = item.get(field)
+            must_be_non_empty = field in ("name", "url")
+            if not isinstance(value, str) or (must_be_non_empty and not value.strip()):
+                qualifier = "non-empty " if must_be_non_empty else ""
+                results.append(("x", f"clone_results[{index}].{field} must be a {qualifier}string"))
+
+        if item.get("status") not in ("cloned", "failed"):
+            results.append(("x", f"clone_results[{index}].status must be 'cloned' or 'failed'"))
+            continue
+        if item["status"] == "failed":
+            error = item.get("error")
+            if not isinstance(error, str) or not error.strip():
+                error = "unknown error"
+            results.append(("x", f"clone failed for {item.get('url') or slug or 'unknown candidate'}: {error}"))
+        elif not isinstance(item.get("commit"), str) or not item["commit"].strip():
+            results.append(("x", f"successful clone has no commit hash: {slug or 'unknown candidate'}"))
+
+    cloned_slugs = {
+        item.get("slug") for item in clone_results
+        if isinstance(item, dict) and item.get("status") == "cloned"
+        and isinstance(item.get("slug"), str)
+    }
+    if cloned_slugs != set(repo_slugs):
+        results.append(("x", "recorded successful clone slugs do not match candidate_repos slugs"))
+    for repo in repos:
+        if not isinstance(repo, dict) or not isinstance(repo.get("slug"), str):
+            continue
+        if repo["slug"] not in clone_results_by_slug:
+            continue
+        clone = clone_results_by_slug[repo["slug"]]
+        if clone.get("status") != "cloned":
+            continue
+        for field in ("name", "url", "commit"):
+            if repo.get(field) != clone.get(field):
+                results.append(("x", f"candidate_repos {field} does not match clone result for {repo['slug']}"))
+
+    return results
+
+
 # @lat: [[deep#Key Concepts#Validation]]
 def validate_all(workspace_dir: str, include_reuse_map: bool = False) -> dict:
     """Validate artifacts for all repos in the session.
@@ -233,24 +419,35 @@ def validate_all(workspace_dir: str, include_reuse_map: bool = False) -> dict:
 
     session = load_session(workspace_dir)
     if not session:
+        session_path = os.path.join(workspace_dir, "session.json")
+        reason = (
+            "session.json is missing" if not os.path.exists(session_path)
+            else "session.json is invalid or unreadable"
+        )
         return {
-            "summary": [("x", "No session.json found in workspace")],
+            "summary": [(f"[x] {reason}",)],
             "all_pass": False,
             "exit_code": 1,
-        }
-
-    repos = session.get("candidate_repos", [])
-    if not repos:
-        return {
-            "summary": [("!", "No candidate repos in session.json")],
-            "all_pass": True,
-            "exit_code": 0,
+            "errors": [reason],
         }
 
     all_results = []
     all_pass = True
+    session_results = validate_session_completeness(session)
+    for status, msg in session_results:
+        all_results.append((f"[ {status} ] {msg}",))
+        if status == "x":
+            all_pass = False
+
+    repos = session.get("candidate_repos", [])
+    if not isinstance(repos, list):
+        repos = []
 
     for repo in repos:
+        if not isinstance(repo, dict) or not isinstance(repo.get("slug"), str):
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", repo["slug"]):
+            continue
         slug = repo["slug"]
         all_results.append((f"\n[{slug}]", ""))
         repo_results = validate_repo_artifacts(workspace_dir, slug, include_reuse_map=include_reuse_map)
@@ -263,6 +460,10 @@ def validate_all(workspace_dir: str, include_reuse_map: bool = False) -> dict:
         "summary": all_results,
         "all_pass": all_pass,
         "exit_code": 0 if all_pass else 1,
+        "errors": [
+            entry[0] for entry in all_results
+            if entry and ("[ x ]" in entry[0] or "[x]" in entry[0])
+        ],
     }
 
 

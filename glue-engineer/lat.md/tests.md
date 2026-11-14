@@ -48,6 +48,10 @@ Verify that architecture validation gives a `jsonschema` install command that wo
 ### jsonschema is declared as a runtime dependency
 Verify that `jsonschema` is listed in the Polyglot runtime requirements.
 
+## Issue 59 Phase 3
+
+Offline regression tests for candidate accounting, requirement coverage, and ranking integrity live in `test_issue59_phase3.py`.
+
 ### License compatibility engine
 Verify that `license.py` correctly classifies SPDX identifiers into the right reuse mode categories.
 

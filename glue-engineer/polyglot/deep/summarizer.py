@@ -6,6 +6,7 @@ a final-report-draft.md using template filling. No LLM calls.
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 
 
@@ -14,9 +15,24 @@ def _load_json(path: str) -> dict:
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
+
+
+def _load_json_with_status(path: str):
+    """Load a JSON object and preserve missing/corrupt-file diagnostics."""
+    if not os.path.exists(path):
+        return {}, f"{os.path.basename(path)} is missing"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        return {}, f"{os.path.basename(path)} is invalid: {exc}"
+    if not isinstance(value, dict):
+        return {}, f"{os.path.basename(path)} must contain a JSON object"
+    return value, ""
 
 
 def _load_architecture(workspace_dir: str, slug: str) -> dict:
@@ -36,15 +52,133 @@ def generate_draft(workspace_dir: str) -> str:
 
     session = load_session(workspace_dir)
     if not session:
-        return "# Error: No session.json found in workspace\n"
+        session_path = os.path.join(workspace_dir, "session.json")
+        reason = (
+            "session.json is missing" if not os.path.exists(session_path)
+            else "session.json is invalid or unreadable"
+        )
+        comparison, comparison_error = _load_json_with_status(
+            os.path.join(workspace_dir, "comparison.json")
+        )
+        lines = [
+            "# Deep Analysis: Unavailable",
+            "",
+            "> **DATA INCOMPLETE — ranking suppressed.**",
+            "",
+            "## Completeness issues",
+            "",
+            f"- {reason}",
+        ]
+        if comparison_error:
+            lines.append(f"- {comparison_error}")
+        failures = comparison.get("clone_failures", [])
+        for item in failures if isinstance(failures, list) else []:
+            if isinstance(item, dict):
+                lines.append(
+                    f"- Clone failed: `{item.get('url', item.get('slug', 'unknown'))}` — "
+                    f"{item.get('error') or 'unknown error'}"
+                )
+        lines.extend(["", "## Summary", "", "*Ranking suppressed because session data is unavailable.*", ""])
+        return "\n".join(lines)
 
     project = session.get("project", "Unnamed")
     requirements = session.get("requirements", [])
+    requirements = requirements if isinstance(requirements, list) else []
     repos = session.get("candidate_repos", [])
+    repos = [
+        repo for repo in repos
+        if isinstance(repo, dict)
+        and isinstance(repo.get("slug"), str)
+        and re.fullmatch(r"[A-Za-z0-9_-]+", repo["slug"])
+    ] if isinstance(repos, list) else []
 
-    # Load comparison if available
-    comparison = _load_json(os.path.join(workspace_dir, "comparison.json"))
-    comparison_available = "error" not in comparison and comparison.get("comparisons")
+    # The report must not trust a stale or hand-edited comparison gate. Validate
+    # current artifacts again and only expose ranking for a complete result.
+    from polyglot.deep.validator import validate_all
+
+    comparison, comparison_error = _load_json_with_status(
+        os.path.join(workspace_dir, "comparison.json")
+    )
+    validation = validate_all(workspace_dir)
+    incomplete_reasons = list(validation.get("errors", []))
+    if comparison_error:
+        incomplete_reasons.append(comparison_error)
+    if comparison.get("status") != "complete" or comparison.get("validation_failed"):
+        validation_errors = comparison.get("validation_errors", [])
+        if isinstance(validation_errors, list):
+            incomplete_reasons.extend(str(error) for error in validation_errors if error)
+        if comparison.get("validation_failed") and not validation_errors:
+            incomplete_reasons.append("comparison is marked validation_failed")
+        if comparison.get("status") != "complete" and not validation_errors:
+            incomplete_reasons.append(
+                f"comparison status is {comparison.get('status', 'missing or unknown')}, not complete"
+            )
+
+    if not comparison_error and comparison.get("status") == "complete":
+        expected_count = session.get("candidate_count", len(repos))
+        if comparison.get("candidate_count") != expected_count:
+            incomplete_reasons.append(
+                f"comparison candidate_count ({comparison.get('candidate_count')}) does not match session ({expected_count})"
+            )
+        if comparison.get("cloned_count") != len(repos):
+            incomplete_reasons.append(
+                f"comparison cloned_count ({comparison.get('cloned_count')}) does not match session ({len(repos)})"
+            )
+        expected_slugs = {repo["slug"] for repo in repos}
+        matrix = comparison.get("matrix")
+        matrix_repos = matrix.get("repos", []) if isinstance(matrix, dict) else []
+        matrix_slugs = {
+            slug for slug in matrix_repos if isinstance(slug, str)
+        } if isinstance(matrix_repos, list) else set()
+        reported_comparisons = comparison.get("comparisons")
+        comparison_slugs = {
+            item.get("slug") for item in reported_comparisons
+            if isinstance(item, dict) and isinstance(item.get("slug"), str)
+        } if isinstance(reported_comparisons, list) else set()
+        if (matrix_slugs != expected_slugs or comparison_slugs != expected_slugs
+                or len(matrix_repos) != len(expected_slugs)
+                or not isinstance(comparison.get("matrix"), dict)
+                or not isinstance(matrix.get("matrix"), list)
+                or not isinstance(reported_comparisons, list)
+                or len(reported_comparisons) != len(expected_slugs)):
+            incomplete_reasons.append("comparison candidate details do not match the current session")
+
+        persisted_ranking = comparison.get("ranking")
+        persisted_clone_failures = comparison.get("clone_failures")
+        if not isinstance(persisted_ranking, list) or not isinstance(persisted_clone_failures, list):
+            incomplete_reasons.append("comparison ranking or clone_failures has an invalid shape")
+        elif persisted_clone_failures:
+            incomplete_reasons.append("complete comparison contains clone failures")
+
+        # A status flag alone is not evidence that a saved comparison is sound.
+        # Recompute deterministic coverage and scores from the validated session
+        # and architecture artifacts; stale or hand-edited ranking data blocks
+        # selection even when its status still says `complete`.
+        if not incomplete_reasons:
+            from polyglot.deep.comparer import compare_all
+
+            canonical = compare_all(workspace_dir)
+            if (canonical.get("status") != "complete"
+                    or comparison.get("matrix") != canonical.get("matrix")
+                    or comparison.get("ranking") != canonical.get("ranking")):
+                incomplete_reasons.append("comparison matrix or ranking does not match current architecture data")
+
+    # Preserve order while removing duplicate messages.
+    incomplete_reasons = list(dict.fromkeys(incomplete_reasons))
+    data_incomplete = bool(incomplete_reasons)
+    comparison_available = (
+        not data_incomplete
+        and comparison.get("status") == "complete"
+        and isinstance(comparison.get("comparisons"), list)
+        and bool(comparison.get("comparisons"))
+        and isinstance(comparison.get("ranking"), list)
+        and isinstance(comparison.get("matrix"), dict)
+    )
+    clone_results = session.get("clone_results")
+    clone_failures = [
+        item for item in (clone_results if isinstance(clone_results, list) else [])
+        if isinstance(item, dict) and item.get("status") != "cloned"
+    ]
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -53,8 +187,35 @@ def generate_draft(workspace_dir: str) -> str:
     lines.append("")
     lines.append(f"**Generated**: {date_str}")
     lines.append(f"**Repos analyzed**: {len(repos)}")
+    lines.append(f"**Candidates requested**: {session.get('candidate_count', len(repos))}")
     lines.append(f"**Requirements**: {len(requirements)}")
     lines.append("")
+
+    if data_incomplete:
+        lines.append("> **DATA INCOMPLETE — ranking suppressed.** Do not use this report to select a top candidate.")
+        lines.append("")
+        lines.append("### Completeness issues")
+        lines.append("")
+        for reason in incomplete_reasons:
+            lines.append(f"- {reason}")
+        reported_failures = set()
+        failures = comparison.get("clone_failures", [])
+        for item in failures if isinstance(failures, list) else []:
+            if not isinstance(item, dict):
+                continue
+            reported_failures.add(item.get("slug"))
+            lines.append(
+                f"- Clone failed: `{item.get('url', item.get('slug', 'unknown'))}` — "
+                f"{item.get('error') or 'unknown error'}"
+            )
+        for item in clone_failures:
+            if item.get("slug") in reported_failures:
+                continue
+            lines.append(
+                f"- Clone failed: `{item.get('url', item.get('slug', 'unknown'))}` — "
+                f"{item.get('error') or 'unknown error'}"
+            )
+        lines.append("")
 
     # Section 1: Requirements
     lines.append("## Requirements")
@@ -108,11 +269,10 @@ def generate_draft(workspace_dir: str) -> str:
                     f"confidence {r['confidence']})"
                 )
             lines.append("")
-        elif comparison.get("validation_failed"):
+        else:
             lines.append("### Ranking")
             lines.append("")
-            lines.append("*Ranking suppressed — architecture reports incomplete. "
-                        "Run subagents first, then `deep-validate`.*")
+            lines.append("*Ranking suppressed because candidate or architecture data is incomplete.*")
             lines.append("")
 
     # Section 3: Repo-by-repo summaries
@@ -141,6 +301,7 @@ def generate_draft(workspace_dir: str) -> str:
 
         # Key types
         key_types = arch.get("key_types", [])
+        key_types = [item for item in key_types if isinstance(item, dict)] if isinstance(key_types, list) else []
         if key_types:
             lines.append("**Key Types:**")
             for kt in key_types[:5]:
@@ -155,6 +316,7 @@ def generate_draft(workspace_dir: str) -> str:
 
         # Platform APIs
         apis = arch.get("platform_apis", [])
+        apis = [item for item in apis if isinstance(item, dict)] if isinstance(apis, list) else []
         if apis:
             lines.append("**Platform APIs:**")
             for api in apis[:5]:
@@ -165,6 +327,7 @@ def generate_draft(workspace_dir: str) -> str:
 
         # Known gaps
         gaps = arch.get("known_gaps", [])
+        gaps = [item for item in gaps if isinstance(item, dict)] if isinstance(gaps, list) else []
         if gaps:
             lines.append("**Known Gaps:**")
             for gap in gaps:
@@ -178,6 +341,7 @@ def generate_draft(workspace_dir: str) -> str:
 
         # Evidence count
         evidence = arch.get("evidence", [])
+        evidence = evidence if isinstance(evidence, list) else []
         lines.append(f"- **Evidence items**: {len(evidence)}")
         lines.append("")
 
@@ -294,6 +458,8 @@ def generate_draft(workspace_dir: str) -> str:
             supported_count = sum(1 for s in repo_slugs if row.get(s) == "supported")
             partial_count = sum(1 for s in repo_slugs if row.get(s) == "partial")
             lines.append(f"- {row['requirement']}: {supported_count} supported, {partial_count} partial")
+    elif data_incomplete:
+        lines.append("*Ranking suppressed because candidate or architecture data is incomplete.*")
     else:
         lines.append("*Comparison data not yet available. Run `deep-compare` first.*")
     lines.append("")

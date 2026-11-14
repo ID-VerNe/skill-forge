@@ -49,6 +49,7 @@ Write the following files to the paths specified in your task prompt:
 
 2. **`architecture.json`** — Structured summary following the schema at `polyglot/deep/schemas/architecture.schema.json`. Must include:
    - `one_line_summary`, `core_modules`, `key_types`, `platform_apis`, `known_gaps`
+   - `known_gaps` must contain exactly one entry for each requirement in the task prompt; copy each requirement exactly, and do not add duplicates or unrelated requirement rows.
    - `confidence` (0.0-1.0)
    - `evidence` array — every claim must have file path and line range
 
