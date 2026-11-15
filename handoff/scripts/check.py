@@ -90,15 +90,28 @@ def same_commit(repo_dir: Path, a: str, b: str) -> bool:
     return a.lower() == b.lower()
 
 
+def split_cells(line: str) -> list[str]:
+    """按 GFM 表格切列:先按 ` | ` 切,退化时按 `|` 切(单元格里若有转义 \\| 则不再退化)。"""
+    body = line.strip("|")
+    cells = [c.strip() for c in body.split(" | ")]
+    if len(cells) != 3 and "\\|" not in body:
+        cells = [c.strip() for c in body.split("|")]
+    return cells
+
+
 def fact_rows(section: str) -> tuple[list[tuple[str, str, str]], list[str]]:
-    """解析 §1 表行,返回 (名称, 值, 第三列原文) 与无法解析的行。表头与分隔行跳过。"""
+    """解析 §1 表行,返回 (名称, 值, 第三列原文) 与无法解析的行。
+
+    任何以 `|` 开头的行都必须归入 rows 或 bad,不允许静默跳过(表格行少了 padding 空格
+    在 GFM 里仍然是合法表格行)。
+    """
     rows: list[tuple[str, str, str]] = []
     bad: list[str] = []
     for line in section.splitlines():
         s = line.strip()
-        if not (s.startswith("| ") and s.endswith(" |")):
+        if not s.startswith("|"):
             continue
-        cells = [c.strip() for c in s[2:-2].split(" | ")]
+        cells = split_cells(s)
         if cells and (cells[0] == "数字" or set(cells[0]) <= set("-: ")):
             continue
         if len(cells) != 3:
@@ -110,6 +123,8 @@ def fact_rows(section: str) -> tuple[list[tuple[str, str, str]], list[str]]:
 
 def same_value(table: str, got: str) -> bool:
     a, b = table.strip(), got.strip()
+    if not a or not b:
+        return False
     if a.isdigit() and b.isdigit():
         return int(a) == int(b)
     return a.lower() == b.lower()
@@ -125,7 +140,10 @@ def recompute(cmd: str, repo: str, repo_dir: Path, window_start: str) -> tuple[b
 
     m = re.fullmatch(r"git log (\S+) --merges", c)
     if m:
-        p = run(["git", "-C", str(repo_dir), "log", m.group(1), "--merges", "--format=%s"])
+        rev = m.group(1)
+        if rev.startswith("-"):
+            return False, f"revision 不能以 - 开头(防止被当作 git 选项): {rev[:40]}"
+        p = run(["git", "-C", str(repo_dir), "log", rev, "--merges", "--format=%s"])
         return (True, str(len(p.stdout.splitlines()))) if p.returncode == 0 \
             else (False, f"git 失败: {p.stderr.strip()[:80]}")
 

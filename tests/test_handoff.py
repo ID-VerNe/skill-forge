@@ -299,6 +299,19 @@ class HandoffTest(unittest.TestCase):
         self.assertNotEqual(result[0], 0, result)
         self.assertIn("[FAIL] 3.合并提交", result[1])
 
+    def test_rows_without_padding_are_still_recomputed(self):
+        body = self.first_draft().replace("| 仓库可见性 | PUBLIC |", "|仓库可见性|PRIVATE|")
+        self.output.write_text(body, encoding="utf-8")
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("[FAIL] 3.仓库可见性", result[1])
+
+    def test_empty_values_and_option_like_rev_are_rejected(self):
+        self.assertFalse(check.same_value("", ""))
+        ok, why = check.recompute("git log --output=/tmp/x --merges", "example/repo",
+                                  self.repo, "2024-01-01")
+        self.assertFalse(ok, why)
+
     def test_check_rejects_malformed_fact_row(self):
         body = self.first_draft().replace("| 被跟踪文件 |", "| 被跟踪文件 | extra |", 1)
         self.output.write_text(body, encoding="utf-8")
