@@ -153,10 +153,10 @@ class HandoffTest(unittest.TestCase):
                            "--head", self.head, "--today", "2024-01-03",
                            "--out", self.output, *args)
 
-    def check(self, *args, base=None):
+    def check(self, *args, base=None, head=None):
         return self.invoke(check, self.output, "--repo", "example/repo",
                            "--repo-dir", self.repo, "--baseline", base or self.base,
-                           "--head", self.head, *args)
+                           "--head", head or self.head, *args)
 
     def check_published(self, number):
         return self.invoke(check, "--repo", "example/repo", "--published", str(number))
@@ -287,6 +287,17 @@ class HandoffTest(unittest.TestCase):
         result = self.collect(*args)
         self.assertNotEqual(result[0], 0, result)
         self.assertFalse(self.output.exists())
+
+    def test_check_accepts_short_sha_for_snapshot_fields(self):
+        self.first_draft()
+        result = self.check(base=self.base[:7], head=self.head[:8])
+        self.assertEqual(result[0], 0, result)
+
+    def test_check_rejects_other_commit_as_baseline(self):
+        self.first_draft()
+        result = self.check(base=self.head[:7], head=self.head[:8])
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("[FAIL] 1.base", result[1])
 
     def test_check_prepublication_identity_and_count(self):
         self.first_draft()
