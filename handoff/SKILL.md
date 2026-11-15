@@ -88,6 +88,7 @@ python handoff/scripts/check.py draft.md --repo OWNER/REPO \
 ```
 
 使用草案 frontmatter 中的 baseline/head 作为参数,不要用后来变化的 HEAD 替代快照。
+参数按解析后的 commit 比对,短 SHA 与全 SHA 等价,但必须指向同一 commit。
 九项全过才允许发布;首份要求零份 open handoff,后续要求恰有指定 `supersedes` 旧单。
 任一条失败 → 中止,把失败项 + 怎么修贴给用户,不许跳过、不许降级。
 

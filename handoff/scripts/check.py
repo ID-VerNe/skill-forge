@@ -13,8 +13,12 @@
   8  §4 表行首 #N 必须是 issue 号(不是 PR 号)
 
 用法:
-  python check.py <draft.md> --repo OWNER/REPO --baseline 3dfc35d --head fd0ea53
+  python check.py <draft.md> --repo OWNER/REPO --baseline <sha> --head <sha>
                  [--repo-dir /path/to/clone] [--mode issue|local]
+  python check.py --repo OWNER/REPO --published <N>     # 发布后:确认 N 是唯一 open handoff
+
+frontmatter 的 baseline_commit/head_commit 与 --baseline/--head 按解析后的 commit 比对,
+短 SHA 与全 SHA 等价,但必须指向同一个 commit。
 
 退出码:0 = 全过;1 = 有 FAIL;2 = 参数/环境错。
 """
@@ -67,6 +71,22 @@ def gh(repo: str, path: str, args: list[str] | None = None) -> dict | list:
     if p.returncode != 0:
         raise RuntimeError(f"gh api 失败({p.returncode}): {' '.join(cmd)}\n{p.stderr.strip()[:300]}")
     return json.loads(p.stdout) if p.stdout.strip() else {}
+
+
+def resolve_commit(repo_dir: Path, rev: str) -> str:
+    """把 rev 解析成完整 commit SHA;解析不到时返回空串。"""
+    if not rev:
+        return ""
+    p = run(["git", "-C", str(repo_dir), "rev-parse", "--verify", f"{rev}^{{commit}}"])
+    return p.stdout.strip().lower() if p.returncode == 0 else ""
+
+
+def same_commit(repo_dir: Path, a: str, b: str) -> bool:
+    """按解析后的 commit 身份比对:短 SHA、全 SHA、tag 只要指向同一 commit 即相等。"""
+    ra, rb = resolve_commit(repo_dir, a), resolve_commit(repo_dir, b)
+    if ra and rb:
+        return ra == rb
+    return a.lower() == b.lower()
 
 
 def open_handoffs(repo: str) -> list[int]:
@@ -146,9 +166,11 @@ def main() -> int:
     ck("1.schema", "schema 值 = handoff/v1", fm.get("schema") == "handoff/v1", fm.get("schema", ""))
     ck("1.repo", "repo 值 = --repo", fm.get("repo") == args.repo, fm.get("repo", ""))
     ck("1.base", "baseline_commit = --baseline",
-       fm.get("baseline_commit", "").lower() == args.baseline.lower(), fm.get("baseline_commit", ""))
+       same_commit(repo_dir, fm.get("baseline_commit", ""), args.baseline),
+       f"草案 {fm.get('baseline_commit', '')} / 参数 {args.baseline}")
     ck("1.head", "head_commit = --head",
-       fm.get("head_commit", "").lower() == args.head.lower(), fm.get("head_commit", ""))
+       same_commit(repo_dir, fm.get("head_commit", ""), args.head),
+       f"草案 {fm.get('head_commit', '')} / 参数 {args.head}")
 
     # ---- 2. baseline 可达 ----
     print("=== check 2: baseline 是 head 的祖先 ===")
