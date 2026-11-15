@@ -8,7 +8,7 @@
   3  §1 口径表每行的复算命令在本机重跑结果与表中数字一致
   4  正文 #N 引用全部存在于该仓(issue 或 PR 均可,但 §4 表行首必须 issue)
   5  8 节骨架标题文字齐全(§1 数据口径 ... §7 无法追溯与不确定项,§7 允许空但不许省)
-  6  issue 模式下 HANDOFF.md 死文字未被改动(相对 git HEAD 无 diff)
+  6  issue 模式下已有 HANDOFF.md 无未提交改动(文件不存在时通过)
   7  issue 模式发布前 open handoff 与 supersedes 一致
   8  §4 表行首 #N 必须是 issue 号(不是 PR 号)
 
@@ -230,7 +230,7 @@ def main() -> int:
         ck(f"5.{s.split('.')[0]}", s, s in txt, "" if s in txt else "缺失")
 
     # ---- 6. HANDOFF.md 未改 ----
-    print("=== check 6: HANDOFF.md 死文字未被改动 ===")
+    print("=== check 6: HANDOFF.md 无未提交改动 ===")
     if args.mode == "local":
         print("  [SKIP] local 模式不校验 HANDOFF.md")
     else:

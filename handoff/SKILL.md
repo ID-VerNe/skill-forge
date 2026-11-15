@@ -102,8 +102,9 @@ python handoff/scripts/check.py draft.md --repo OWNER/REPO \
    首份跳过关单和追评。
 4. 发布后运行 `python handoff/scripts/check.py --repo OWNER/REPO --published N`,
    确认 N 是唯一 open handoff。检查失败则报告实际状态,不宣布成功。
-5. `HANDOFF.md` 是可选静态入口,即使缺失也能读取;如需初始化,另行获得用户授权再建文件或 PR,
-   不作为发布的一部分自动创建或 commit。
+5. `HANDOFF.md` 是可选静态入口,即使缺失也能读取;如需初始化,另行获得用户授权后再建文件或 PR,
+   不作为发布的一部分自动创建或 commit。新建或改动该文件会占住第 6 项,必须另有提交记录
+   (单独 commit 或独立 PR)后才会通过;不要在发布前留下未提交的 `HANDOFF.md`。
 
 发布前检查不是锁,多个发布者需事先协调。创建后只允许预期的新单和指定旧单同时 open;
 若发现竞争、额外或身份不符的 open 单,停止并报告,不擅自关闭其他单。

@@ -230,6 +230,17 @@ class HandoffTest(unittest.TestCase):
         self.assertIn(f"baseline_commit: {self.head}", body)
         self.assertIn("supersedes: 42", body)
 
+    def test_entry_file_must_be_committed_or_absent(self):
+        (self.repo / "HANDOFF.md").write_text("# HANDOFF\n", encoding="utf-8")
+        self.git("add", "HANDOFF.md")
+        self.git("commit", "-qm", "add handoff entry")
+        self.first_draft()
+        self.assertEqual(self.check()[0], 0)
+        (self.repo / "HANDOFF.md").write_text("# HANDOFF changed\n", encoding="utf-8")
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("[FAIL] 6", result[1])
+
     def test_previous_frontmatter_must_be_valid_and_not_body_text(self):
         bad_bodies = [
             f"baseline_commit: {self.base}\nhead_commit: {self.head}\n",
