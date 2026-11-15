@@ -33,6 +33,8 @@ os.environ["PYTHONUTF8"] = "1"
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
 HANDOFF_LABEL = "handoff"
+# 列表命令的统一上限。取满即视为可能截断,直接失败,不允许少算出数。
+LIST_LIMIT = 1000
 
 REQUIRED_FM = ["schema", "repo", "window", "baseline_commit", "head_commit", "supersedes"]
 
@@ -68,12 +70,19 @@ def gh(repo: str, path: str, args: list[str] | None = None) -> dict | list:
 
 
 def gh_list(repo: str, kind: str, **params) -> list[dict]:
-    """gh issue/pr list 的分页封装。"""
+    """gh issue/pr list 的分页封装;取满上限视为截断,硬失败而不是少算。"""
+    limit = params.pop("limit", LIST_LIMIT)
     cmd = ["gh", kind, "list", "--repo", repo, "--state", "all",
-           "--limit", "500", "--json", params.pop("fields")]
+           "--limit", str(limit), "--json", params.pop("fields")]
     for k, v in params.items():
         cmd += ["--" + k, str(v)]
-    return json.loads(run(cmd))
+    items = json.loads(run(cmd))
+    if len(items) >= limit:
+        raise RuntimeError(
+            f"{kind} list 返回 {len(items)} 条,已达上限 {limit},可能被截断;"
+            f"请用 `gh api --paginate` 复核,不要据此出数"
+        )
+    return items
 
 
 def git(repo_dir: Path, *args: str) -> str:
@@ -147,20 +156,22 @@ def collect(repo: str, repo_dir: Path, baseline: str, head: str,
     compare = gh(repo, f"compare/{baseline}...{head}")
     total_commits = compare["total_commits"]
 
-    merge_subjects = [c["commit"]["message"].split("\n")[0]
-                      for c in compare["commits"]
-                      if c["commit"]["message"].startswith("Merge pull request")]
-    pr_merges = len(merge_subjects)
-    # 全口径合并提交 = git log --merges(含本地回合 origin/main)
+    # compare 的 commits 列表最多 250 条,不能用来数合并提交;全口径一律走本地 git
     all_merges = git(repo_dir, "log", f"{baseline}..{head}", "--merges", "--format=%s").splitlines()
+    pr_merges = sum(1 for s in all_merges if s.startswith("Merge pull request"))
     local_merges = len(all_merges) - pr_merges
 
+    def in_window(stamp: str | None) -> bool:
+        """UTC 日期闭区间 [window_start, today];空值不算命中。"""
+        d = (stamp or "")[:10]
+        return bool(d) and window_start <= d <= today
+
     merged_prs = [p for p in gh_list(repo, "pr", fields="number,title,mergedAt,body")
-                  if (p.get("mergedAt") or "") >= window_start]
+                  if in_window(p.get("mergedAt"))]
     merged_prs.sort(key=lambda p: p["number"])
 
     closed_issues = [i for i in gh_list(repo, "issue", fields="number,closedAt")
-                     if (i.get("closedAt") or "") >= window_start]
+                     if in_window(i.get("closedAt"))]
     # gh issue list 的 state 字段是大写 OPEN/CLOSED
     open_issues = [i for i in gh_list(repo, "issue", fields="number,title,labels,state")
                    if i["state"] == "OPEN"
@@ -253,13 +264,13 @@ def collect(repo: str, repo_dir: Path, baseline: str, head: str,
     L.append("|---|---|---|")
     L.append(f"| 提交数(含合并提交) | {total_commits} | `gh api repos/$REPO/compare/{baseline}...{head} --jq .total_commits` |")
     L.append(f"| 合并提交 | {len(all_merges)} | `git log {baseline}..{head} --merges` 行数;全口径,其中 {pr_merges} 条 `Merge pull request`,{local_merges} 条本地回合 origin/main |")
-    L.append(f"| 合并 PR(窗口内) | {len(merged_prs)} | `gh pr list --repo $REPO --state all --limit 500 --json mergedAt` 过滤 `mergedAt >= {window_start}` |")
-    L.append(f"| 关闭 issue(窗口内) | {len(closed_issues)} | `gh issue list --repo $REPO --state all --limit 500 --json closedAt` 过滤 `closedAt >= {window_start}` |")
-    L.append(f"| 当前 open issue | {len(open_issues)} | `gh issue list --repo $REPO --state open --limit 500 --json number,labels` 排除 label `handoff` |")
+    L.append(f"| 合并 PR(窗口内) | {len(merged_prs)} | `gh pr list --repo $REPO --state all --limit {LIST_LIMIT} --json mergedAt` 过滤 `{window_start} <= mergedAt <= {today}` |")
+    L.append(f"| 关闭 issue(窗口内) | {len(closed_issues)} | `gh issue list --repo $REPO --state all --limit {LIST_LIMIT} --json closedAt` 过滤 `{window_start} <= closedAt <= {today}` |")
+    L.append(f"| 当前 open issue | {len(open_issues)} | `gh issue list --repo $REPO --state open --limit {LIST_LIMIT} --json number,labels` 排除 label `handoff` |")
     L.append(f"| 被跟踪文件 | {tracked_files} | `git ls-files` 行数 |")
     L.append(f"| 仓库可见性 | {vis} | `gh repo view $REPO --json visibility --jq .visibility` |")
     L.append("")
-    L.append(f"口径说明:提交数与合并提交按 commit 范围 `{baseline}..{head}` 计;合并 PR / 关闭 issue 按日期过滤 `>= {window_start}`。两者不等价 —— 窗口起点当天更早合并的 PR 不在这批提交里,反向也不成立;引用时不要当成同一集合。")
+    L.append(f"口径说明:提交数与合并提交按 commit 范围 `{baseline}..{head}` 计;合并 PR / 关闭 issue 按 UTC 日期闭区间 `{window_start} <= 日期 <= {today}` 过滤。两者不等价 —— 窗口起点当天更早合并的 PR 不在这批提交里,反向也不成立;引用时不要当成同一集合。")
     L.append("")
     L.append("## 2. 本窗口交付")
     L.append("")

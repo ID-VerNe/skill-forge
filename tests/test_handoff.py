@@ -309,7 +309,7 @@ class HandoffTest(unittest.TestCase):
     def test_empty_values_and_option_like_rev_are_rejected(self):
         self.assertFalse(check.same_value("", ""))
         ok, why = check.recompute("git log --output=/tmp/x --merges", "example/repo",
-                                  self.repo, "2024-01-01")
+                                  self.repo, ("2024-01-01", "2024-01-03"))
         self.assertFalse(ok, why)
 
     def test_check_rejects_malformed_fact_row(self):
@@ -335,6 +335,56 @@ class HandoffTest(unittest.TestCase):
         result = self.check()
         self.assertNotEqual(result[0], 0, result)
         self.assertIn("仓名字面量", result[1])
+
+    def test_window_right_bound_excludes_later_merges(self):
+        self.github.prs = [
+            {"number": 51, "title": "in window", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+            {"number": 52, "title": "after window", "mergedAt": "2024-01-04T00:00:00Z", "body": ""},
+        ]
+        body = self.first_draft()
+        self.assertIn("| 合并 PR(窗口内) | 1 |", body)
+        self.assertNotIn("#52", body)
+
+    def test_recompute_excludes_merges_after_window_end(self):
+        self.first_draft()
+        self.github.prs = [
+            {"number": 52, "title": "after window", "mergedAt": "2024-01-04T00:00:00Z", "body": ""},
+        ]
+        result = self.check()
+        self.assertEqual(result[0], 0, result)
+
+    def test_check_rejects_non_unified_list_limit(self):
+        body = self.first_draft().replace("--limit 1000", "--limit 1", 1)
+        self.output.write_text(body, encoding="utf-8")
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("统一上限", result[1])
+
+    def test_truncated_list_fails_closed_without_output(self):
+        self.addCleanup(setattr, collect, "LIST_LIMIT", collect.LIST_LIMIT)
+        collect.LIST_LIMIT = 1
+        self.github.prs = [
+            {"number": 51, "title": "one", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+        ]
+        result = self.collect("--baseline", self.base, "--window-start", "2024-01-01")
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("截断", result[2])
+        self.assertFalse(self.output.exists())
+
+    def test_merge_count_uses_local_git_not_compare_list(self):
+        branch = self.git("rev-parse", "--abbrev-ref", "HEAD")
+        self.git("checkout", "-q", "-b", "side")
+        (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
+        self.git("add", "side.txt")
+        self.git("commit", "-qm", "side")
+        self.git("checkout", "-q", branch)
+        self.git("merge", "-q", "--no-ff", "side", "-m", "Merge pull request #1 from x/y")
+        result = self.collect("--head", "HEAD", "--baseline", self.base,
+                              "--window-start", "2024-01-01")
+        self.assertEqual(result[0], 0, result)
+        body = self.output.read_text(encoding="utf-8")
+        self.assertIn("| 合并提交 | 1 |", body)
+        self.assertIn("其中 1 条 `Merge pull request`", body)
 
     def test_check_accepts_short_sha_for_snapshot_fields(self):
         self.first_draft()

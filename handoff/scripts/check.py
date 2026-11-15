@@ -38,6 +38,8 @@ os.environ.setdefault("PYTHONUTF8", "1")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 REQUIRED_FM = ["schema", "repo", "window", "baseline_commit", "head_commit", "supersedes"]
+# 与 collect.py 的统一分页上限一致;草案里的 --limit 不是这个值就判不可信
+LIST_LIMIT = 1000
 SECTION_TITLES = [
     "## 1. 数据口径",
     "## 2. 本窗口交付",
@@ -130,9 +132,19 @@ def same_value(table: str, got: str) -> bool:
     return a.lower() == b.lower()
 
 
-def recompute(cmd: str, repo: str, repo_dir: Path, window_start: str) -> tuple[bool, str]:
-    """按 §1 允许的命令形态复算。返回 (成功?, 值或原因);不认识的形态直接失败,不静默跳过。"""
+def recompute(cmd: str, repo: str, repo_dir: Path,
+              window: tuple[str, str]) -> tuple[bool, str]:
+    """按 §1 允许的命令形态复算。返回 (成功?, 值或原因);不认识的形态直接失败,不静默跳过。
+
+    window = (from, to),UTC 日期闭区间;缺任一端时按日期过滤的行无法复算。
+    """
     c = " ".join(cmd.split())
+    window_from, window_to = window
+
+    def in_window(stamp: str | None) -> bool:
+        d = (stamp or "")[:10]
+        return bool(d) and bool(window_from) and bool(window_to) and window_from <= d <= window_to
+
     if c == "git ls-files":
         p = run(["git", "-C", str(repo_dir), "ls-files"])
         return (True, str(len(p.stdout.splitlines()))) if p.returncode == 0 \
@@ -160,20 +172,23 @@ def recompute(cmd: str, repo: str, repo_dir: Path, window_start: str) -> tuple[b
     if m:
         if m.group(1) != repo:
             return False, f"命令里的仓名不是 $REPO: {m.group(1)}"
-        if not window_start:
-            return False, "frontmatter 缺 window.from,无法按日期过滤"
+        if int(m.group(2)) != LIST_LIMIT:
+            return False, f"--limit 必须是统一上限 {LIST_LIMIT},实际 {m.group(2)}"
+        if not (window_from and window_to):
+            return False, "frontmatter 缺 window.from/to,无法按日期过滤"
         p = run(["gh", "pr", "list", "--repo", repo, "--state", "all",
                  "--limit", m.group(2), "--json", "mergedAt"])
         if p.returncode != 0:
             return False, f"gh 失败: {p.stderr.strip()[:80]}"
-        return True, str(len([x for x in json.loads(p.stdout)
-                              if (x.get("mergedAt") or "") >= window_start]))
+        return True, str(len([x for x in json.loads(p.stdout) if in_window(x.get("mergedAt"))]))
 
     m = re.fullmatch(r"gh issue list --repo (\S+) --state (open|closed|all) --limit (\d+) --json (\S+)", c)
     if m:
         if m.group(1) != repo:
             return False, f"命令里的仓名不是 $REPO: {m.group(1)}"
         state, limit, fields = m.group(2), m.group(3), m.group(4)
+        if int(limit) != LIST_LIMIT:
+            return False, f"--limit 必须是统一上限 {LIST_LIMIT},实际 {limit}"
         p = run(["gh", "issue", "list", "--repo", repo, "--state", state,
                  "--limit", limit, "--json", fields])
         if p.returncode != 0:
@@ -182,9 +197,9 @@ def recompute(cmd: str, repo: str, repo_dir: Path, window_start: str) -> tuple[b
         if state == "open":
             return True, str(len([x for x in items
                                   if "handoff" not in [l["name"] for l in x.get("labels", [])]]))
-        if not window_start:
-            return False, "frontmatter 缺 window.from,无法按日期过滤"
-        return True, str(len([x for x in items if (x.get("closedAt") or "") >= window_start]))
+        if not (window_from and window_to):
+            return False, "frontmatter 缺 window.from/to,无法按日期过滤"
+        return True, str(len([x for x in items if in_window(x.get("closedAt"))]))
 
     m = re.fullmatch(r"gh repo view (\S+) --json visibility --jq \.visibility", c)
     if m:
@@ -298,8 +313,8 @@ def main() -> int:
         if not rows:
             ck("3.rows", "§1 表格行可解析", False, "无匹配行")
         else:
-            wm = re.search(r'from:\s*"?(\d{4}-\d{2}-\d{2})', fm.get("window", ""))
-            window_start = wm.group(1) if wm else ""
+            wm = re.search(r'from:\s*"?(\d{4}-\d{2}-\d{2})"?,\s*to:\s*"?(\d{4}-\d{2}-\d{2})', fm.get("window", ""))
+            window = (wm.group(1), wm.group(2)) if wm else ("", "")
             done = 0
             for name, val, note in rows:
                 cm = re.search(r"`([^`]+)`", note)
@@ -315,7 +330,7 @@ def main() -> int:
                     ck(f"3.{name}", name, False, f"命令里出现仓名字面量,应改用 $REPO: {cmd[:60]}")
                     continue
                 ok, got = recompute(cmd.replace("$REPO", args.repo), args.repo, repo_dir,
-                                    window_start)
+                                    window)
                 ck(f"3.{name}", name, ok and same_value(val, got), f"表={val} 算={got}")
                 if ok:
                     done += 1

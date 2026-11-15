@@ -68,7 +68,13 @@ collect.py / check.py / SKILL.md 的行为都由本文档推导;改行为先改�
   不得伪装成不适用。
 - 合并提交用 `git log --merges` 全口径(含本地回合 origin/main),不用 compare API 的
   `Merge pull request` 计数(会少算本地回合)。
-- 合并 PR / 关闭 issue 按窗口起点日期过滤 mergedAt / closedAt。
+- 窗口 = UTC 日期闭区间 `[window.from, window.to]`。合并 PR / 关闭 issue 按
+  `from <= mergedAt/closedAt <= to` 过滤(比较日期部分 `YYYY-MM-DD`);右界之后发生的事件
+  不属于本份快照,不得计入。`to` 默认取采集当天 UTC。
+- 列表分页统一 `--limit 1000`(collect.py 的 `LIST_LIMIT`)。取满上限即视为可能截断 → 硬失败,
+  提示用 `gh api --paginate` 复核,不得少算出数。
+- compare API 的 `commits` 列表最多 250 条,不能用来数合并提交;`total_commits` 是准确值。
+  合并提交数一律用本地 `git log --merges --format=%s` 统计。
 - **两种口径不等价**:提交数/合并提交按 commit 范围 `baseline..head` 计,PR/issue 按日期过滤,
   同一批 PR 不必然落在同一批提交里。§1 表下必须有一句口径说明,agent 不得删。
 - §1 每行 = 值列(数字或可见性字符串)+ 一个反引号命令 + 可选说明文字。命令统一用 `$REPO`
