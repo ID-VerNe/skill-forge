@@ -5,7 +5,8 @@
   0  正文无 H1 行(标题信息由 frontmatter 承载,H1 属禁止项)
   1  frontmatter 必填字段齐且格式对(schema/repo/window/baseline_commit/head_commit/supersedes)
   2  baseline_commit 是 head_commit 的祖先(git merge-base --is-ancestor)
-  3  §1 口径表每行的复算命令在本机重跑结果与表中数字一致
+  3  §1 口径表每行的复算命令在本机重跑结果与表中数字一致;命令形态不识别、含仓名字面量
+     或未定义变量一律 FAIL,不允许 SKIP
   4  正文 #N 引用全部存在于该仓(issue 或 PR 均可,但 §4 表行首必须 issue)
   5  8 节骨架标题文字齐全(§1 数据口径 ... §7 无法追溯与不确定项,§7 允许空但不许省)
   6  issue 模式下已有 HANDOFF.md 无未提交改动(文件不存在时通过)
@@ -87,6 +88,113 @@ def same_commit(repo_dir: Path, a: str, b: str) -> bool:
     if ra and rb:
         return ra == rb
     return a.lower() == b.lower()
+
+
+def split_cells(line: str) -> list[str]:
+    """按 GFM 表格切列:先按 ` | ` 切,退化时按 `|` 切(单元格里若有转义 \\| 则不再退化)。"""
+    body = line.strip("|")
+    cells = [c.strip() for c in body.split(" | ")]
+    if len(cells) != 3 and "\\|" not in body:
+        cells = [c.strip() for c in body.split("|")]
+    return cells
+
+
+def fact_rows(section: str) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """解析 §1 表行,返回 (名称, 值, 第三列原文) 与无法解析的行。
+
+    任何以 `|` 开头的行都必须归入 rows 或 bad,不允许静默跳过(表格行少了 padding 空格
+    在 GFM 里仍然是合法表格行)。
+    """
+    rows: list[tuple[str, str, str]] = []
+    bad: list[str] = []
+    for line in section.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            continue
+        cells = split_cells(s)
+        if cells and (cells[0] == "数字" or set(cells[0]) <= set("-: ")):
+            continue
+        if len(cells) != 3:
+            bad.append(s[:60])
+            continue
+        rows.append((cells[0], cells[1], cells[2]))
+    return rows, bad
+
+
+def same_value(table: str, got: str) -> bool:
+    a, b = table.strip(), got.strip()
+    if not a or not b:
+        return False
+    if a.isdigit() and b.isdigit():
+        return int(a) == int(b)
+    return a.lower() == b.lower()
+
+
+def recompute(cmd: str, repo: str, repo_dir: Path, window_start: str) -> tuple[bool, str]:
+    """按 §1 允许的命令形态复算。返回 (成功?, 值或原因);不认识的形态直接失败,不静默跳过。"""
+    c = " ".join(cmd.split())
+    if c == "git ls-files":
+        p = run(["git", "-C", str(repo_dir), "ls-files"])
+        return (True, str(len(p.stdout.splitlines()))) if p.returncode == 0 \
+            else (False, f"git 失败: {p.stderr.strip()[:80]}")
+
+    m = re.fullmatch(r"git log (\S+) --merges", c)
+    if m:
+        rev = m.group(1)
+        if rev.startswith("-"):
+            return False, f"revision 不能以 - 开头(防止被当作 git 选项): {rev[:40]}"
+        p = run(["git", "-C", str(repo_dir), "log", rev, "--merges", "--format=%s"])
+        return (True, str(len(p.stdout.splitlines()))) if p.returncode == 0 \
+            else (False, f"git 失败: {p.stderr.strip()[:80]}")
+
+    m = re.fullmatch(r"gh api repos/(\S+)/compare/(\S+) --jq \.total_commits", c)
+    if m:
+        if m.group(1) != repo:
+            return False, f"命令里的仓名不是 $REPO: {m.group(1)}"
+        try:
+            return True, str(gh(repo, f"compare/{m.group(2)}")["total_commits"])
+        except Exception as e:
+            return False, f"复算失败: {str(e)[:80]}"
+
+    m = re.fullmatch(r"gh pr list --repo (\S+) --state all --limit (\d+) --json mergedAt", c)
+    if m:
+        if m.group(1) != repo:
+            return False, f"命令里的仓名不是 $REPO: {m.group(1)}"
+        if not window_start:
+            return False, "frontmatter 缺 window.from,无法按日期过滤"
+        p = run(["gh", "pr", "list", "--repo", repo, "--state", "all",
+                 "--limit", m.group(2), "--json", "mergedAt"])
+        if p.returncode != 0:
+            return False, f"gh 失败: {p.stderr.strip()[:80]}"
+        return True, str(len([x for x in json.loads(p.stdout)
+                              if (x.get("mergedAt") or "") >= window_start]))
+
+    m = re.fullmatch(r"gh issue list --repo (\S+) --state (open|closed|all) --limit (\d+) --json (\S+)", c)
+    if m:
+        if m.group(1) != repo:
+            return False, f"命令里的仓名不是 $REPO: {m.group(1)}"
+        state, limit, fields = m.group(2), m.group(3), m.group(4)
+        p = run(["gh", "issue", "list", "--repo", repo, "--state", state,
+                 "--limit", limit, "--json", fields])
+        if p.returncode != 0:
+            return False, f"gh 失败: {p.stderr.strip()[:80]}"
+        items = json.loads(p.stdout)
+        if state == "open":
+            return True, str(len([x for x in items
+                                  if "handoff" not in [l["name"] for l in x.get("labels", [])]]))
+        if not window_start:
+            return False, "frontmatter 缺 window.from,无法按日期过滤"
+        return True, str(len([x for x in items if (x.get("closedAt") or "") >= window_start]))
+
+    m = re.fullmatch(r"gh repo view (\S+) --json visibility --jq \.visibility", c)
+    if m:
+        if m.group(1) != repo:
+            return False, f"命令里的仓名不是 $REPO: {m.group(1)}"
+        p = run(["gh", "repo", "view", repo, "--json", "visibility", "--jq", ".visibility"])
+        return (True, p.stdout.strip()) if p.returncode == 0 \
+            else (False, f"gh 失败: {p.stderr.strip()[:80]}")
+
+    return False, f"未识别的复算命令: {c[:70]}"
 
 
 def open_handoffs(repo: str) -> list[int]:
@@ -178,62 +286,40 @@ def main() -> int:
     ck("2", f"{args.baseline} 是 {args.head} 的祖先", p.returncode == 0,
        "" if p.returncode == 0 else p.stderr.strip()[:120])
 
-    # ---- 3. §1 口径表数字复算 ----
+    # ---- 3. §1 口径表数字复算(逐行,fail-closed) ----
     print("=== check 3: §1 口径表数字复算 ===")
     sec1 = re.search(r"## 1\. 数据口径\n(.*?)\n## 2\.", txt, re.S)
     if not sec1:
         ck("3", "§1 存在", False, "未找到 '## 1. 数据口径'")
     else:
-        rows = re.findall(r"^\| (.+?) \| (.+?) \| `(.+?)` \|$", sec1.group(1), re.M)
+        rows, bad = fact_rows(sec1.group(1))
+        if bad:
+            ck("3.parse", "§1 表行结构可解析(3 列)", False, f"列数不对: {bad[:2]}")
         if not rows:
             ck("3.rows", "§1 表格行可解析", False, "无匹配行")
         else:
-            for name, val, cmd in rows:
-                # 只复算能本地跑的:gh api / gh pr list / gh issue list / git ls-files / python scripts/
-                if cmd.startswith("gh api repos/") and "compare/" in cmd:
-                    try:
-        # compare URL 形如 repos/O/R/compare/A...B,gh api 只要 compare/A...B 段
-                        cmp_arg = cmd.split("compare/")[1].split(" ")[0]
-                        got = gh(args.repo, f"compare/{cmp_arg}")["total_commits"]
-                        ck(f"3.{name}", name, str(got) == val.strip(), f"表={val.strip()} 算={got}")
-                    except Exception as e:
-                        ck(f"3.{name}", name, False, f"复算失败: {str(e)[:80]}")
-                elif cmd.startswith("git log") and "--merges" in cmd:
-                    got = run(["git", "-C", str(repo_dir), "log",
-                               f"{args.baseline}..{args.head}", "--merges", "--format=%s"]).stdout.strip().splitlines()
-                    ck(f"3.{name}", name, str(len(got)) == val.strip(), f"表={val.strip()} 算={len(got)}")
-                elif cmd.startswith("gh pr list"):
-                    try:
-                        p2 = run(["gh", "pr", "list", "--repo", args.repo, "--state", "all",
-                                  "--limit", "500", "--json", "mergedAt"])
-                        merged = [x for x in json.loads(p2.stdout)
-                                  if (x.get("mergedAt") or "") >= fm.get("window", "").split('"')[1]]
-                        ck(f"3.{name}", name, str(len(merged)) == val.strip(), f"表={val.strip()} 算={len(merged)}")
-                    except Exception as e:
-                        ck(f"3.{name}", name, False, f"复算失败: {str(e)[:80]}")
-                elif cmd.startswith("gh issue list") and "closed" in cmd:
-                    try:
-                        p2 = run(["gh", "issue", "list", "--repo", args.repo, "--state", "closed",
-                                  "--limit", "500", "--json", "closedAt"])
-                        closed = [x for x in json.loads(p2.stdout)
-                                  if (x.get("closedAt") or "") >= fm.get("window", "").split('"')[1]]
-                        ck(f"3.{name}", name, str(len(closed)) == val.strip(), f"表={val.strip()} 算={len(closed)}")
-                    except Exception as e:
-                        ck(f"3.{name}", name, False, f"复算失败: {str(e)[:80]}")
-                elif cmd.startswith("gh issue list") and "open" in cmd:
-                    try:
-                        p2 = run(["gh", "issue", "list", "--repo", args.repo, "--state", "open",
-                                  "--limit", "500", "--json", "labels,state"])
-                        opens = [x for x in json.loads(p2.stdout)
-                                 if "handoff" not in [l["name"] for l in x.get("labels", [])]]
-                        ck(f"3.{name}", name, str(len(opens)) == val.strip(), f"表={val.strip()} 算={len(opens)}")
-                    except Exception as e:
-                        ck(f"3.{name}", name, False, f"复算失败: {str(e)[:80]}")
-                elif cmd.startswith("git ls-files"):
-                    got = len(run(["git", "-C", str(repo_dir), "ls-files"]).stdout.strip().splitlines())
-                    ck(f"3.{name}", name, str(got) == val.strip(), f"表={val.strip()} 算={got}")
-                else:
-                    print(f"  [SKIP] 3.{name} {name}: 复算命令需本机特殊环境,跳过({cmd[:50]}...)")
+            wm = re.search(r'from:\s*"?(\d{4}-\d{2}-\d{2})', fm.get("window", ""))
+            window_start = wm.group(1) if wm else ""
+            done = 0
+            for name, val, note in rows:
+                cm = re.search(r"`([^`]+)`", note)
+                if not cm:
+                    ck(f"3.{name}", name, False, "第三列没有反引号复算命令")
+                    continue
+                cmd = cm.group(1).strip()
+                unknown = re.search(r"\$[A-Za-z_][A-Za-z0-9_]*", cmd.replace("$REPO", ""))
+                if unknown:
+                    ck(f"3.{name}", name, False, f"未定义变量 {unknown.group(0)}: {cmd[:60]}")
+                    continue
+                if args.repo.lower() in cmd.lower():
+                    ck(f"3.{name}", name, False, f"命令里出现仓名字面量,应改用 $REPO: {cmd[:60]}")
+                    continue
+                ok, got = recompute(cmd.replace("$REPO", args.repo), args.repo, repo_dir,
+                                    window_start)
+                ck(f"3.{name}", name, ok and same_value(val, got), f"表={val} 算={got}")
+                if ok:
+                    done += 1
+            ck("3.coverage", "§1 每行都复算过", done == len(rows), f"复算 {done}/{len(rows)} 行")
 
     # ---- 4. 正文 #N 引用存在 ----
     print("=== check 4: 正文 #N 引用全部存在 ===")

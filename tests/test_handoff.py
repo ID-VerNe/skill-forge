@@ -72,6 +72,8 @@ class FakeGitHub:
         if cmd[1:3] == ["auth", "status"]:
             return subprocess.CompletedProcess(cmd, 0, "ok", "")
         if cmd[1:3] == ["repo", "view"]:
+            if "--jq" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "PUBLIC", "")
             data = {"visibility": "PUBLIC"}
         elif cmd[1:3] == ["pr", "list"]:
             data = self.prs
@@ -287,6 +289,52 @@ class HandoffTest(unittest.TestCase):
         result = self.collect(*args)
         self.assertNotEqual(result[0], 0, result)
         self.assertFalse(self.output.exists())
+
+    def test_check_recomputes_row_with_trailing_note(self):
+        body = self.first_draft()
+        value = body.split("| 合并提交 | ")[1].split(" |")[0]
+        self.output.write_text(body.replace(f"| 合并提交 | {value} |",
+                                            f"| 合并提交 | {int(value) + 1} |"), encoding="utf-8")
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("[FAIL] 3.合并提交", result[1])
+
+    def test_rows_without_padding_are_still_recomputed(self):
+        body = self.first_draft().replace("| 仓库可见性 | PUBLIC |", "|仓库可见性|PRIVATE|")
+        self.output.write_text(body, encoding="utf-8")
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("[FAIL] 3.仓库可见性", result[1])
+
+    def test_empty_values_and_option_like_rev_are_rejected(self):
+        self.assertFalse(check.same_value("", ""))
+        ok, why = check.recompute("git log --output=/tmp/x --merges", "example/repo",
+                                  self.repo, "2024-01-01")
+        self.assertFalse(ok, why)
+
+    def test_check_rejects_malformed_fact_row(self):
+        body = self.first_draft().replace("| 被跟踪文件 |", "| 被跟踪文件 | extra |", 1)
+        self.output.write_text(body, encoding="utf-8")
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("[FAIL] 3.parse", result[1])
+
+    def test_check_rejects_unknown_recompute_command(self):
+        body = self.first_draft().replace("`git ls-files` 行数",
+                                          "`python scripts/run_gates.py --list` 行数")
+        self.output.write_text(body, encoding="utf-8")
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("未识别", result[1])
+        self.assertIn("[FAIL] 3.coverage", result[1])
+
+    def test_check_rejects_repo_name_literal_in_command(self):
+        body = self.first_draft().replace("`gh repo view $REPO",
+                                          "`gh repo view example/repo")
+        self.output.write_text(body, encoding="utf-8")
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("仓名字面量", result[1])
 
     def test_check_accepts_short_sha_for_snapshot_fields(self):
         self.first_draft()
