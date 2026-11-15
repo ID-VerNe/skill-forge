@@ -107,6 +107,8 @@ class FakeGitHub:
         else:
             raise AssertionError(f"unexpected gh command: {cmd}")
         out = data if isinstance(data, str) else json.dumps(data)
+        if isinstance(data, list) and "--limit" in cmd:
+            out = json.dumps(data[: int(cmd[cmd.index("--limit") + 1])])
         return subprocess.CompletedProcess(cmd, 0, out, "")
 
 
@@ -370,6 +372,22 @@ class HandoffTest(unittest.TestCase):
         result = self.collect("--baseline", self.base, "--window-start", "2024-01-01")
         self.assertEqual(result[0], 0, result)
         self.assertTrue(self.output.exists())
+
+    def test_check_probe_matches_collect_limit(self):
+        self.addCleanup(setattr, check, "LIST_LIMIT", check.LIST_LIMIT)
+        self.addCleanup(setattr, collect, "LIST_LIMIT", collect.LIST_LIMIT)
+        check.LIST_LIMIT = collect.LIST_LIMIT = 2
+        self.github.prs = [
+            {"number": 51, "title": "one", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+            {"number": 52, "title": "two", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+        ]
+        self.first_draft()
+        self.assertEqual(self.check()[0], 0)
+        self.github.prs.append(
+            {"number": 53, "title": "three", "mergedAt": "2024-01-02T00:00:00Z", "body": ""})
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("截断", result[1])
 
     def test_read_reports_rows_with_trailing_note(self):
         self.first_draft()
