@@ -70,16 +70,19 @@ def gh(repo: str, path: str, args: list[str] | None = None) -> dict | list:
 
 
 def gh_list(repo: str, kind: str, **params) -> list[dict]:
-    """gh issue/pr list 的分页封装;取满上限视为截断,硬失败而不是少算。"""
+    """gh issue/pr list 的分页封装;多取一条做探针,超过上限才算截断。
+
+    取满上限本身可能是「刚好这么多条」,不能据此判截断;多请求一条才能区分。
+    """
     limit = params.pop("limit", LIST_LIMIT)
     cmd = ["gh", kind, "list", "--repo", repo, "--state", "all",
-           "--limit", str(limit), "--json", params.pop("fields")]
+           "--limit", str(limit + 1), "--json", params.pop("fields")]
     for k, v in params.items():
         cmd += ["--" + k, str(v)]
     items = json.loads(run(cmd))
-    if len(items) >= limit:
+    if len(items) > limit:
         raise RuntimeError(
-            f"{kind} list 返回 {len(items)} 条,已达上限 {limit},可能被截断;"
+            f"{kind} list 超过上限 {limit} 条(至少 {len(items)} 条),可能被截断;"
             f"请用 `gh api --paginate` 复核,不要据此出数"
         )
     return items
@@ -264,8 +267,8 @@ def collect(repo: str, repo_dir: Path, baseline: str, head: str,
     L.append("|---|---|---|")
     L.append(f"| 提交数(含合并提交) | {total_commits} | `gh api repos/$REPO/compare/{baseline}...{head} --jq .total_commits` |")
     L.append(f"| 合并提交 | {len(all_merges)} | `git log {baseline}..{head} --merges` 行数;全口径,其中 {pr_merges} 条 `Merge pull request`,{local_merges} 条本地回合 origin/main |")
-    L.append(f"| 合并 PR(窗口内) | {len(merged_prs)} | `gh pr list --repo $REPO --state all --limit {LIST_LIMIT} --json mergedAt` 过滤 `{window_start} <= mergedAt <= {today}` |")
-    L.append(f"| 关闭 issue(窗口内) | {len(closed_issues)} | `gh issue list --repo $REPO --state all --limit {LIST_LIMIT} --json closedAt` 过滤 `{window_start} <= closedAt <= {today}` |")
+    L.append(f"| 合并 PR(窗口内) | {len(merged_prs)} | `gh pr list --repo $REPO --state all --limit {LIST_LIMIT} --json mergedAt` 过滤 `{window_start} <= mergedAt[:10] <= {today}` |")
+    L.append(f"| 关闭 issue(窗口内) | {len(closed_issues)} | `gh issue list --repo $REPO --state all --limit {LIST_LIMIT} --json closedAt` 过滤 `{window_start} <= closedAt[:10] <= {today}` |")
     L.append(f"| 当前 open issue | {len(open_issues)} | `gh issue list --repo $REPO --state open --limit {LIST_LIMIT} --json number,labels` 排除 label `handoff` |")
     L.append(f"| 被跟踪文件 | {tracked_files} | `git ls-files` 行数 |")
     L.append(f"| 仓库可见性 | {vis} | `gh repo view $REPO --json visibility --jq .visibility` |")
@@ -347,7 +350,7 @@ def read_handoff(path: Path) -> int:
         m = re.search(rf"^## {re.escape(title)}\n(.*?)(?=^## |\Z)", txt, re.M | re.S)
         return m.group(1).strip("\n") if m else ""
 
-    rows = re.findall(r"^\| (.+?) \| (.+?) \| `.+?` \|$", sec("1. 数据口径"), re.M)
+    rows = re.findall(r"^\| (.+?) \| (.+?) \| `.+?`.*\|$", sec("1. 数据口径"), re.M)
     facts = {name.strip(): val.strip() for name, val in rows}
     pr_rows = re.findall(r"^\| #(\d+) \| (.+?) \| (.+?) \| (.+?) \|$", sec("2. 本窗口交付"), re.M)
     buckets = {}

@@ -360,11 +360,31 @@ class HandoffTest(unittest.TestCase):
         self.assertNotEqual(result[0], 0, result)
         self.assertIn("统一上限", result[1])
 
+    def test_list_exactly_at_limit_is_not_truncation(self):
+        self.addCleanup(setattr, collect, "LIST_LIMIT", collect.LIST_LIMIT)
+        collect.LIST_LIMIT = 2
+        self.github.prs = [
+            {"number": 51, "title": "one", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+            {"number": 52, "title": "two", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+        ]
+        result = self.collect("--baseline", self.base, "--window-start", "2024-01-01")
+        self.assertEqual(result[0], 0, result)
+        self.assertTrue(self.output.exists())
+
+    def test_read_reports_rows_with_trailing_note(self):
+        self.first_draft()
+        code, out, _ = self.invoke(collect, "--read", self.output)
+        self.assertEqual(code, 0)
+        facts = json.loads(out)["facts"]
+        self.assertIn("合并提交", facts)
+        self.assertEqual(facts["合并提交"], "0")
+
     def test_truncated_list_fails_closed_without_output(self):
         self.addCleanup(setattr, collect, "LIST_LIMIT", collect.LIST_LIMIT)
         collect.LIST_LIMIT = 1
         self.github.prs = [
             {"number": 51, "title": "one", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+            {"number": 52, "title": "two", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
         ]
         result = self.collect("--baseline", self.base, "--window-start", "2024-01-01")
         self.assertNotEqual(result[0], 0, result)

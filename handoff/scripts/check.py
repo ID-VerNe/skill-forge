@@ -180,7 +180,10 @@ def recompute(cmd: str, repo: str, repo_dir: Path,
                  "--limit", m.group(2), "--json", "mergedAt"])
         if p.returncode != 0:
             return False, f"gh 失败: {p.stderr.strip()[:80]}"
-        return True, str(len([x for x in json.loads(p.stdout) if in_window(x.get("mergedAt"))]))
+        rows = json.loads(p.stdout)
+        if len(rows) >= LIST_LIMIT:
+            return False, f"返回 {len(rows)} 条已达上限 {LIST_LIMIT},可能截断,无法复算"
+        return True, str(len([x for x in rows if in_window(x.get("mergedAt"))]))
 
     m = re.fullmatch(r"gh issue list --repo (\S+) --state (open|closed|all) --limit (\d+) --json (\S+)", c)
     if m:
@@ -194,6 +197,8 @@ def recompute(cmd: str, repo: str, repo_dir: Path,
         if p.returncode != 0:
             return False, f"gh 失败: {p.stderr.strip()[:80]}"
         items = json.loads(p.stdout)
+        if len(items) >= LIST_LIMIT:
+            return False, f"返回 {len(items)} 条已达上限 {LIST_LIMIT},可能截断,无法复算"
         if state == "open":
             return True, str(len([x for x in items
                                   if "handoff" not in [l["name"] for l in x.get("labels", [])]]))
