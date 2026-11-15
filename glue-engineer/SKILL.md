@@ -168,6 +168,8 @@ python -m polyglot analyze <lang> <src>              # 分析源码
 
 > **scout vs discover 语义**（一句话）：`scout` = 包级，查要装的库（注册表，带版本/下载量）；`discover` = 项目级，查"有没有人做过"（GitHub 仓库，带星数）。Go repo 通过 `proxy.golang.org/@latest` 精确补 version。
 
+> **能力匹配边界**：`cap-list` 是有限的人工维护 starter registry，不是完整或实时的包索引。`cap-match` 的能力/许可证分数是基于已录入字段的启发式信号，不是兼容性结论、法律意见或法律合规判定。`cross-search` 默认搜索 8 个有 scout 后端的生态（Python、JavaScript、Rust、Java、Kotlin、C/C++、PHP、Go）；partial failure/timeout 会在 JSON 中通过 `status` 和 `errors` 暴露。
+
 > **HTTPS 证书策略**：polyglot 在导入时自动注入 **OS 系统证书库**（`polyglot/common/net.py` + 内置 `polyglot/vendor/truststore`），信任方式与 `gh`/`git`/浏览器一致 —— 开着 Steam++/SteamTools 等 MITM 加速器也能正常检索。若遇 `CERTIFICATE_VERIFY_FAILED`：设 `POLYGLOT_SYSTEM_TRUST=0` 临时退回默认 certifi 排查，或确认加速器 CA 已装入系统根证书库（详见 `docs/skill/troubleshooting.md`）。
 
 Deep Mode 命令（`deep-init`/`deep-pack`/`deep-validate`/`deep-compare`/`deep-summarize`/`deep-clean`）见 `docs/skill/cli-reference.md` + `docs/skill/deep-mode.md`。

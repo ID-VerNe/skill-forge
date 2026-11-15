@@ -7,6 +7,18 @@ CrossLangCandidate, CrossLangSearchView, BatchSearchConfig.
 from dataclasses import dataclass, field
 
 
+SUPPORTED_SCOUT_LANGUAGES = (
+    "python",
+    "javascript",
+    "rust",
+    "java",
+    "kotlin",
+    "c_cpp",
+    "php",
+    "go",
+)
+
+
 @dataclass
 class CrossLangCandidate:
     """A search result from one backend, tagged with language and metadata."""
@@ -37,7 +49,10 @@ class CrossLangSearchView:
     duration_ms: int = 0
 
     def summary(self) -> str:
-        lines = [f"Cross-language search for '{self.query}':"]
+        status = "partial" if self.errors else "complete"
+        lines = [f"Cross-language search for '{self.query}' ({status}):"]
+        if self.targets:
+            lines.append(f"  Targets: {', '.join(self.targets)}")
         for lang, count in self.coverage.items():
             lines.append(f"  [{lang}] {count} candidates")
         if self.errors:
@@ -50,7 +65,7 @@ class CrossLangSearchView:
 class BatchSearchConfig:
     """Configuration for a batch cross-language search."""
     query: str
-    languages: list = field(default_factory=lambda: ["python", "javascript", "rust", "java", "kotlin", "c_cpp"])
+    languages: list = field(default_factory=lambda: list(SUPPORTED_SCOUT_LANGUAGES))
     limit_per_lang: int = 5
     timeout_per_lang: int = 60       # seconds
     dedup: bool = True

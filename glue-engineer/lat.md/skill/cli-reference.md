@@ -42,7 +42,7 @@ python -m polyglot scout rust "serialization"
 
 ### 跨语言同时搜索（cross-search）
 
-一次跨多语言生态注册表搜索,返回汇总结果。用法: `python -m polyglot cross-search "<kw>" --languages <langs>`。
+一次跨多个生态注册表搜索,返回汇总结果。当前有 scout 后端的生态为 `python`、`javascript`、`rust`、`java`、`kotlin`、`c_cpp`、`php`、`go`;默认搜索全部 8 种,也可用 `--languages` 选择子集。遇到后端错误或单生态超时会保留部分结果,在 JSON 中通过 `status: "partial"` 和 `errors` 标记,Markdown 中也会显示错误。
 
 ```bash
 python -m polyglot cross-search "json parser" --languages python,rust,javascript --limit 3
@@ -63,7 +63,7 @@ python -m polyglot discover "ffmpeg" --limit 10 --no-enrich   # 跳过生态补�
 
 ## 能力匹配类
 
-查看能力注册表,匹配两个库的功能和许可证兼容性。
+查看有限的人工维护 capability starter registry,并对已收录库的字段做启发式比较。该 registry 不是完整或实时的包索引;匹配分数（包含 license score）仅是启发式信号,不构成实际兼容性结论、法律意见或法律合规判定。JSON 输出包含 `status: "curated_starter"`、`scope`、`notice` 和 `entries` 字段。
 
 ```bash
 # 查看能力注册表

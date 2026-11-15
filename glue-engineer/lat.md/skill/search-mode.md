@@ -8,6 +8,8 @@ Search Mode（设计/构建/评估系统）的三阶段流程:CLI 自动链收�
 
 依次执行 scout/cross-search/mvp-scope/cap-list/cap-match,用真实数据替代内部知识。
 
+`cross-search` 默认覆盖全部 8 个 scout 后端生态（Python、JavaScript、Rust、Java、Kotlin、C/C++、PHP、Go）；部分失败或超时会显式标为 partial。`cap-list` 仅展示有限的人工维护 starter 数据；`cap-match` 分数是启发式参考,许可证分数不代替法律审查。
+
 ```bash
 # 1. 单语言搜索用户需求所需库
 python -m polyglot scout <lang> "<keyword>"

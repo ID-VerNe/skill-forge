@@ -1,8 +1,8 @@
 """
 polyglot/glue/capability_ontology.py — Library capability registry + matching.
 
-Provides a structured, machine-readable description per library that enables
-real functional matching (unlike FEATURES.json which only describes tooling ops).
+Provides a limited, manually curated starter description per library and
+heuristic capability matching (unlike FEATURES.json, which describes tooling ops).
 
 This file is a thin re-export layer over the sectioned ontology modules:
   - polyglot.glue.registry_data        STARTER_REGISTRY
@@ -13,6 +13,7 @@ This file is a thin re-export layer over the sectioned ontology modules:
 from polyglot.glue.capability_types import LibraryCapability, CapabilityAlignment
 from polyglot.glue.registry_data import STARTER_REGISTRY
 from polyglot.glue.capability_matcher import match_capabilities
+from copy import deepcopy
 
 
 # @lat: [[glue#Key Concepts#Capability Ontology]]
@@ -29,7 +30,7 @@ class CapabilityRegistry:
 
     def _load_starter(self):
         for key, cap in STARTER_REGISTRY.items():
-            self._entries[key] = cap
+            self._entries[key] = deepcopy(cap)
 
     def get(self, library: str, language: str) -> LibraryCapability | None:
         """Look up a library's capability by name and language."""
@@ -75,12 +76,16 @@ class CapabilityRegistry:
         return result
 
     def match(self, src_cap: LibraryCapability, dst_cap: LibraryCapability) -> CapabilityAlignment:
-        """Compute compatibility alignment between two library capabilities."""
+        """Compute heuristic alignment between two recorded capabilities."""
         return match_capabilities(src_cap, dst_cap)
 
 
 # ───── Convenience ─────
 
 def get_registry() -> CapabilityRegistry:
-    """Get the global capability registry (singleton)."""
+    """Create a fresh registry loaded with the built-in starter entries.
+
+    Each call returns an independent registry; user-loaded or registered entries
+    do not leak into later calls.
+    """
     return CapabilityRegistry()

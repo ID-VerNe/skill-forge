@@ -262,6 +262,10 @@ python -m polyglot cap-match python orjson rust serde_json
 python -m polyglot bridge python orjson rust serde_json
 ```
 
+`cross-search` searches all eight scout ecosystems by default: `python`, `javascript`, `rust`, `java`, `kotlin`, `c_cpp`, `php`, and `go`. Use `--languages` to select a subset. Per-language backend failures and timeouts are reported alongside any partial results; JSON output sets `status` to `partial` and includes `errors`.
+
+The capability registry is a limited, manually curated starter dataset, not a complete or live package index. `cap-match` scores are heuristic signals based on those records. In particular, a license score is not legal advice or a legal-compliance determination.
+
 ---
 
 ## Subagent Definitions
@@ -315,7 +319,7 @@ glue-engineer/
 │   │       └── integration-plan.schema.json
 │   ├── glue/                             # v3 glue engine
 │   ├── common/                           # Shared infrastructure
-│   ├── backends/                         # 6 language backends
+│   ├── backends/                         # 8 scout ecosystems
 │   └── ...
 ├── .claude/settings.json                 # Permission whitelist
 ├── evals/                                # Eval checklists

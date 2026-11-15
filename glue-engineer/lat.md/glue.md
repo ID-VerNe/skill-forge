@@ -61,6 +61,14 @@ Bridge generation consumes reviewed mappings only. Empty mappings require explic
 
 Reference: [[polyglot/commands/glue.py]]
 
+### Capability registry scope
+
+The capability registry is a limited, manually curated starter dataset, not a complete or live package index.
+
+`get_registry()` returns a fresh registry per call with independent copies of the built-in entries. `cap-match` scores are heuristic signals based on recorded fields; license scores do not constitute legal advice or a compliance determination.
+
+`cap-list --format json` includes a `curated_starter` status, scope, notice, and an `entries` array so machine-readable consumers receive the same boundary warning as Markdown users.
+
 ## Dependencies
 
 glue 模块依赖的其他模块。
