@@ -107,6 +107,8 @@ class FakeGitHub:
         else:
             raise AssertionError(f"unexpected gh command: {cmd}")
         out = data if isinstance(data, str) else json.dumps(data)
+        if isinstance(data, list) and "--limit" in cmd:
+            out = json.dumps(data[: int(cmd[cmd.index("--limit") + 1])])
         return subprocess.CompletedProcess(cmd, 0, out, "")
 
 
@@ -309,7 +311,7 @@ class HandoffTest(unittest.TestCase):
     def test_empty_values_and_option_like_rev_are_rejected(self):
         self.assertFalse(check.same_value("", ""))
         ok, why = check.recompute("git log --output=/tmp/x --merges", "example/repo",
-                                  self.repo, "2024-01-01")
+                                  self.repo, ("2024-01-01", "2024-01-03"))
         self.assertFalse(ok, why)
 
     def test_check_rejects_malformed_fact_row(self):
@@ -335,6 +337,92 @@ class HandoffTest(unittest.TestCase):
         result = self.check()
         self.assertNotEqual(result[0], 0, result)
         self.assertIn("仓名字面量", result[1])
+
+    def test_window_right_bound_excludes_later_merges(self):
+        self.github.prs = [
+            {"number": 51, "title": "in window", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+            {"number": 52, "title": "after window", "mergedAt": "2024-01-04T00:00:00Z", "body": ""},
+        ]
+        body = self.first_draft()
+        self.assertIn("| 合并 PR(窗口内) | 1 |", body)
+        self.assertNotIn("#52", body)
+
+    def test_recompute_excludes_merges_after_window_end(self):
+        self.first_draft()
+        self.github.prs = [
+            {"number": 52, "title": "after window", "mergedAt": "2024-01-04T00:00:00Z", "body": ""},
+        ]
+        result = self.check()
+        self.assertEqual(result[0], 0, result)
+
+    def test_check_rejects_non_unified_list_limit(self):
+        body = self.first_draft().replace("--limit 1000", "--limit 1", 1)
+        self.output.write_text(body, encoding="utf-8")
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("统一上限", result[1])
+
+    def test_list_exactly_at_limit_is_not_truncation(self):
+        self.addCleanup(setattr, collect, "LIST_LIMIT", collect.LIST_LIMIT)
+        collect.LIST_LIMIT = 2
+        self.github.prs = [
+            {"number": 51, "title": "one", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+            {"number": 52, "title": "two", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+        ]
+        result = self.collect("--baseline", self.base, "--window-start", "2024-01-01")
+        self.assertEqual(result[0], 0, result)
+        self.assertTrue(self.output.exists())
+
+    def test_check_probe_matches_collect_limit(self):
+        self.addCleanup(setattr, check, "LIST_LIMIT", check.LIST_LIMIT)
+        self.addCleanup(setattr, collect, "LIST_LIMIT", collect.LIST_LIMIT)
+        check.LIST_LIMIT = collect.LIST_LIMIT = 2
+        self.github.prs = [
+            {"number": 51, "title": "one", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+            {"number": 52, "title": "two", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+        ]
+        self.first_draft()
+        self.assertEqual(self.check()[0], 0)
+        self.github.prs.append(
+            {"number": 53, "title": "three", "mergedAt": "2024-01-02T00:00:00Z", "body": ""})
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("截断", result[1])
+
+    def test_read_reports_rows_with_trailing_note(self):
+        self.first_draft()
+        code, out, _ = self.invoke(collect, "--read", self.output)
+        self.assertEqual(code, 0)
+        facts = json.loads(out)["facts"]
+        self.assertIn("合并提交", facts)
+        self.assertEqual(facts["合并提交"], "0")
+
+    def test_truncated_list_fails_closed_without_output(self):
+        self.addCleanup(setattr, collect, "LIST_LIMIT", collect.LIST_LIMIT)
+        collect.LIST_LIMIT = 1
+        self.github.prs = [
+            {"number": 51, "title": "one", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+            {"number": 52, "title": "two", "mergedAt": "2024-01-02T00:00:00Z", "body": ""},
+        ]
+        result = self.collect("--baseline", self.base, "--window-start", "2024-01-01")
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("截断", result[2])
+        self.assertFalse(self.output.exists())
+
+    def test_merge_count_uses_local_git_not_compare_list(self):
+        branch = self.git("rev-parse", "--abbrev-ref", "HEAD")
+        self.git("checkout", "-q", "-b", "side")
+        (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
+        self.git("add", "side.txt")
+        self.git("commit", "-qm", "side")
+        self.git("checkout", "-q", branch)
+        self.git("merge", "-q", "--no-ff", "side", "-m", "Merge pull request #1 from x/y")
+        result = self.collect("--head", "HEAD", "--baseline", self.base,
+                              "--window-start", "2024-01-01")
+        self.assertEqual(result[0], 0, result)
+        body = self.output.read_text(encoding="utf-8")
+        self.assertIn("| 合并提交 | 1 |", body)
+        self.assertIn("其中 1 条 `Merge pull request`", body)
 
     def test_check_accepts_short_sha_for_snapshot_fields(self):
         self.first_draft()
