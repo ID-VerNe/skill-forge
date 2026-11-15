@@ -69,6 +69,11 @@ collect.py / check.py / SKILL.md 的行为都由本文档推导;改行为先改�
 - 合并提交用 `git log --merges` 全口径(含本地回合 origin/main),不用 compare API 的
   `Merge pull request` 计数(会少算本地回合)。
 - 合并 PR / 关闭 issue 按窗口起点日期过滤 mergedAt / closedAt。
+- **两种口径不等价**:提交数/合并提交按 commit 范围 `baseline..head` 计,PR/issue 按日期过滤,
+  同一批 PR 不必然落在同一批提交里。§1 表下必须有一句口径说明,agent 不得删。
+- §1 每行 = 值列(数字或可见性字符串)+ 一个反引号命令 + 可选说明文字。命令统一用 `$REPO`
+  占位,由 check.py 用 `--repo` 的值替换后复算;命令里不得出现仓名字面量,也不得出现
+  `$REPO` 以外的变量。
 - open issue 排除 label `handoff` 自身。
 - §2 行 = merged PR;linked issue 从 PR body 的 `Closes|Refs|Fixes #N` 解析,只扫关键词后,
   不扫标题、不扫正文叙述;去重。
@@ -96,8 +101,9 @@ check.py 九项,全过才允许创建 issue,任一条失败 abort 并打印具�
 0. 正文无 H1 行(标题信息由 frontmatter 承载,H1 属禁止项)
 1. frontmatter 必填字段齐且格式对(schema 值 = handoff/v1,repo/baseline/head 与 CLI 参数一致)
 2. baseline_commit 是 head_commit 的祖先
-3. §1 口径表每行的复算命令在本机重跑结果与表中数字一致(能本地跑的全跑;需特殊环境的 skip)
-   §1 复算命令不变量:值列 = 表中数字,命令列 = 可本机重跑的 gh/git 命令;命令里不得出现仓名字面量(check_sensitive private-repo 规则会红),用 --repo 参数值代替
+3. §1 口径表逐行复算:每行第三列取第一个反引号命令,替换 `$REPO` 后用 git/gh 重跑,
+   结果必须等于值列。命令形态不识别、命令里有仓名字面量、有 `$REPO` 以外的变量,
+   或某行没被复算,均判 FAIL——不允许 SKIP,也不允许「需特殊环境」绕过。
    已发布快照对 check 3 会红属预期,不加降级:issue 之间不是串行推进,而是按需选择性推进,
    窗口外的合并/开闭会让复算值偏离快照值;读方按快照读,不要求它等于现在
 4. 正文 #N 引用全部存在于该仓(issue 或 PR 均可)
