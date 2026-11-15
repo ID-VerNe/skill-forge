@@ -299,6 +299,13 @@ class HandoffTest(unittest.TestCase):
         self.assertNotEqual(result[0], 0, result)
         self.assertIn("[FAIL] 3.合并提交", result[1])
 
+    def test_check_rejects_malformed_fact_row(self):
+        body = self.first_draft().replace("| 被跟踪文件 |", "| 被跟踪文件 | extra |", 1)
+        self.output.write_text(body, encoding="utf-8")
+        result = self.check()
+        self.assertNotEqual(result[0], 0, result)
+        self.assertIn("[FAIL] 3.parse", result[1])
+
     def test_check_rejects_unknown_recompute_command(self):
         body = self.first_draft().replace("`git ls-files` 行数",
                                           "`python scripts/run_gates.py --list` 行数")

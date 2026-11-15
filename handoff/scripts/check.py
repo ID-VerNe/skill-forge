@@ -90,18 +90,22 @@ def same_commit(repo_dir: Path, a: str, b: str) -> bool:
     return a.lower() == b.lower()
 
 
-def fact_rows(section: str) -> list[tuple[str, str, str]]:
-    """解析 §1 表行,返回 (名称, 值, 第三列原文);表头与分隔行跳过。"""
-    rows = []
+def fact_rows(section: str) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """解析 §1 表行,返回 (名称, 值, 第三列原文) 与无法解析的行。表头与分隔行跳过。"""
+    rows: list[tuple[str, str, str]] = []
+    bad: list[str] = []
     for line in section.splitlines():
         s = line.strip()
         if not (s.startswith("| ") and s.endswith(" |")):
             continue
         cells = [c.strip() for c in s[2:-2].split(" | ")]
-        if len(cells) != 3 or cells[0] == "数字" or set(cells[0]) <= set("-: "):
+        if cells and (cells[0] == "数字" or set(cells[0]) <= set("-: ")):
+            continue
+        if len(cells) != 3:
+            bad.append(s[:60])
             continue
         rows.append((cells[0], cells[1], cells[2]))
-    return rows
+    return rows, bad
 
 
 def same_value(table: str, got: str) -> bool:
@@ -270,7 +274,9 @@ def main() -> int:
     if not sec1:
         ck("3", "§1 存在", False, "未找到 '## 1. 数据口径'")
     else:
-        rows = fact_rows(sec1.group(1))
+        rows, bad = fact_rows(sec1.group(1))
+        if bad:
+            ck("3.parse", "§1 表行结构可解析(3 列)", False, f"列数不对: {bad[:2]}")
         if not rows:
             ck("3.rows", "§1 表格行可解析", False, "无匹配行")
         else:
