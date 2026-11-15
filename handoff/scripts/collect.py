@@ -80,41 +80,61 @@ def git(repo_dir: Path, *args: str) -> str:
     return run(["git", "-C", str(repo_dir), *args]).strip()
 
 
-def parse_frontmatter(path: Path) -> dict:
-    txt = path.read_text(encoding="utf-8")
-    m = re.match(r"^---\n(.*?)\n---\n", txt, re.S)
+def parse_frontmatter_text(txt: str) -> dict:
+    """仅读取正文开头的 frontmatter;拒绝重复字段。"""
+    m = re.match(r"^---\r?\n(.*?)\r?\n---(?:\r?\n|$)", txt, re.S)
     if not m:
         return {}
     fm: dict = {}
     for line in m.group(1).splitlines():
         if ":" in line:
             k, v = line.split(":", 1)
-            fm[k.strip()] = v.strip().strip('"').strip("'")
+            k, v = k.strip(), v.strip()
+            if k in fm:
+                raise RuntimeError(f"frontmatter 字段重复: {k}")
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            fm[k] = v
     return fm
 
 
-def find_prev_handoff(repo_dir: Path, repo: str) -> dict | None:
-    """找当前 open handoff issue(配合 HANDOFF.md 死文字路径,不扫标题)。
+def parse_frontmatter(path: Path) -> dict:
+    return parse_frontmatter_text(path.read_text(encoding="utf-8"))
 
-    返回 {number, baseline_commit, head_commit} 或 None(首份)。
-    """
-    items = gh_list(repo, "issue", fields="number,title,body", label=HANDOFF_LABEL)
-    # gh issue list 的 state 字段是大写 OPEN/CLOSED
-    open_ones = [i for i in items if i.get("state") == "OPEN" and i.get("pull_request") is None]
-    if not open_ones:
+
+def find_prev_handoff(repo_dir: Path, repo: str) -> dict | None:
+    """查当前 open handoff;数量或前驱格式异常时停止。"""
+    items = json.loads(run(["gh", "issue", "list", "--repo", repo,
+                            "--label", HANDOFF_LABEL, "--state", "open",
+                            "--limit", "2", "--json", "number,state,body"]))
+    if not isinstance(items, list):
+        raise RuntimeError("open handoff 查询结果不是列表")
+    if not items:
         return None
-    if len(open_ones) > 1:
-        sys.stderr.write(
-            f"[collect] 警告:open handoff issue 有 {len(open_ones)} 份"
-            f"({[i['number'] for i in open_ones]}),取最大号;请先手工关多余的\n"
-        )
-    cur = max(open_ones, key=lambda i: i["number"])
-    body = cur.get("body") or ""
-    base = re.search(r"^baseline_commit:\s*([0-9a-fA-F]+)", body, re.M)
-    head = re.search(r"^head_commit:\s*([0-9a-fA-F]+)", body, re.M)
-    return {"number": cur["number"],
-            "baseline_commit": base.group(1) if base else None,
-            "head_commit": head.group(1) if head else None}
+    if len(items) != 1:
+        raise RuntimeError("存在多份 open handoff,请先核对并处理")
+    cur = items[0]
+    if not isinstance(cur, dict) or cur.get("state") != "OPEN" or type(cur.get("number")) is not int or cur["number"] <= 0:
+        raise RuntimeError("open handoff 查询返回无效状态或编号")
+    if not isinstance(cur.get("body"), str):
+        raise RuntimeError("open handoff 正文无效")
+    fm = parse_frontmatter_text(cur["body"])
+    if (any(not fm.get(k) for k in REQUIRED_FM) or fm.get("schema") != "handoff/v1"
+            or fm.get("repo", "").lower() != repo.lower()):
+        raise RuntimeError(f"前驱 #{cur['number']} 的 frontmatter 无效")
+    for field in ("baseline_commit", "head_commit"):
+        if not re.fullmatch(r"[0-9a-fA-F]{4,64}", fm[field]):
+            raise RuntimeError(f"前驱 #{cur['number']} 的 {field} 不是 commit SHA")
+    if not re.fullmatch(r"null|[1-9][0-9]*", fm["supersedes"]):
+        raise RuntimeError(f"前驱 #{cur['number']} 的 supersedes 无效")
+    window = re.fullmatch(r'''\{from:\s*["']?(\d{4}-\d{2}-\d{2})["']?,\s*to:\s*["']?(\d{4}-\d{2}-\d{2})["']?\}''', fm["window"])
+    try:
+        if not window or datetime.fromisoformat(window[1]) > datetime.fromisoformat(window[2]):
+            raise ValueError("日期范围无效")
+    except ValueError as e:
+        raise RuntimeError(f"前驱 #{cur['number']} 的 window 无效") from e
+    return {"number": cur["number"], "baseline_commit": fm["baseline_commit"],
+            "head_commit": fm["head_commit"]}
 
 
 def collect(repo: str, repo_dir: Path, baseline: str, head: str,
@@ -148,12 +168,6 @@ def collect(repo: str, repo_dir: Path, baseline: str, head: str,
     open_issues.sort(key=lambda i: i["number"])
 
     tracked_files = len(git(repo_dir, "ls-files").splitlines())
-    gates = run(["python", "scripts/run_gates.py", "--list"], cwd=repo_dir)
-    gate_rows = re.findall(r"^\[(ci|manual|support)\]\s+(\d+) 条", gates, re.M)
-    gate_str = " / ".join(f"{k} {v}" for k, v in gate_rows) or "未检出"
-    common = run(["python", "scripts/_common.py"], cwd=repo_dir)
-    selftest = re.search(r"自检全绿[:：]\s*(\d+)\s*项", common)
-    selftest_n = selftest.group(1) if selftest else "未检出"
     vis = json.loads(run(["gh", "repo", "view", repo, "--json", "visibility"]))["visibility"]
 
     # ---- 2. §2 交付表(行 = merged PR,验证状态从 linked issue label 取)----
@@ -168,23 +182,16 @@ def collect(repo: str, repo_dir: Path, baseline: str, head: str,
                 nums.append(n)
         pr_issue_map[p["number"]] = nums
 
-    issue_label_cache: dict[int, list[str]] = {}
-    for i in open_issues:
-        issue_label_cache[i["number"]] = [l["name"] for l in i.get("labels", [])]
+    issue_cache: dict[int, dict] = {i["number"]: i for i in open_issues}
     for n in {num for nums in pr_issue_map.values() for num in nums}:
-        if n in issue_label_cache:
+        if n in issue_cache:
             continue
-        # gh api issues/N 对 PR 号会返回 PR 对象(--jq 路径不匹配 → 空 stdout,JSON 解析失败)
-        # 用 issues/N + pulls/N 双查,先判类型再取 label
-        p = subprocess.run(["gh", "api", f"repos/{repo}/issues/{n}",
-                            "--jq", ".labels"],
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", env=_env())
-        if p.returncode == 0 and p.stdout.strip().startswith("["):
-            labs = json.loads(p.stdout)
-        else:
-            labs = []
-        issue_label_cache[n] = [l["name"] for l in labs]
+        item = gh(repo, f"issues/{n}")
+        if (not isinstance(item, dict) or "pull_request" in item
+                or str(item.get("state", "")).lower() not in ("open", "closed")
+                or not isinstance(item.get("labels"), list)):
+            raise RuntimeError(f"关联 issue #{n} 的状态或类型无效")
+        issue_cache[n] = item
 
     def verify_state(pr: dict) -> str:
         linked = pr_issue_map.get(pr["number"], [])
@@ -192,10 +199,11 @@ def collect(repo: str, repo_dir: Path, baseline: str, head: str,
             return "无 linked issue"
         states = []
         for n in linked:
-            labs = issue_label_cache.get(n, [])
+            item = issue_cache[n]
+            labs = [l["name"] for l in item["labels"]]
             if "needs-live-verify" in labs:
                 states.append(f"#{n} 待真机回签")
-            elif n in [i["number"] for i in open_issues]:
+            elif item["state"].lower() == "open":
                 states.append(f"#{n} 仍 open")
             else:
                 states.append(f"#{n} 已关闭")
@@ -249,8 +257,6 @@ def collect(repo: str, repo_dir: Path, baseline: str, head: str,
     L.append(f"| 关闭 issue(窗口内) | {len(closed_issues)} | `gh issue list --state closed --json closedAt` 过滤 `closedAt >= {window_start}` |")
     L.append(f"| 当前 open issue | {len(open_issues)} | `gh issue list --state open` 排除 label `handoff` |")
     L.append(f"| 被跟踪文件 | {tracked_files} | `git ls-files \\| wc -l` |")
-    L.append(f"| 门禁条数 | {gate_str} | `python scripts/run_gates.py --list` |")
-    L.append(f"| 共享层自检 | {selftest_n} 项 | `python scripts/_common.py` 末行 `== 自检全绿:N 项 ==` |")
     L.append(f"| 仓库可见性 | {vis} | `gh repo view --json visibility --jq .visibility` |")
     L.append("")
     L.append("## 2. 本窗口交付")
@@ -362,7 +368,7 @@ def main() -> int:
 
     ap2 = argparse.ArgumentParser(description="handoff 事实底盘取数器")
     ap2.add_argument("--repo", required=True, help="OWNER/REPO")
-    ap2.add_argument("--baseline", required=True, help="基线 commit(上一份 frontmatter.baseline_commit)")
+    ap2.add_argument("--baseline", help="基线 commit,默认上一份的 head_commit;首份必传")
     ap2.add_argument("--head", help="head commit,默认 HEAD")
     ap2.add_argument("--supersedes", type=int, default=None, help="上一份 handoff issue 号,首份省略")
     ap2.add_argument("--today", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
@@ -374,15 +380,18 @@ def main() -> int:
     a = ap2.parse_args(rest)
 
     repo_dir = Path(a.repo_dir)
-    head = a.head or git(repo_dir, "rev-parse", "--short", "HEAD")
-
-    # supersedes 未传 → 自动找当前 open handoff(D1 链)
+    # 前驱必须与当前唯一 open handoff 一致。
     prev = find_prev_handoff(repo_dir, a.repo)
-    sup = a.supersedes if a.supersedes is not None else (prev["number"] if prev else None)
-    base = a.baseline or (prev["baseline_commit"] if prev else None)
+    if a.supersedes is not None and (a.supersedes <= 0 or not prev or a.supersedes != prev["number"]):
+        sys.stderr.write("[collect] 错误:--supersedes 与当前 open handoff 不一致\n")
+        return 2
+    sup = prev["number"] if prev else None
+    base = a.baseline or (prev["head_commit"] if prev else None)
     if not base:
         sys.stderr.write("[collect] 错误:无上一份 handoff 且未传 --baseline;首份请手工指定基线\n")
         return 2
+    base = git(repo_dir, "rev-parse", "--verify", f"{base}^{{commit}}")
+    head = git(repo_dir, "rev-parse", "--verify", f"{a.head or 'HEAD'}^{{commit}}")
 
     # window_start:显式传入 > 上一份 head 日期 > 报错(首份必须给)
     ws = a.window_start

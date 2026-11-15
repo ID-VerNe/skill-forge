@@ -13,28 +13,32 @@ collect.py / check.py / SKILL.md 的行为都由本文档推导;改行为先改�
 1. **issue 是快照载体,不是事实源**。所有可复算的数字由 collect.py 从 git/gh API 取,
    issue 正文只放判断、决策、风险和承认不知道的东西。
 2. **单事实源**。一个项目一次只有一种模式生效(issue 或 local),不允许双写。
-3. **机器读优先**。读者是 agent:入口是 HANDOFF.md 死文字 + frontmatter,
-   正文是完整 markdown 但每节标题固定,check.py 可断言。
+3. **机器读优先**。读者是 agent:直接查询 handoff issue,可选的 HANDOFF.md 提供静态入口;
+   frontmatter 和固定章节便于机器读取,check.py 可断言。
 4. **诚实记录不知道**。§7 强制存在,允许为空,不允许省略;无复算命令的数字只能进 §7。
 
 ## 1. 生命周期(D1/D2/D5/D8)
 
-- 单仓库当前态:一个仓库最多一份 open handoff issue。
-- 每次 handoff 开新 issue,frontmatter `supersedes` 指上一份;创建成功后自动关旧单
-  并在旧单追一行 comment `superseded by #N`。
-- label 只有一个 `handoff`(wiredraw 已建);生命周期靠 issue state 表达,不加第二个 label。
+- 稳定状态:一个仓库最多一份 open handoff issue。发布过程中创建新单和关闭旧单之间允许短暂有两份。
+- 发布前按草案 frontmatter `supersedes` 校验:首份为 null 时必须没有 open handoff;
+  后续必须恰有一份 open handoff,且号码等于 `supersedes`。多份、身份不符或查询失败均中止。
+- 每次 handoff 开新 issue;创建后只关闭 `supersedes` 指定的旧单,并在旧单追 comment
+  `superseded by #N`。首份没有旧单,跳过关单和追评。发布后验证新单是唯一 open handoff。
+- 若创建、关单、追评或发布后验证失败,保留已完成的操作并报告实际状态;恢复前重新查询,
+  核对新旧 issue 身份,只补做尚未完成的步骤,不盲目重建或关闭其他单。
+- 发布前检查不是原子锁;多个发布者必须协调。创建后只允许预期的新单和指定旧单同时 open;
+  发现竞争、额外或身份不符的 open handoff 则停止并报告,不擅自关闭其他发布者的 issue。
+- label 只有一个 `handoff`;缺失时发布前创建,生命周期靠 issue state 表达,不加第二个 label。
 - 触发权在用户:纯手动,collect.py 只报体量数字,不自动建议、不自动触发。
-- open handoff 恒为 1 是 check.py 的硬闸(第 7 项);不为 1 说明关单失败,读者入口已破。
 
 ## 2. 标题与入口(D3/D14/D15)
 
 - 标题:`[handoff] YYYY-MM-DD～MM-DD <一句话主题>`。不带规模数字,数字进 §1。
-- 仓库根 `HANDOFF.md` 是静态死文字,只放读者三步:
-  1. `gh issue list --repo <OWNER/REPO> --label handoff --state open --json number`
-  2. `gh issue view <N> --repo <OWNER/REPO>`
-  3. 按正文 8 节骨架读,重点 §4 遗留 / §5 下一步 / §7 不确定项
-- HANDOFF.md 不放 issue 号、不放 commit、不放任何会过期的字段;handoff 流程永不改它。
-- check.py 第 6 项校验 HANDOFF.md 相对 git HEAD 无 diff;第 7 项校验 open handoff 恒为 1。
+- 读者不依赖入口文件,直接查 `gh issue list --repo <OWNER/REPO> --label handoff --state open --json number`,
+  唯一结果用 `gh issue view <N> --repo <OWNER/REPO>` 读取,再按正文骨架读;多份则报告异常。
+- 仓库根 `HANDOFF.md` 是可选的静态入口,不放 issue 号、commit 或其他会过期的字段。
+  初始化入口是单独的、须用户授权的文件变更或 PR;handoff 发布流程不自动创建或提交它。
+- check.py 第 6 项校验已有 HANDOFF.md 无未提交改动;文件缺失不妨碍读取或发布。
 
 ## 3. 文档形态(D13/D19)
 
@@ -56,8 +60,12 @@ collect.py / check.py / SKILL.md 的行为都由本文档推导;改行为先改�
 
 ## 4. 取数口径(D4/D9/D10/D11/D20)
 
-- 窗口 = 上一份 frontmatter.baseline_commit..HEAD;无上一份时用户必须给 --baseline 与
-  --window-start,脚本拒绝猜。
+- 首份交接必须由用户提供 `--baseline` 与 `--window-start`,脚本拒绝猜。后续默认用上一份
+  `head_commit` 作 baseline,该 commit 的 UTC 日期作窗口起点;二者均可显式覆盖。
+  baseline 必须是本次 head 的祖先;采集时将 baseline/head 解析为实际 commit SHA 写入 frontmatter。
+  本次 head 是采集时的快照,不要求此后恒等于 HEAD;检查时使用草案中的 SHA。
+- §1 不执行目标仓库的项目专属脚本,也不统计其门禁或自检项目数;其余取数失败必须明确报错,
+  不得伪装成不适用。
 - 合并提交用 `git log --merges` 全口径(含本地回合 origin/main),不用 compare API 的
   `Merge pull request` 计数(会少算本地回合)。
 - 合并 PR / 关闭 issue 按窗口起点日期过滤 mergedAt / closedAt。
@@ -73,10 +81,12 @@ collect.py / check.py / SKILL.md 的行为都由本文档推导;改行为先改�
 ## 5. 模式与失败语义(D16/D17/D18/D6 续)
 
 - 写路由必须用户明示 `--mode issue` 或 `--mode local`;未指明拒绝执行。
-- issue 模式无 gh / 未登录 / 离线 → 硬失败,错误信息给出路:
-  `issue 模式需要 gh,如需本地模式请用 --mode local 重跑`。不静默降级。
-- 读路由自动探测:有 open handoff issue 走 issue 模式三步;无 open 且有 .handoffs/ 最新
-  文件走 local 模式,并标注「本地模式,无 supersedes 链、无关单、读不到远端进度」。
+- 两种写模式的采集均依赖 gh、认证及远端数据;local 只改变写出口且跳过检查 6/7,
+  不是离线方案。缺 gh、认证或远端查询失败时硬失败,不静默降级或声称 local 可离线使用。
+- 读路由直接查询 open handoff,不论 HANDOFF.md 是否存在;恰有一份则读 issue,
+  确认无 open 且有 .handoffs/ 最新文件则读 local 并标注
+  「本地模式,发布不维护 issue 交接链、不关单;文件只反映采集时快照」。查询失败不等于无记录,
+  应报告失败,不得静默转 local。
 - 读是纯读,不写 comment、不留回执(D7)。
 
 ## 6. 发布前硬门禁(D12/D21 + 三条补充)
@@ -92,8 +102,10 @@ check.py 九项,全过才允许创建 issue,任一条失败 abort 并打印具�
    窗口外的合并/开闭会让复算值偏离快照值;读方按快照读,不要求它等于现在
 4. 正文 #N 引用全部存在于该仓(issue 或 PR 均可)
 5. 8 节骨架标题文字齐全(§7 允许空但不许省)
-6. issue 模式下 HANDOFF.md 相对 git HEAD 无 diff
-7. issue 模式下 open handoff issue 恒为 1
+6. issue 模式下已有 HANDOFF.md 无未提交改动;不存在时通过
+7. issue 模式发布前:首份 `supersedes: null` 时 open handoff 数为 0;后续恰有一份,
+   且 issue 号等于 `supersedes`;查询失败或身份不符均失败。发布后另行检查新 issue
+   为唯一 open handoff;local 模式跳过 6/7
 8. §4 表行首 #N 必须是 issue 号(PR 号不得误入;GitHub 的 issues API 对 PR 也返回 200,
    要再查 pulls/N 才分得清)
 

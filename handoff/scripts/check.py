@@ -8,8 +8,8 @@
   3  §1 口径表每行的复算命令在本机重跑结果与表中数字一致
   4  正文 #N 引用全部存在于该仓(issue 或 PR 均可,但 §4 表行首必须 issue)
   5  8 节骨架标题文字齐全(§1 数据口径 ... §7 无法追溯与不确定项,§7 允许空但不许省)
-  6  issue 模式下 HANDOFF.md 死文字未被改动(相对 git HEAD 无 diff)
-  7  issue 模式下 open handoff issue 恒为 1(D1 关旧单不变量)
+  6  issue 模式下已有 HANDOFF.md 无未提交改动(文件不存在时通过)
+  7  issue 模式发布前 open handoff 与 supersedes 一致
   8  §4 表行首 #N 必须是 issue 号(不是 PR 号)
 
 用法:
@@ -69,16 +69,45 @@ def gh(repo: str, path: str, args: list[str] | None = None) -> dict | list:
     return json.loads(p.stdout) if p.stdout.strip() else {}
 
 
+def open_handoffs(repo: str) -> list[int]:
+    p = run(["gh", "issue", "list", "--repo", repo, "--label", "handoff",
+             "--state", "open", "--limit", "2", "--json", "number"])
+    if p.returncode != 0:
+        raise RuntimeError(f"查询失败: {p.stderr.strip()[:120]}")
+    items = json.loads(p.stdout)
+    if not isinstance(items, list) or any(
+        not isinstance(i, dict) or type(i.get("number")) is not int or i["number"] <= 0
+        for i in items
+    ):
+        raise ValueError("open handoff 查询结果无效")
+    return [i["number"] for i in items]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="handoff 草案发布前硬门禁")
-    ap.add_argument("draft", help="草案 md 路径")
+    ap.add_argument("draft", nargs="?", help="草案 md 路径")
     ap.add_argument("--repo", required=True, help="OWNER/REPO")
-    ap.add_argument("--baseline", required=True, help="基线 commit")
-    ap.add_argument("--head", required=True, help="head commit")
+    ap.add_argument("--baseline", help="基线 commit")
+    ap.add_argument("--head", help="head commit")
+    ap.add_argument("--published", type=int, help="发布后检查唯一 open handoff 是否为此编号")
     ap.add_argument("--repo-dir", default=".", help="本地 git 仓路径")
     ap.add_argument("--mode", choices=["issue", "local"], default="issue",
-                    help="issue 模式校验 HANDOFF.md/open 恒为 1;local 模式跳过 6/7")
+                    help="issue 模式校验 HANDOFF.md 和发布前状态;local 模式跳过 6/7")
     args = ap.parse_args()
+
+    if args.published is not None:
+        if args.published <= 0 or args.draft or args.baseline or args.head or args.mode != "issue":
+            ap.error("--published 需要正整数,不能与草案参数或 local 模式组合")
+        try:
+            actual = open_handoffs(args.repo)
+            ok = actual == [args.published]
+            print(f"[{'PASS' if ok else 'FAIL'}] 发布后 open handoff: {actual}, 期望 [{args.published}]")
+            return 0 if ok else 1
+        except (RuntimeError, ValueError) as e:
+            print(f"[FAIL] 发布后查询失败: {e}", file=sys.stderr)
+            return 1
+    if not args.draft or not args.baseline or not args.head:
+        ap.error("发布前检查需要 draft、--baseline 和 --head")
 
     draft = Path(args.draft)
     if not draft.exists():
@@ -102,11 +131,16 @@ def main() -> int:
     print("=== check 1: frontmatter 必填字段 ===")
     fm: dict = {}
     m = re.match(r"^---\n(.*?)\n---\n", txt, re.S)
+    duplicates = []
     if m:
         for line in m.group(1).splitlines():
             if ":" in line:
                 k, v = line.split(":", 1)
-                fm[k.strip()] = v.strip()
+                k = k.strip()
+                if k in fm:
+                    duplicates.append(k)
+                fm[k] = v.strip()
+    ck("1.duplicate", "frontmatter 字段无重复", not duplicates, ", ".join(duplicates))
     for f in REQUIRED_FM:
         ck(f"1.{f}", f"字段 {f}", f in fm and fm[f] != "", fm.get(f, "(缺失)"))
     ck("1.schema", "schema 值 = handoff/v1", fm.get("schema") == "handoff/v1", fm.get("schema", ""))
@@ -196,25 +230,32 @@ def main() -> int:
         ck(f"5.{s.split('.')[0]}", s, s in txt, "" if s in txt else "缺失")
 
     # ---- 6. HANDOFF.md 未改 ----
-    print("=== check 6: HANDOFF.md 死文字未被改动 ===")
+    print("=== check 6: HANDOFF.md 无未提交改动 ===")
     if args.mode == "local":
         print("  [SKIP] local 模式不校验 HANDOFF.md")
     else:
         p = run(["git", "-C", str(repo_dir), "status", "--short", "HANDOFF.md"])
-        ck("6", "HANDOFF.md 无未提交改动", p.stdout.strip() == "", p.stdout.strip()[:80])
+        ck("6", "HANDOFF.md 无未提交改动", p.returncode == 0 and not p.stdout.strip(),
+           (p.stderr.strip() if p.returncode else p.stdout.strip())[:80])
 
-    # ---- 7. open handoff 恒为 1 ----
-    print("=== check 7: open handoff issue 恒为 1 ===")
+    # ---- 7. 发布前 open handoff 与 supersedes 一致 ----
+    print("=== check 7: 发布前 open handoff ===")
     if args.mode == "local":
         print("  [SKIP] local 模式不校验")
     else:
         try:
-            p = run(["gh", "issue", "list", "--repo", args.repo, "--label", "handoff",
-                     "--state", "open", "--json", "number"])
-            n = len(json.loads(p.stdout))
-            ck("7", "open handoff issue 数", n == 1, f"当前 {n}")
-        except Exception as e:
-            ck("7", "open handoff issue 数", False, f"查询失败: {str(e)[:80]}")
+            sup = fm.get("supersedes", "")
+            if sup == "null":
+                expected = []
+            elif re.fullmatch(r"[1-9][0-9]*", sup):
+                expected = [int(sup)]
+            else:
+                raise ValueError("supersedes 必须是 null 或正整数")
+            actual = open_handoffs(args.repo)
+            ck("7", "open handoff 与 supersedes 一致", actual == expected,
+               f"当前 {actual}, 期望 {expected}")
+        except (RuntimeError, ValueError) as e:
+            ck("7", "open handoff 与 supersedes 一致", False, f"检查失败: {str(e)[:80]}")
 
     # ---- 8. §4 表行首必须 issue 号 ----
     print("=== check 8: §4 表行首 #N 必须是 issue 号 ===")
