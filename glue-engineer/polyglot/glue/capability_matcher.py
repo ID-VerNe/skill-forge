@@ -20,7 +20,7 @@ WEIGHTS = {
 
 
 def match_capabilities(src: LibraryCapability, dst: LibraryCapability) -> CapabilityAlignment:
-    """Compute compatibility alignment between two library capabilities.
+    """Compute heuristic alignment between two recorded capabilities.
 
     Score = weighted intersection of compatible fields:
     - io_patterns: 0.25 weight
@@ -29,6 +29,9 @@ def match_capabilities(src: LibraryCapability, dst: LibraryCapability) -> Capabi
     - data_shape_constraints compatibility: 0.15 weight
     - runtime_reqs compatibility: 0.10 weight
     - license_compatibility: 0.10 weight
+
+    The result is a screening signal based on curated metadata, not a verified
+    compatibility result or a legal license determination.
     """
     alignment = CapabilityAlignment()
     warnings = []

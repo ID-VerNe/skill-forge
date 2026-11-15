@@ -8,16 +8,40 @@ import re
 
 
 def add_args(sub):
-    p_cross = sub.add_parser("cross-search", help="Search across multiple ecosystems")
+    from polyglot.glue.search_types import SUPPORTED_SCOUT_LANGUAGES
+    supported_languages = ",".join(SUPPORTED_SCOUT_LANGUAGES)
+
+    p_cross = sub.add_parser(
+        "cross-search",
+        help=f"Search across ecosystems (supported: {supported_languages})",
+        description=(
+            "Search package registries across supported scout ecosystems. "
+            f"Supported languages: {supported_languages}."
+        ),
+    )
     p_cross.add_argument("keyword", help="Search query")
-    p_cross.add_argument("--languages", default="", help="Comma-separated (python,javascript,rust)")
+    p_cross.add_argument("--languages", default="", help=f"Comma-separated language list (default: all; supported: {supported_languages})")
     p_cross.add_argument("--limit", type=int, default=5)
     p_cross.add_argument("--format", choices=["json", "markdown"], default="markdown")
 
-    p_cap = sub.add_parser("cap-list", help="List capability ontology entries")
+    p_cap = sub.add_parser(
+        "cap-list",
+        help="List the limited, manually curated starter capability registry",
+        description=(
+            "List the limited, manually curated capability starter dataset. "
+            "It is not a complete or live package index."
+        ),
+    )
     p_cap.add_argument("--format", choices=["json", "markdown"], default="markdown")
 
-    p_cap_match = sub.add_parser("cap-match", help="Match capabilities between two libraries")
+    p_cap_match = sub.add_parser(
+        "cap-match",
+        help="Heuristically compare registered library capabilities (not legal advice)",
+        description=(
+            "Compare manually curated capability records using heuristic scores. "
+            "License scores are not legal advice or a compliance determination."
+        ),
+    )
     p_cap_match.add_argument("src_lang", help="Source language")
     p_cap_match.add_argument("src", help="Source library name")
     p_cap_match.add_argument("dst_lang", help="Destination language")
@@ -59,15 +83,19 @@ def add_args(sub):
 def cmd_cross_search(args):
     """Search across multiple ecosystems simultaneously."""
     from polyglot.glue.aggregator import CrossLangScoutEngine
+    from polyglot.glue.search_types import SUPPORTED_SCOUT_LANGUAGES
     engine = CrossLangScoutEngine()
     languages = args.languages.split(",") if args.languages else None
     view = engine.batch_search(args.keyword, languages=languages, limit=args.limit)
     if args.format == "json":
         print(json.dumps({
             "tool": "cross_lang_scout",
+            "status": "partial" if view.errors else "complete",
             "query": view.query,
             "languages": view.targets,
+            "supported_languages": list(SUPPORTED_SCOUT_LANGUAGES),
             "coverage": view.coverage,
+            "errors": view.errors,
             "duration_ms": view.duration_ms,
             "candidates": [
                 {"name": c.name, "language": c.language, "version": c.version,
@@ -76,7 +104,9 @@ def cmd_cross_search(args):
             ],
         }, indent=2, ensure_ascii=False))
     else:
-        print(f"[v] Cross-language search for '{view.query}':")
+        print(f"[{'!' if view.errors else 'v'}] Cross-language search for '{view.query}' ({'partial' if view.errors else 'complete'}):")
+        if view.targets:
+            print(f"  Targets: {', '.join(view.targets)}")
         for lang, count in view.coverage.items():
             print(f"  [{lang}] {count} candidates")
         for c in view.candidates[:10]:
@@ -92,9 +122,18 @@ def cmd_cap_list(args):
     registry = get_registry()
     entries = registry.list_available()
     if args.format == "json":
-        print(json.dumps(entries, indent=2, ensure_ascii=False))
+        print(json.dumps({
+            "status": "curated_starter",
+            "scope": "limited_manual_dataset",
+            "notice": (
+                "This is a limited, manually curated starter dataset, not a complete "
+                "or live package index. Capability data is heuristic."
+            ),
+            "entries": entries,
+        }, indent=2, ensure_ascii=False))
     else:
-        print(f"Capability registry ({len(entries)} entries):")
+        print(f"Capability registry ({len(entries)} starter entries; limited and manually curated):")
+        print("  This is not a complete/live package index; capability data is heuristic.")
         for e in entries:
             print(f"  {e['key']}: {', '.join(e['io_patterns'])}")
 
@@ -113,7 +152,10 @@ def cmd_cap_match(args):
         sys.exit(1)
     alignment = registry.match(src_cap, dst_cap)
     if args.format == "json":
-        print(json.dumps(alignment.to_dict(), indent=2, ensure_ascii=False))
+        result = alignment.to_dict()
+        result["status"] = "heuristic_only"
+        result["notice"] = "Capability scores are heuristic signals; license scores are not legal advice or a compliance determination."
+        print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         print(f"[v] Capability match: {args.src_lang}:{args.src} <-> {args.dst_lang}:{args.dst}")
         print(f"  Overall score: {alignment.overall_score:.2f}")
@@ -124,6 +166,7 @@ def cmd_cap_match(args):
         if alignment.warnings:
             for w in alignment.warnings:
                 print(f"  [!] {w}")
+        print("  Note: capability and license scores are heuristic signals, not legal or compatibility determinations.")
 
 
 def cmd_bridge(args):

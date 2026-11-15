@@ -23,6 +23,43 @@ Verify that `python -m polyglot scout <lang> <keyword>` returns a list of candid
 ### Cross-search aggregates results
 Verify that `python -m polyglot cross-search` aggregates results from multiple language backends into a unified output.
 
+## Issue 59 Phase 4
+
+Offline regression tests for cross-search state and capability registry boundaries live in `test_issue59_phase4.py`.
+
+### Default cross-search ecosystem inventory
+Verify that an unconfigured batch search defaults to all eight supported scout backends, including PHP and Go.
+
+### Cross-search backend exceptions are visible
+Verify that a scout import or execution exception is recorded against its language and makes the overall search partial.
+
+### Backend errors retain partial results
+Verify that backend-reported errors remain visible while valid results from the same backend are retained.
+
+### Deadline rejects late worker outcomes
+Verify that a worker which finishes after its deadline is rejected even if the main thread collects it later.
+
+### Cross-search timeouts are explicit
+Verify that a worker still running at its deadline is marked timed out and its eventual results are excluded.
+
+### Cross-search CLI exposes status and backend inventory
+Verify that JSON and Markdown CLI output identify partial status and errors, and JSON lists attempted and supported ecosystems.
+
+### Cross-search convenience API exposes status
+Verify that the one-shot API returns partial/complete status, errors, and the supported ecosystem inventory.
+
+### Cross-search help lists supported ecosystems
+Verify that CLI help identifies the supported PHP and Go scout ecosystems along with the existing backends.
+
+### Fresh capability registries isolate mutable entries
+Verify that each registry call returns independent registry state and deep-copied built-in capability records.
+
+### Capability CLI labels heuristic limits
+Verify that Markdown cap-list and JSON cap-match output clearly describe curated capability data and scores as heuristic, not legal or compatibility determinations.
+
+### Capability JSON declares curated starter scope
+Verify that JSON cap-list output wraps entries with an explicit curated-starter status, limited scope, and a non-completeness notice.
+
 ### Deep-init creates workspace
 Verify that `python -m polyglot deep-init` creates the `.glue/deep/` directory structure with session.json.
 

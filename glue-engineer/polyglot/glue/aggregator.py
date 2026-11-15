@@ -1,7 +1,7 @@
 """
 polyglot/glue/aggregator.py — Cross-language scout engine.
 
-Wraps all 6 backend scouts in a coordinated fan-out that searches
+Wraps all 8 backend scouts in a coordinated fan-out that searches
 multiple ecosystems simultaneously and deduplicates results.
 
 DedupEngine lives in dedup.py.
@@ -26,6 +26,7 @@ from polyglot.glue.glue_schema import (
     BatchSearchConfig,
     resolve_alias,
 )
+from polyglot.glue.search_types import SUPPORTED_SCOUT_LANGUAGES
 from polyglot.glue.dedup import DedupEngine
 
 
@@ -55,35 +56,61 @@ class CrossLangScoutEngine:
         start = time.time()
         results = {}       # lang -> list[dict]
         errors = {}        # lang -> error string
-        threads = []
-        lock = threading.Lock()
+        workers = []
 
-        def _search_one(lang: str):
+        def _search_one(lang: str, outcome: dict, completed: threading.Event):
             try:
                 mod = self._import_scout(lang)
                 raw = mod.search(query, limit=self.config.limit_per_lang)
-                with lock:
-                    results[lang] = raw.get("results", [])
-                    if raw.get("errors"):
-                        errors[lang] = "; ".join(raw["errors"][:2])
+                if not isinstance(raw, dict):
+                    raise TypeError("Scout backend returned a non-object result")
+                outcome["results"] = raw.get("results", [])
+                backend_errors = raw.get("errors") or []
+                if isinstance(backend_errors, str):
+                    backend_errors = [backend_errors]
+                if backend_errors:
+                    outcome["error"] = "; ".join(str(error) for error in backend_errors[:2])
             except Exception as e:
-                with lock:
-                    errors[lang] = str(e)[:200]
+                outcome["error"] = str(e)[:200]
+            finally:
+                outcome["completed_at"] = time.monotonic()
+                completed.set()
 
-        for lang in self.config.languages:
-            t = threading.Thread(target=_search_one, args=(lang,), daemon=True)
+        targets = list(dict.fromkeys(self.config.languages))
+        for lang in targets:
+            outcome = {}
+            completed = threading.Event()
+            started_at = time.monotonic()
+            t = threading.Thread(
+                target=_search_one,
+                args=(lang, outcome, completed),
+                daemon=True,
+            )
             t.start()
-            threads.append(t)
+            workers.append((lang, outcome, completed, started_at))
 
-        for t in threads:
-            t.join(timeout=self.config.timeout_per_lang)
+        for lang, outcome, completed, started_at in workers:
+            deadline = started_at + self.config.timeout_per_lang
+            remaining = max(0.0, deadline - time.monotonic())
+            finished_in_time = completed.wait(timeout=remaining)
+            completed_at = outcome.get("completed_at")
+            if not finished_in_time or completed_at is None or completed_at > deadline:
+                errors[lang] = f"Timed out after {self.config.timeout_per_lang} seconds"
+                continue
+            if outcome.get("error"):
+                errors[lang] = outcome["error"]
+            backend_results = outcome.get("results", [])
+            if isinstance(backend_results, list):
+                results[lang] = backend_results
+            else:
+                errors[lang] = "Scout backend returned a non-array 'results' value"
 
         elapsed = int((time.time() - start) * 1000)
 
         # Build CrossLangSearchView
         view = CrossLangSearchView(
             query=query,
-            targets=list(self.config.languages),
+            targets=targets,
             duration_ms=elapsed,
         )
 
@@ -165,8 +192,10 @@ def cross_search(query: str, languages: Optional[list] = None, limit: int = 5) -
     return {
         "tool": "cross_lang_scout",
         "schema": "cross-lang-search-v1",
+        "status": "partial" if view.errors else "complete",
         "query": view.query,
         "languages": view.targets,
+        "supported_languages": list(SUPPORTED_SCOUT_LANGUAGES),
         "duration_ms": view.duration_ms,
         "coverage": view.coverage,
         "errors": view.errors,
