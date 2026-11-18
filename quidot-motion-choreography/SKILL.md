@@ -16,9 +16,12 @@ Your sole responsibility here is **how UI geometry dynamically deforms, bridges,
 
 ## 1. Compatibility Rules (Layering on Apple UI Principles)
 - **Inherit Geometry & Theme**: Apply deformations relative to whatever shape, size, and color tokens the component already uses.
-- **Always Interruptible**: Never lock input or rely on non-interruptible fixed timelines. Drive every morph via continuous Spring physics (`useSpring` / `Animatable`) so mid-flight reversal carries velocity seamlessly.
+- **Always Interruptible**: Never lock input, never chain a morph from a fixed timeline (`setTimeout` choreography, keyframe sequences, timer-driven "pulse" booleans). Drive every morph via continuous Spring physics (`useSpring` / `Animatable`) so mid-flight reversal carries velocity seamlessly. The one allowed one-shot is a **self-terminating impulse**: a spring whose target never moves, kicked by an initial `velocity` (Web) or seeded from the press state (Compose). It owns no timer, so a reversal during the pulse simply re-targets the same spring instead of stacking a second animation.
 - **Zero-Latency Down State**: Trigger tactile compression and elastic cues immediately on `pointerdown` (Web) or `awaitFirstDown` / `MutableInteractionSource` press (Compose), never waiting for `click` release.
-- **Respect Reduced Motion**: Honor `prefers-reduced-motion` (Web) or system animator scale / reduced motion settings (Compose) by collapsing stretches and bends into gentle fades or instant states.
+- **Respect Reduced Motion**: Honor `prefers-reduced-motion` (Web) or system animator scale / reduced motion settings (Compose). The two platforms need different work, and assuming otherwise is the most common defect in this area:
+  - **Compose**: `Animatable`, `animate*AsState` and `spring()` read `MotionDurationScale` from the composition context and collapse automatically. Write the motion normally; do not hand-roll a reduced-motion branch.
+  - **Web**: `<MotionConfig reducedMotion="user">` covers **only** `transform`, `opacity` and `layout` projection. It does **not** touch attribute animations — `boxShadow`, `filter`, SVG `d`, `width`/`height`, or any explicit `useMotionValue` + imperative `animate()` call. Any recipe built on those must branch on `useReducedMotion()` itself.
+  - Under reduced motion, **remove the deformation instead of shortening it**. An instant jump to a 1.32x size and an instant jump back is a full-frame flash of the whole control, which is worse for vestibular sensitivity than a smooth animation. Keep geometry at rest and carry the feedback on `opacity` or color.
 
 ## 2. Stack Detection & Execution Routing
 Before writing code, detect the target platform from the workspace or prompt:

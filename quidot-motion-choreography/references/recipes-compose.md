@@ -27,6 +27,8 @@ fun ElongatingValueContainer(
 ) {
     val stretch = remember { Animatable(1f) }
 
+    // Two-stage animateTo is interruptible: a new value cancels the in-flight
+    // animation and re-targets the same Animatable, carrying its velocity.
     LaunchedEffect(value) {
         stretch.animateTo(1.28f, spring(dampingRatio = 0.6f, stiffness = 620f))
         stretch.animateTo(1f, spring(dampingRatio = 0.62f, stiffness = 400f))
@@ -41,21 +43,35 @@ fun ElongatingValueContainer(
             }
             .clipToBounds()
     ) {
-        AnimatedContent(
-            targetState = value,
-            transitionSpec = {
-                (slideInHorizontally(spring(0.78f, 420f)) { direction * it } + fadeIn())
-                    .togetherWith(
-                        slideOutHorizontally(spring(0.78f, 420f)) { -direction * it } + fadeOut()
-                    )
-            },
-            label = "elongating_value"
-        ) { target ->
-            content(target)
+        // Nested graphicsLayer inside the scaled box divides the horizontal
+        // stretch back out. Without it the AnimatedContent text is stretched
+        // by the same 1.28x as the container (see the note below).
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.graphicsLayer { scaleX = 1f / stretch.value }
+        ) {
+            AnimatedContent(
+                targetState = value,
+                transitionSpec = {
+                    (slideInHorizontally(spring(0.78f, 420f)) { direction * it } + fadeIn())
+                        .togetherWith(
+                            slideOutHorizontally(spring(0.78f, 420f)) { -direction * it } + fadeOut()
+                        )
+                },
+                label = "elongating_value"
+            ) { target ->
+                content(target)
+            }
         }
     }
 }
 ```
+
+**The counter-scale layer is mandatory, not decorative.** `scaleX` on an outer `graphicsLayer` scales every descendant, text included; nesting `graphicsLayer { scaleX = 1f / stretch.value }` keeps the glyphs' advance width constant while the container still stretches. Both sides of the `Box` read `stretch.value` inside the draw lambda, so neither causes recomposition.
+
+**Peak width must be budgeted by the caller.** A 1.28x stretch overflows any fixed-width cell, and `.clipToBounds()` on the outer `Box` will clip it. Either reserve the peak width in the parent, or put `clipToBounds` on an inner wrapper that is sized for the peak.
+
+**Reduced motion needs no branch here.** `Animatable.animateTo` with a `spring()` reads `MotionDurationScale` from the composition (fed by `Settings.Global.animator_duration_scale`), so the whole thing collapses automatically when the system scale is 0 — verified on-device: zero intermediate frames in every stage. This is a genuine difference from the Web side, where `<MotionConfig reducedMotion="user">` does not reach `useMotionValue` + `animate()` at all. Do not copy the Web `useReducedMotion()` branch into Compose code.
 
 ---
 
@@ -160,6 +176,16 @@ fun RowScope.MorphingClusterItem(
     content: @Composable () -> Unit
 ) {
     val springSpecFloat = remember { spring<Float>(dampingRatio = 0.72f, stiffness = 420f) }
+    // 1.6f is a *weight*, not a width ratio. Row distributes its width by
+    // weight, so for N equal-weight siblings where one goes 1 -> 1.6:
+    //   - active vs. a neighbour: exactly 1.6x (a weight ratio, independent of N)
+    //   - active vs. its own resting width: 1.6N/(N + 0.6) — 1.00 at N=1,
+    //     1.23 at N=2, 1.33 at N=3, 1.51 at N=10, approaching 1.6 as N grows
+    // In a 2- or 3-item cluster the visible growth is therefore ~1.23-1.33x,
+    // not the 1.6 the literal suggests. (Idealized: ignores min-width, padding,
+    // and any fixed-size siblings, all of which change the split.)
+    // There is deliberately no `scale` here: scaling a Row item paints outside
+    // its cell and overlaps the neighbours instead of making them yield space.
     val weight by animateFloatAsState(if (isActive) 1.6f else 1f, springSpecFloat, label = "weight")
     val height by animateDpAsState(if (isActive) activeHeight else restingSize, spring(0.72f, 420f), label = "height")
     val cornerPercent by animateIntAsState(if (isActive) activeCornerPercent else 50, spring(0.75f, 420f), label = "corner")
