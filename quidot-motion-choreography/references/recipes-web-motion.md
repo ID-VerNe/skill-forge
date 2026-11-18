@@ -4,21 +4,24 @@ All patterns assume React + `motion/react` (Framer Motion). Preserve the host co
 
 ## What `<MotionConfig reducedMotion="user">` actually covers
 
-Wrap the tree in `<MotionConfig reducedMotion="user">`, but do not assume it handles every recipe below. It suppresses **only** `transform`, `opacity`, and `layout` projection animations.
+Wrap the tree in `<MotionConfig reducedMotion="user">`, but do not assume it handles every recipe below. Read the implementation before trusting a summary of it: `motion-dom`'s `visual-element-target.mjs` applies the reduce branch only to keys in `positionalKeys`, which is `width`, `height`, `top`, `left`, `right`, `bottom` plus every transform key. Everything else — including `opacity` — animates normally.
 
-| Carrier used by a recipe | Suppressed by `MotionConfig`? |
+| Carrier used by a recipe | Collapsed under reduce? |
 |---|---|
-| `transform` (`scaleX`, `scaleY`, `scale`, `x`, `y`, `rotate`) | Yes |
-| `opacity` | Yes |
-| `layout` / `layoutId` projection | Yes |
+| `transform` (`scaleX`, `scaleY`, `scale`, `x`, `y`, `rotate`, …) | Yes — snapped to the end value |
+| `width` / `height` / `top` / `left` / `right` / `bottom` | Yes — snapped to the end value |
+| `layout` / `layoutId` projection | Yes (separate projection-node check) |
+| **`opacity`** | **No — animates as usual** |
 | CSS `boxShadow`, `filter`, `background-color` | **No** — attribute animation |
 | SVG `d`, `viewBox`, `pathLength` | **No** — attribute animation |
-| `width` / `height` / `flexGrow` / `borderRadius` | **No** — layout, not projection |
+| `flexGrow` / `borderRadius` | **No** — not in `positionalKeys` |
 | Any `useMotionValue` + imperative `animate()` you call yourself | **No** — outside the config context |
 
-Recipes 2 and 5 fall on the "No" side, so they branch on `useReducedMotion()` explicitly. Recipes 3, 4 and 6 stay entirely on `transform` / `opacity` / `layout` and need no branch. Recipe 1 animates `transform` only, which the config would suppress — but it also drives that transform through `useMotionValue` + imperative `animate()`, which the config cannot see, so it carries its own `useReducedMotion()` guard.
+The `opacity` row is the one people get wrong, and it is the row this skill depends on: every recipe below that needs a reduced-motion fallback uses `opacity`, and it only works *because* the config leaves `opacity` alone. Verified: with `reducedMotion: "reduce"`, a `scaleX` swing collapses to a single rendered value while the `opacity` crossfade still produces 18–20 intermediate values on the same page.
 
-Under reduced motion the goal is to **remove the deformation**, not to compress it into a single frame: an instant jump to a 1.32x size and straight back flashes the entire control, which reads worse to a vestibular-sensitive user than a smooth animation. Keep geometry at rest and move the feedback onto opacity.
+Recipes 2 and 5 animate carriers the config cannot reach, so they branch on `useReducedMotion()` explicitly. Recipes 3, 4 and 6 stay on carriers that are collapsed automatically and need no branch. Recipe 1 animates `transform`, which the config *would* collapse — but it drives that transform through `useMotionValue` + imperative `animate()`, which the config cannot see at all, so it carries its own guard.
+
+Under reduced motion the goal is to **remove the deformation**, not to compress it into a single frame: an instant jump to a 1.32x size and straight back flashes the entire control, which reads worse to a vestibular-sensitive user than a smooth animation. Keep geometry at rest and move the feedback onto `opacity`.
 
 ---
 

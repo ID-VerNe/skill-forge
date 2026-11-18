@@ -107,8 +107,20 @@ def t_d1_reduced_motion_split():
         "Compose" in solo and ("自动" in solo or "automatically" in solo),
         "SKILL.md 未写明 Compose 侧自动响应 animator scale",
     )
-    for carrier in ("transform", "opacity", "layout"):
-        require(carrier in solo, "SKILL.md 未点名 MotionConfig 只覆盖 %s" % carrier)
+    for carrier in ("transform", "layout", "positionalKeys"):
+        require(carrier in solo, "SKILL.md 未点名 MotionConfig 的覆盖范围（%s）" % carrier)
+    # 源码核对结论：opacity 不在 positionalKeys 里，reduce 下照常动画。
+    # 断言文档不再把 opacity 错列为"被抑制"，否则所有 reduce fallback 的
+    # 设计前提就是错的。
+    require(
+        "does **not** touch `opacity`" in solo or "does not touch `opacity`" in solo,
+        "SKILL.md 未写明 opacity 不受 MotionConfig 抑制——这是 reduce fallback "
+        "使用 opacity 的前提，写错会导致读者以为 opacity 也会被吞掉",
+    )
+    require(
+        "width" in solo and "height" in solo,
+        "SKILL.md 未说明 width/height 属于会被折叠的位置类属性",
+    )
     require(
         "boxShadow" in solo or "attribute" in solo or "属性动画" in solo,
         "SKILL.md 未指出属性动画（boxShadow / SVG d）不受 MotionConfig 抑制",
