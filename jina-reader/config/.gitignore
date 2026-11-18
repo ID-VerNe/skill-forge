@@ -1,0 +1,4 @@
+# 本地实际配置（含主机别名，不入版本库）
+endpoints.json
+gateway.pid
+gateway.log

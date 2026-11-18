@@ -1,0 +1,23 @@
+{
+  "_comment": "COPY TO endpoints.json AND FILL. This file uses placeholders only.",
+  "port": 8767,
+  "endpoints": [
+    {
+      "name": "local",
+      "mode": "direct",
+      "domain": "r.jinaai.cn"
+    },
+    {
+      "name": "edge-a",
+      "mode": "ssh",
+      "alias": "<SSH_ALIAS_FOR_FIRST_REMOTE>",
+      "domain": "r.jinaai.cn"
+    },
+    {
+      "name": "edge-b",
+      "mode": "ssh",
+      "alias": "<SSH_ALIAS_FOR_SECOND_REMOTE>",
+      "domain": "r.jina.ai"
+    }
+  ]
+}
