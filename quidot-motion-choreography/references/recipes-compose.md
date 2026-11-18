@@ -17,6 +17,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
+import kotlinx.coroutines.launch
 
 @Composable
 fun ElongatingValueContainer(
@@ -26,12 +27,20 @@ fun ElongatingValueContainer(
     content: @Composable (Int) -> Unit
 ) {
     val stretch = remember { Animatable(1f) }
+    // The pulse runs on the composition scope, not inside the keyed effect:
+    // a key change cancels that effect's coroutine and leaves the Animatable
+    // frozen wherever it was — a control stuck mid-stretch.
+    val scope = rememberCoroutineScope()
 
-    // Two-stage animateTo is interruptible: a new value cancels the in-flight
-    // animation and re-targets the same Animatable, carrying its velocity.
     LaunchedEffect(value) {
-        stretch.animateTo(1.28f, spring(dampingRatio = 0.6f, stiffness = 620f))
-        stretch.animateTo(1f, spring(dampingRatio = 0.62f, stiffness = 400f))
+        // Self-terminating impulse: the target never leaves 1f, the overshoot
+        // comes entirely from initialVelocity. Animatable's MutatorMutex
+        // cancels any running animateTo when a new one starts, so nothing is
+        // stacked; the guard below only stops repeat taps compounding energy.
+        if (stretch.value > 1.0001f) return@LaunchedEffect
+        scope.launch {
+            stretch.animateTo(1f, spring(dampingRatio = 1f, stiffness = 520f), initialVelocity = 20f)
+        }
     }
 
     Box(
@@ -71,7 +80,11 @@ fun ElongatingValueContainer(
 
 **Peak width must be budgeted by the caller.** A 1.28x stretch overflows any fixed-width cell, and `.clipToBounds()` on the outer `Box` will clip it. Either reserve the peak width in the parent, or put `clipToBounds` on an inner wrapper that is sized for the peak.
 
-**Reduced motion needs no branch here.** `Animatable.animateTo` with a `spring()` reads `MotionDurationScale` from the composition (fed by `Settings.Global.animator_duration_scale`), so the whole thing collapses automatically when the system scale is 0 — verified on-device: zero intermediate frames in every stage. This is a genuine difference from the Web side, where `<MotionConfig reducedMotion="user">` does not reach `useMotionValue` + `animate()` at all. Do not copy the Web `useReducedMotion()` branch into Compose code.
+**Reduced motion needs no branch here — but only because the pulse is self-terminating.** `Animatable.animateTo` with a `spring()` reads `MotionDurationScale` from the coroutine context, and that scale is fed from `Settings.Global.animator_duration_scale` (`WindowRecomposer.readAnimationScale`, kept current through a `ContentObserver`). A scale of 0 does not slow the animation down; `SuspendAnimationKt.doAnimationFrameWithScale` sets `playTime = animation.getDurationNanos()` on the first frame, so the animation renders its end value immediately.
+
+That is exactly right for an impulse aimed at the resting value: the end value *is* the state the control is already in, so the whole pulse collapses to nothing. Measured on a MI 9 at scale 0: the `stretch` value logged a single `1.00000` for the lifetime of the tap, while the digit still advanced — the deformation disappeared and the function did not. Measured at scale 1 for comparison: peak 1.31976 decaying over ~250ms.
+
+It is **wrong** for a pulse written as a two-stage target change (`animateTo(1.28f)` then `animateTo(1f)`). At scale 0 that pair renders one frame at 1.28x and the next back at rest — the full-frame flash this skill tells you to avoid, produced by the very collapse you relied on. If you write the pulse that way you must branch; the impulse form removes the need. This is a deliberate difference from the Web side, where `<MotionConfig reducedMotion="user">` does not reach `useMotionValue` + `animate()` at all.
 
 ---
 

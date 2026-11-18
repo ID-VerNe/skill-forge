@@ -26,6 +26,7 @@ D8 在缺 esbuild/typescript 时**跳过并打印原因**，不假装通过—�
   D5 Web recipe 3 写明了 flexGrow 与 scale 叠加后的有效比值
   D6 Compose recipe 1 有内层反向缩放；recipe 3 写明了 weight 不是宽度比；
      Compose 侧不出现手工 reduced-motion 分支
+  D6d Compose recipe 1 用自终止脉冲，不用两段式目标切换（reduce 下会闪一帧）
   D7 Web 文件头有 MotionConfig 载体覆盖矩阵
   D8 文档里的 tsx 代码块能被真实解析（链条语法错误 / JSX 注释位置写错）
 
@@ -263,6 +264,39 @@ def t_d6c_compose_no_manual_reduce_branch():
     )
 
 
+def t_d6d_compose_recipe1_is_impulse():
+    """Compose recipe 1 必须是自终止脉冲，不能是两段式目标切换。
+
+    字节码核对：scale==0 时 doAnimationFrameWithScale 把 playTime 直接设成
+    durationNanos，动画首帧渲染终值。于是 animateTo(peak)+animateTo(rest)
+    在 reduce 下变成「一帧峰值、一帧回位」的全帧闪烁——正是 SKILL.md 自己
+    判定为「比平滑动画更糟」的东西。自终止脉冲的终值就是静止值，压缩后是
+    无变化，这条矛盾才消失。
+    """
+    text = read("references", "recipes-compose.md")
+    sec = text[text.index("## 1. Transient Axis Elongation"):]
+    sec = sec[:sec.index("\n## 2.")]
+    body = "\n".join(code_blocks(sec))
+
+    require("initialVelocity" in body,
+            "Compose recipe 1 没用 initialVelocity 造脉冲，峰值来自目标切换")
+    require(
+        re.search(r"animateTo\(\s*1f\s*,", body),
+        "Compose recipe 1 的 animateTo 目标不是静止值 1f（不是自终止脉冲）",
+    )
+    require(
+        not re.search(r"animateTo\(\s*1\.[0-9]+f\s*,", body),
+        "Compose recipe 1 仍在 animateTo 一个峰值目标——reduce 下会闪一帧",
+    )
+    require("rememberCoroutineScope" in body and "launch" in body,
+            "Compose recipe 1 的脉冲没跑在 remembered scope 上；"
+            "放进 keyed LaunchedEffect 会在 key 变化时被取消并把 Animatable 冻住")
+    require(
+        re.search(r"stretch\.value\s*>", body),
+        "Compose recipe 1 缺少脉冲进行中的重入守卫（连点会累积速度）",
+    )
+
+
 # ---------------------------------------------------------------- D7
 def t_d7_web_header_boundary_table():
     """文件头必须写明 MotionConfig 覆盖不到的载体。"""
@@ -405,6 +439,7 @@ def main():
     test("D6 Compose recipe 1 反向缩放", t_d6_compose_recipe1_counter_scale)
     test("D6b Compose recipe 3 weight 语义", t_d6b_compose_recipe3_weight_semantics)
     test("D6c Compose 无手工 reduce 分支", t_d6c_compose_no_manual_reduce_branch)
+    test("D6d Compose recipe 1 是自终止脉冲", t_d6d_compose_recipe1_is_impulse)
     test("D8 文档 tsx 片段可解析", t_d8_documented_tsx_parses)
     print()
     if FAILED_NAMES:
