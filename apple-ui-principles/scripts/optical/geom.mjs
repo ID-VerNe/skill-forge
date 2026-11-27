@@ -225,11 +225,34 @@ function selfCrossingMatters(poly, area) {
  * own start, and telling a genuine pinch from ordinary curve noise needs more
  * than a vertex-position check. Refusing is the cheap honest answer.
  */
-function cancelsToNothing(poly) {
+function cancelsToNothing(poly, sceneArea) {
   if (Math.abs(subpathSignedArea(poly)) >= 1e-12) return false;
   const box = bboxOfPoints(poly);
   if (!box) return false;
-  return (box.maxX - box.minX) * (box.maxY - box.minY) > 1e-9;
+  const span = (box.maxX - box.minX) * (box.maxY - box.minY);
+  if (span <= 1e-9) return false; // an empty `M4 4z` fragment spans nothing
+  // Exporters leave hair-thin wiggles that cancel to zero area on their own —
+  // antd's outlined Chrome has a 1.98-unit² over-and-back on an 832-unit canvas.
+  // Refusing those would drop the whole logo for a rounding error.
+  return span > SELF_CROSSING_TOLERANCE * Math.max(sceneArea, 1e-9);
+}
+
+/** Union bbox area of a set of subpaths — the scale a cancellation is judged on. */
+function sceneAreaOf(subpaths) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const sub of subpaths) {
+    const box = bboxOfPoints(sub);
+    if (!box) continue;
+    if (box.minX < minX) minX = box.minX;
+    if (box.minY < minY) minY = box.minY;
+    if (box.maxX > maxX) maxX = box.maxX;
+    if (box.maxY > maxY) maxY = box.maxY;
+  }
+  if (!Number.isFinite(minX)) return 0;
+  return (maxX - minX) * (maxY - minY);
 }
 
 export function netShape(subpaths) {
@@ -237,8 +260,9 @@ export function netShape(subpaths) {
   // doubles the area and drags the centroid towards it, so refuse instead.
   const boxes = subpaths.map((sub) => bboxOfPoints(sub));
   const areas = subpaths.map((sub) => Math.abs(subpathSignedArea(sub)));
+  const sceneArea = sceneAreaOf(subpaths);
   for (let i = 0; i < subpaths.length; i += 1) {
-    if (cancelsToNothing(subpaths[i])) {
+    if (cancelsToNothing(subpaths[i], sceneArea)) {
       return { area: 0, cx: 0, cy: 0, selfIntersecting: true };
     }
   }
@@ -457,8 +481,9 @@ export function netShapeEvenOdd(subpaths) {
   // Even-odd has the same blind spot: it counts boundary crossings, and a
   // subpath that crosses itself produces crossings the containment test never
   // sees. A bowtie is the cheap case (zero shoelace area, non-zero paint).
+  const sceneArea = sceneAreaOf(subpaths);
   for (const item of items) {
-    if (selfCrossingMatters(item.sub, item.area) || cancelsToNothing(item.sub)) {
+    if (selfCrossingMatters(item.sub, item.area) || cancelsToNothing(item.sub, sceneArea)) {
       return { area: 0, cx: 0, cy: 0, overlapping: false, selfIntersecting: true };
     }
   }

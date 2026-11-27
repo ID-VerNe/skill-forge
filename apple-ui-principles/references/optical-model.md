@@ -54,7 +54,7 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | a matching rule that declares `animation` / `animation-name` (other than `none`) | `geometry/unresolved-graphics` (`css-animation`) — the paint comes from a `@keyframes` block this pass does not evaluate |
 | `fill` / `stroke` set to `var()` or `env()` | `geometry/unresolved-graphics` (`runtime-paint`) — the value is defined outside the file |
 | `<?xml-stylesheet?>` pointing at an external sheet | `geometry/unresolved-graphics` (`external-stylesheet`) |
-| animation that moves ink (`animateTransform`, `animateMotion`, `animate` on a geometry attribute, or on `fill`/`stroke` with a `none` endpoint) | `geometry/unresolved-graphics` (`animated-ink`) — one frame is not the drawing |
+| animation that moves ink (`animateTransform`, `animateMotion`, `animate` on a geometry attribute, or on `fill`/`stroke`/an opacity reaching zero paint) | `geometry/unresolved-graphics` (`animated-ink`) — one frame is not the drawing |
 | ink that leaves its viewport | `geometry/unresolved-graphics` (`ink-outside-viewport`) — the browser clips it |
 | groups nested more than 200 deep | `geometry/unresolved-graphics` (`nesting-too-deep`) |
 | two subpaths with the same outline | `geometry/unresolved-graphics` (`overlapping-subpaths`) — they cancel under even-odd and render once under nonzero, so the sum is wrong either way |
@@ -287,6 +287,17 @@ sums the bounding boxes of the crossing segments as an upper bound on the
 doubled region and refuses when that exceeds 0.1% of the subpath's own area.
 Below that the outline is measured as if it were simple; the error it introduces
 is smaller than the tolerance the verdict is judged against.
+
+A related case slips past the crossing test: a figure-eight
+(`M12 12 L4 2 L2 12 L12 12 L20 2 L22 12 Z`) is two loops joined at one vertex,
+wound in opposite directions, so its area is exactly zero while both paint.
+Splitting the outline into loops at the shared vertex would be exact, but arcs
+flatten into polylines that revisit their own start, and telling a real pinch
+from ordinary curve noise needs more than vertex positions. The checker therefore
+refuses any subpath whose area cancels to zero while its bounding box covers more
+than 0.1% of the drawing — an empty `M4 4z` fragment spans nothing at all, and
+antd's Chrome logo carries a 1.98-unit² over-and-back on an 832-unit canvas that
+must not cost the whole file.
 
 **What is still approximate.** Three things, and they are why `off` on
 `geometry/centroid` deserves a second look at the artwork:
