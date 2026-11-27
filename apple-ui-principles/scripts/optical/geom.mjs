@@ -228,6 +228,10 @@ export function netShape(subpaths) {
   }
   for (let i = 0; i < subpaths.length; i += 1) {
     for (let j = i + 1; j < subpaths.length; j += 1) {
+      // Two fragments that paint nothing are not one outline drawn twice. Empty
+      // `M4 4z` runs share a degenerate box and an area of zero, so the outline
+      // test below called them duplicates and threw the whole shape away.
+      if (areas[i] <= 1e-9 || areas[j] <= 1e-9) continue;
       if (sameOutline(boxes[i], boxes[j], areas[i], areas[j])) {
         return { area: 0, cx: 0, cy: 0, overlapping: true };
       }
@@ -437,8 +441,10 @@ export function netShapeEvenOdd(subpaths) {
     for (let j = i + 1; j < items.length; j += 1) {
       // Identical outlines cancel to nothing under even-odd, but they leave every
       // vertex `boundary` and no containment, so the nesting pass below would
-      // count both at full weight. Catch them first.
-      if (sameOutline(items[i].box, items[j].box, items[i].area, items[j].area)) {
+      // count both at full weight. Catch them first — but only when both paint
+      // something, or a pair of empty `M…z` runs at one point looks identical.
+      if (items[i].area > 1e-9 && items[j].area > 1e-9 &&
+          sameOutline(items[i].box, items[j].box, items[i].area, items[j].area)) {
         overlapping = true;
         continue;
       }

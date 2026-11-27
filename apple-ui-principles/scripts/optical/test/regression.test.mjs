@@ -1589,3 +1589,19 @@ test('a half-parsed path inside a viewport is reported, not dropped', () => {
   assert.match(shape.unresolved.join(), /unparsed-path/);
   assert.equal(checkShape(shape, { target: 'sym-path.svg' }).verdict, 'unknown');
 });
+
+test('empty moveto fragments are not duplicate outlines', () => {
+  // `M4 4z` twice paints nothing twice. Both fragments share a degenerate box
+  // and an area of zero, so the duplicate-outline test called them one region
+  // drawn twice and threw away the icon's real ink with them.
+  const shape = analyzeSvg(svg('<path d="M4 4zM4 4z"/><rect x="2" y="0" width="20" height="24"/>'));
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 480, 1e-6);
+
+  // The same test on two outlines that do paint is still a refusal: equal box
+  // and equal area do not prove equal shape, so the answer stays `unknown`.
+  const duplicate = analyzeSvg(
+    svg('<path d="M0 0h10v10h-10z M0 0h10v10h-10z"/><rect x="14" y="0" width="10" height="24"/>'),
+  );
+  assert.match(duplicate.unresolved.join(), /overlapping-subpaths/);
+});
