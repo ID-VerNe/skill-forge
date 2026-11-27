@@ -1559,6 +1559,12 @@ test('two lobes meeting at a vertex are refused only when they subtract', () => 
   );
   assert.ok(mixed.unresolved.includes('self-intersecting'), JSON.stringify(mixed.unresolved));
 
+  // The fill rule does not change the geometry of the lie.
+  const evenOdd = analyzeSvg(
+    svg('<path d="M12 12 L4 2 L2 12 L12 12 L16 8 L17 12 Z" fill-rule="evenodd"/>'),
+  );
+  assert.ok(evenOdd.unresolved.includes('self-intersecting'), JSON.stringify(evenOdd.unresolved));
+
   // Wound the same way the lobes add up and the shoelace total is the painted
   // area. Refusing this would be the over-correction that blinds a real icon.
   const same = analyzeSvg(
@@ -1676,6 +1682,64 @@ test('width/height on a <use> of a plain group is ignored, not refused', () => {
   );
   assert.deepEqual(shape.unresolved, []);
   near(shape.ink.area, 144, 1e-6);
+});
+
+test('a retraced edge is a hole, not two lobes to subtract', () => {
+  // `file-zip` and friends retrace an edge: the inner lobe sits *inside* the
+  // outer one, so non-zero fill subtracts it and the shoelace total is right.
+  // Refusing these blinded 2 of 8 real icons in one sample.
+  const retraced = analyzeSvg(
+    svg('<path d="M0 0 H20 V20 H0 L0 0 L0 6 L6 0 Z"/>'),
+  );
+  assert.deepEqual(retraced.unresolved, []);
+  // Chrome renders exactly this much ink for the same path.
+  near(retraced.ink.area, 382, 1e-6);
+});
+
+test('a hole that meets its container at a corner still subtracts', () => {
+  // Every vertex of the hole lies on the container's outline, so the vertex test
+  // found no interior point and the hole was counted as a second island: 418
+  // where the render paints 382. The centroid is not a vertex and still knows.
+  for (const rule of ['nonzero', 'evenodd']) {
+    const shape = analyzeSvg(
+      svg(`<path d="M0 0 H20 V20 H0 Z M0 0 V6 L6 0 Z" fill-rule="${rule}"/>`),
+    );
+    assert.deepEqual(shape.unresolved, [], rule);
+    near(shape.ink.area, 382, 1e-6);
+  }
+});
+
+test('a stroke width whose area overflows is refused, not reported as NaN', () => {
+  // `1e308` is finite, so the infinity check on the width passed; the band area
+  // then overflowed to Infinity and the centroid to NaN, and NaN compares false
+  // against every tolerance — the report came back `off` with `cx: NaN`.
+  const shape = analyzeSvg(
+    svg('<rect width="24" height="24" fill="none" stroke="#000" stroke-width="1e308"/>'),
+  );
+  assert.ok(shape.unresolved.includes('non-finite-ink'), JSON.stringify(shape.unresolved));
+  assert.ok(Number.isFinite(shape.ink.area), `area ${shape.ink.area}`);
+});
+
+test('a transform with an empty argument is malformed, not a shorter list', () => {
+  // Splitting `translate(10,)` produced one number, so the element moved by 10
+  // as if the attribute were well formed.
+  for (const t of ['translate(10,)', 'translate(,10)', 'translate(1,,2)']) {
+    const shape = analyzeSvg(svg(`<g transform="${t}"><rect width="2" height="2"/></g>`));
+    assert.deepEqual(shape.unresolved, [], t);
+    near(shape.ink.bbox.minX, 0, 1e-9);
+  }
+});
+
+test('a fallback paint of none paints nothing', () => {
+  // `url(#g) none` is a valid declaration whose fallback resolves to "no paint".
+  for (const fallback of ['none', 'transparent']) {
+    const shape = analyzeSvg(
+      svg(`<rect x="2" y="2" width="20" height="20" fill="url(#missing) ${fallback}"/>`),
+    );
+    assert.equal(shape.noInk, true, fallback);
+  }
+  const painted = analyzeSvg(svg('<rect x="2" y="2" width="20" height="20" fill="url(#missing) red"/>'));
+  near(painted.ink.area, 400, 1e-6);
 });
 
 test('a paint that resolves at runtime is refused, not guessed', () => {

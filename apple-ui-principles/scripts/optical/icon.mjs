@@ -453,7 +453,13 @@ function paintReference(paint, ctx) {
   if (paint === undefined || paint === null) return 'paint';
   const match = /^url\(\s*['"]?#([^)'"\s]+)['"]?\s*\)([\s\S]*)$/i.exec(String(paint).trim());
   if (!match) return 'paint';
-  if (match[2].trim() !== '') return 'paint';
+  const fallback = match[2].trim();
+  // `url(#g) red` falls back to the colour, so a broken reference still paints.
+  // `url(#g) none` falls back to *not* painting, and reading it as painted put a
+  // 20×20 block of ink on the canvas for a shape the render leaves empty.
+  if (fallback !== '') {
+    return keywordIs(fallback, 'none') || isInvisiblePaint(fallback) ? 'absent' : 'paint';
+  }
   const target = ctx.ids.get(match[1]);
   if (!target) return 'absent';
   return PAINT_SERVER.has(String(target.tag).toLowerCase()) ? 'paint' : 'unknown';
@@ -1182,7 +1188,16 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
   const totalArea = filledArea + strokeArea;
   const finalBox = bboxUnion(bbox, strokeBox);
 
-  if (totalArea <= 1e-9 || !finalBox) {
+  // `stroke-width="1e308"` is a finite number with an infinite consequence: the
+  // band area overflows, the centroid becomes NaN, and a NaN compares false
+  // against every tolerance — so the report used to come back `off` with
+  // `area: Infinity, cx: NaN` rather than with a gap. A non-finite number is not
+  // a measurement; say so instead of shipping the NaN.
+  if (!Number.isFinite(totalArea) || !Number.isFinite(filledArea) || !Number.isFinite(strokeArea)) {
+    ctx.unresolved.add('non-finite-ink');
+  }
+
+  if (totalArea <= 1e-9 || !finalBox || !Number.isFinite(totalArea)) {
     return {
       viewBox,
       ink: { bbox: null, area: 0, centroid: { cx: 0, cy: 0 } },

@@ -30,6 +30,9 @@ const PAINT = new Set([
   // made the element look unmasked — a confident `ok` on ink nobody can measure.
   'mask',
   'filter',
+  // `marker` is the shorthand for all three; without it a class that sets
+  // `marker: url(#arrow)` looked like a class that sets nothing.
+  'marker',
   'marker-start',
   'marker-mid',
   'marker-end',

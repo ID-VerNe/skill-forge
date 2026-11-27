@@ -262,11 +262,21 @@ function cancelsToNothing(poly, sceneArea) {
  * `M12 12 L4 2 L2 12 L12 12 L16 8 L17 12 Z` never crosses itself — the two
  * triangles meet at (12,12) — so the crossing test stays quiet. Shoelace still
  * walks them in sequence, and opposite winding makes it *subtract* one lobe from
- * the other: 50 − 10 = 40 where the render paints 60. Splitting the outline at
- * its repeated vertices recovers both loops; when their signs disagree the
- * shoelace total is not a painted area and the shape has to be refused.
+ * the other: 50 − 10 = 40 where the render paints 60.
+ *
+ * Splitting the outline at its repeated vertices recovers the lobes, but mixed
+ * signs alone do **not** mean the total is wrong. A retraced edge (`… L0 0 L0 6
+ * L6 0 Z`, or antd's `file-zip`) produces an opposite-wound lobe that sits
+ * *inside* the outer one, so the subtraction is exactly what non-zero fill does:
+ * shoelace is right and the icon must not be refused. What separates the two is
+ * whether the opposite-wound loops overlap: separate blobs add in the render and
+ * cancel in the formula, nested ones do both.
+ *
+ * The bar is the scene area, not the shape's own area: the eye glyph's outline
+ * doubles back and every lobe has an area of 1e-11 on a 500-unit canvas. That is
+ * "nothing", not "cancellation", and refusing it dropped a real icon.
  */
-function selfTouchingLoopsMatter(points, area) {
+function selfTouchingLoopsMatter(points, sceneArea) {
   if (!points || points.length < 5) return false;
   const box = bboxOfPoints(points);
   if (!box) return false;
@@ -289,24 +299,69 @@ function selfTouchingLoopsMatter(points, area) {
     // The implicit close of a flattened subpath repeats the first vertex at the
     // very end; that is not a touch, it is the outline ending.
     if (at === 0 && i === points.length - 1) continue;
-    if (i - open[at].index >= 3) loops.push(subpathSignedArea(points.slice(open[at].index, i + 1)));
+    if (i - open[at].index >= 3) loops.push(points.slice(open[at].index, i + 1));
     for (let k = at + 1; k < open.length; k += 1) positions.delete(open[k].key);
     open.length = at + 1;
     open[at] = { key, index: i };
   }
-  if (open.length >= 3) loops.push(subpathSignedArea(points.slice(open[0].index)));
+  if (open.length >= 3) loops.push(points.slice(open[0].index));
 
   if (loops.length < 2) return false;
-  const total = Math.abs(area) || loops.reduce((s, a) => s + Math.abs(a), 0);
-  // Same 0.1% bar as a true crossing: a hair-thin lobe cannot move the number.
-  const bar = SELF_CROSSING_TOLERANCE * Math.max(total, 1e-9);
-  let positive = false;
-  let negative = false;
-  for (const a of loops) {
-    if (a > bar) positive = true;
-    else if (a < -bar) negative = true;
+  const bar = SELF_CROSSING_TOLERANCE * Math.max(sceneArea, 1e-9);
+  const shapes = loops.map((pts) => ({ pts, area: subpathSignedArea(pts), box: bboxOfPoints(pts) }));
+  const big = shapes.filter((s) => Math.abs(s.area) > bar);
+  for (let i = 0; i < big.length; i += 1) {
+    for (let j = i + 1; j < big.length; j += 1) {
+      if (big[i].area * big[j].area >= 0) continue;
+      if (interiorsOverlap(big[i], big[j])) continue;
+      return true;
+    }
   }
-  return positive && negative;
+  return false;
+}
+
+/**
+ * Do two closed loops share any painted area?
+ *
+ * Separate blobs that merely touch at a vertex add up under the renderer and
+ * cancel in the shoelace sum — that is the case worth refusing. Two other
+ * arrangements are what non-zero fill already subtracts, so the formula agrees
+ * with the render and the icon must be measured:
+ *
+ * - one loop inside the other (a retraced edge produces exactly this);
+ * - two loops sharing a *segment* (`… H0 L0 0 L0 6 L6 0 Z` retraces the left and
+ *   bottom edges, and antd's `file-zip` retraces the teeth) — the lobes sit on
+ *   opposite sides of the shared edge, not in separate places.
+ *
+ * Sharing a single vertex is the one arrangement that is *not* interference:
+ * that is the figure-eight.
+ */
+function interiorsOverlap(a, b) {
+  if (!boxesIntersect(a.box, b.box)) return false;
+  const span = Math.max(a.box.maxX - a.box.minX, a.box.maxY - a.box.minY, 1);
+  const eps = 1e-9 * span;
+  for (const p of a.pts) if (classifyPoint(p, b.pts, eps) === 'inside') return true;
+  for (const p of b.pts) if (classifyPoint(p, a.pts, eps) === 'inside') return true;
+  if (outlinesCross(a.pts, b.pts)) return true;
+  // Edge midpoints, not endpoints: a shared vertex is allowed, a shared edge is
+  // not, and a midpoint of a shared edge lies on the other outline's boundary.
+  return sharesEdge(a.pts, b.pts, eps) || sharesEdge(b.pts, a.pts, eps);
+}
+
+function sharesEdge(a, b, eps) {
+  for (let i = 0; i < a.length; i += 1) {
+    const p = a[i];
+    const q = a[(i + 1) % a.length];
+    // A loop ends with a copy of its first vertex, so the closing edge can be
+    // degenerate. Its midpoint *is* that shared vertex, which would read as a
+    // shared edge and quietly accept the figure-eight.
+    if (Math.hypot(q[0] - p[0], q[1] - p[1]) <= eps) continue;
+    const mid = [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2];
+    for (let j = 0; j < b.length; j += 1) {
+      if (pointOnSegment(mid, b[j], b[(j + 1) % b.length], eps)) return true;
+    }
+  }
+  return false;
 }
 
 /** Union bbox area of a set of subpaths — the scale a cancellation is judged on. */
@@ -348,8 +403,9 @@ export function netShape(subpaths) {
       return { area: 0, cx: 0, cy: 0, selfIntersecting: true };
     }
     // A crossing is not the only way one outline can lie about its area; two
-    // lobes meeting at a vertex lie just as quietly.
-    if (selfTouchingLoopsMatter(subpaths[i], areas[i])) {
+    // lobes meeting at a vertex lie just as quietly. Judged against the scene,
+    // not the shape: a degenerate doubling-back has no area to speak of.
+    if (selfTouchingLoopsMatter(subpaths[i], sceneArea)) {
       return { area: 0, cx: 0, cy: 0, selfIntersecting: true };
     }
   }
@@ -394,6 +450,18 @@ export function netShape(subpaths) {
         else if (where === 'outside') {
           outside = true;
           break;
+        }
+      }
+      // A hole that meets its container only at a corner (`M0 0 H20 V20 H0 Z
+      // M0 0 V6 L6 0 Z`) has every vertex *on* the other outline, so the vertex
+      // test finds no interior point and the hole was painted as an extra island:
+      // 418 where the render paints 382. The area centroid is never a vertex, so
+      // it answers the question the vertices could not.
+      if (!outside && !strictInside) {
+        const centre = subpathCentroid(sub);
+        if (Math.abs(centre.signedArea) > 1e-9 &&
+            classifyPoint([centre.cx, centre.cy], subpaths[j], 1e-6) === 'inside') {
+          strictInside = true;
         }
       }
       if (outside || !strictInside) continue;
@@ -563,6 +631,12 @@ export function netShapeEvenOdd(subpaths) {
     if (selfCrossingMatters(item.sub, item.area) || cancelsToNothing(item.sub, sceneArea)) {
       return { area: 0, cx: 0, cy: 0, overlapping: false, selfIntersecting: true };
     }
+    // The shared-vertex lobe lie is a property of the outline, not of the fill
+    // rule: even-odd walked the same path and reported 40 for ink worth 60 until
+    // this line existed.
+    if (selfTouchingLoopsMatter(item.sub, sceneArea)) {
+      return { area: 0, cx: 0, cy: 0, overlapping: false, selfIntersecting: true };
+    }
   }
 
   const containers = items.map(() => 0);
@@ -601,6 +675,14 @@ export function netShapeEvenOdd(subpaths) {
       }
       if (inside > 0 && outside > 0) overlapping = true;
       if (inside > 0 && outside === 0) containers[i] += 1;
+      // A hole that only meets its container at a corner leaves every vertex on
+      // the boundary: no vertex is inside, none is outside, and the parity pass
+      // counted the hole as a second island. The centroid never coincides with a
+      // vertex, so it still knows which side of the outline the loop lies on.
+      if (inside === 0 && outside === 0 && items[i].area > 1e-9) {
+        const c = items[i].centroid;
+        if (classifyPoint([c.cx, c.cy], items[j].sub, eps) === 'inside') containers[i] += 1;
+      }
     }
   }
 
@@ -619,7 +701,8 @@ export function netShapeEvenOdd(subpaths) {
   }
 
   // Exact cancellation here is the container-and-hole case, same as nonzero.
-  if (Math.abs(area) < 1e-12) return { area: 0, cx: 0, cy: 0, overlapping: false };  return { area: Math.abs(area), cx: mx / area, cy: my / area, overlapping: false };
+  if (Math.abs(area) < 1e-12) return { area: 0, cx: 0, cy: 0, overlapping: false };
+  return { area: Math.abs(area), cx: mx / area, cy: my / area, overlapping: false };
 }
 
 export function bboxOfPoints(points) {
@@ -710,6 +793,10 @@ export function parseTransform(value) {
   while (match) {
     const name = match[1];
     const args = [];
+    // `translate(10,)` and `translate(,10)` have an empty argument. Splitting
+    // silently produced one number, so a malformed list was applied as if it
+    // were `translate(10)` — the browser drops the whole attribute instead.
+    if (/^\s*,|,\s*$|,\s*,/.test(match[2])) return INVALID_TRANSFORM;
     for (const raw of match[2].split(/[\s,]+/).filter((part) => part !== '')) {
       if (name === 'rotate' || name === 'skewX' || name === 'skewY') {
         const m = /^(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(deg|grad|rad|turn)?$/.exec(raw);

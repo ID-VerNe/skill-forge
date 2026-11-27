@@ -66,6 +66,7 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | a `transform` with a percentage or unit argument, or with trailing junk | `geometry/unresolved-graphics` (`unparsed-transform`) |
 | a percentage or relative `stroke-width`, on the shape **or any ancestor** | `geometry/unresolved-graphics` (`stroke-width-percentage`, `stroke-width-relative`) |
 | a `stroke-width` that overflows to infinity (`1e999`) | `geometry/unresolved-graphics` (`stroke-width-not-finite`) — one engine clamps it to the largest length and paints over the canvas, another drops the declaration |
+| a `stroke-width` that is finite but whose band area is not (`1e308`) | `geometry/unresolved-graphics` (`non-finite-ink`) — `width × length` overflows to `Infinity` and the centroid comes back `NaN`; `NaN` compares false against every tolerance, so without this check the report reads `off` with a `NaN` displacement instead of admitting it has no measurement |
 | a `d` the path parser rejects or only partially parses | `geometry/unresolved-graphics` (`unparsed-path`) — svgpath reports `M0 0 L` as "missed param" and still returns one point |
 | a geometry length in `%`, `em`, `pt`… | `geometry/unresolved-graphics` (`unparsed-length`) — a percentage is relative to a viewport we cannot see, and `parseFloat("100%")` is `100` |
 | a `viewBox` attribute that is not four finite numbers with a positive size | `geometry/unresolved-graphics` (`invalid-viewBox`) — the element does not render, so there is no canvas to measure against |
@@ -83,7 +84,7 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | two subpaths with the same outline | `geometry/unresolved-graphics` (`overlapping-subpaths`) — they cancel under even-odd and render once under nonzero, so the sum is wrong either way |
 | even-odd outlines that partially overlap | `geometry/unresolved-graphics` (`overlapping-subpaths`) |
 | a subpath that crosses itself over more than 0.1% of its own area | `geometry/unresolved-graphics` (`self-intersecting`) — the shoelace formula integrates the winding number, so a bowtie comes back zero while painting two triangles, and a pentagram comes back 40% too large. Smaller crossings are measured as if they were simple, and the error that introduces is bounded by the tolerance below |
-| two lobes joined at one shared vertex and wound in **opposite** directions | `geometry/unresolved-graphics` (`self-intersecting`) — nothing crosses, so the test above stays quiet, yet shoelace subtracts one lobe from the other: `M12 12 L4 2 L2 12 L12 12 L16 8 L17 12 Z` measures 40 where the render paints 60. The outline is split at its repeated vertices; same-wound lobes add up and are measured normally |
+| two **disjoint** lobes joined at one shared vertex and wound in opposite directions | `geometry/unresolved-graphics` (`self-intersecting`) — nothing crosses, so the test above stays quiet, yet shoelace subtracts one lobe from the other: `M12 12 L4 2 L2 12 L12 12 L16 8 L17 12 Z` measures 40 where the render paints 60. The outline is split at its repeated vertices; same-wound lobes add up, and opposite-wound lobes that overlap are subtracted by the renderer too, so both are measured normally |
 | a computed centroid outside its own ink box | `geometry/unresolved-graphics` (`centroid-outside-ink`) |
 | a file the CLI could not read or parse in a batch | `geometry/input-error` |
 | an empty directory passed to keyline mode | `geometry/keyline-empty` |
@@ -317,7 +318,11 @@ Containment is classified per vertex: a subpath is *inside* another only when
 none of its vertices fall outside and **at least one lands strictly inside**.
 Vertices on the boundary are otherwise ignored, so an L-shaped icon whose hole
 shares a corner still measures — but "no vertex outside" alone would also call a
-notch sitting in a concavity a hole. Two subpaths with the same bounding box and
+notch sitting in a concavity a hole. A hole that meets its container only at a
+corner leaves *every* vertex on the boundary: none outside, none strictly
+inside, so the hole was painted as an extra island (`418` where the render paints
+`382`). The area centroid is never a vertex, so when both vertex counts are zero
+it is asked instead. Two subpaths with the same bounding box and
 the same absolute area are treated as one outline drawn twice: under even-odd
 they cancel to nothing, under nonzero they render once, and in both cases summing
 them is wrong.
@@ -332,14 +337,25 @@ is smaller than the tolerance the verdict is judged against.
 
 A related case slips past the crossing test: a figure-eight
 (`M12 12 L4 2 L2 12 L12 12 L20 2 L22 12 Z`) is two loops joined at one vertex,
-wound in opposite directions, so its area is exactly zero while both paint.
-Splitting the outline into loops at the shared vertex would be exact, but arcs
-flatten into polylines that revisit their own start, and telling a real pinch
-from ordinary curve noise needs more than vertex positions. The checker therefore
-refuses any subpath whose area cancels to zero while its bounding box covers more
-than 0.1% of the drawing — an empty `M4 4z` fragment spans nothing at all, and
-antd's Chrome logo carries a 1.98-unit² over-and-back on an 832-unit canvas that
-must not cost the whole file.
+wound in opposite directions, so its area is exactly zero while both paint. The
+outline is therefore split at its repeated vertices and the lobes compared.
+
+Mixed winding alone does not make the total wrong, though, and treating it as if
+it did cost two real icons. A **retraced edge** (`… V6 L0 0 L0 6 L6 0 Z`, or
+antd's `file-zip` retracing its teeth) produces an opposite-wound lobe that sits
+*inside* the outer one — that subtraction is exactly what non-zero fill does, so
+the shoelace total agrees with the render and the icon must be measured. What
+separates the two cases is whether the opposite-wound loops overlap: separate
+blobs add in the render and cancel in the formula, nested or edge-sharing loops
+do both. The same rule answers for even-odd, where the lobes were reported as
+`40` ink worth `60` until the split was wired in there too.
+
+The bar for "a lobe" is the **scene** area, not the shape's own. Flattening antd's
+`twotone/eye` outline into polylines makes it revisit its own start 70 times, and
+every lobe that comes out of the split is under `4e-11` on an 896-unit canvas:
+that is rounding noise, not cancellation, and judging it against the subpath's own
+area — which is also nearly zero — refused an icon that had been measurably
+correct.
 
 **What is still approximate.** Three things, and they are why `off` on
 `geometry/centroid` deserves a second look at the artwork:
