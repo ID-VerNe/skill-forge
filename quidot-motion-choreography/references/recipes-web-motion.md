@@ -19,7 +19,9 @@ Wrap the tree in `<MotionConfig reducedMotion="user">`, but do not assume it han
 
 The `opacity` row is the one people get wrong, and it is the row this skill depends on: every recipe below that needs a reduced-motion fallback uses `opacity`, and it only works *because* the config leaves `opacity` alone. Verified: with `reducedMotion: "reduce"`, a `scaleX` swing collapses to a single rendered value while the `opacity` crossfade still produces 18–20 intermediate values on the same page.
 
-Recipes 2 and 5 animate carriers the config cannot reach, so they branch on `useReducedMotion()` explicitly. Recipes 3, 4 and 6 stay on carriers that are collapsed automatically and need no branch. Recipe 1 animates `transform`, which the config *would* collapse — but it drives that transform through `useMotionValue` + imperative `animate()`, which the config cannot see at all, so it carries its own guard.
+Recipes 1, 2, 3 and 5 animate carriers the config cannot reach, so each carries a `useReducedMotion()` branch: recipe 1 drives its `transform` through `useMotionValue` + imperative `animate()`, recipe 2 bends an SVG `d`, recipe 3 changes `flexGrow`, recipe 5 used to move a `boxShadow`. Recipe 6 rides `layoutId` projection, which the config does collapse. Recipe 4 also uses `useSpring` on a `MotionValue`, which the config cannot see, but that lag is direct-manipulation feedback and is documented as intentional at recipe 4.
+
+Measured on recipe 3: under `reducedMotion: "reduce"` the `flexGrow` half kept producing 34 distinct widths for one selection change — the same morph it produces without the preference (32) — while only the `scale` half collapsed. A carrier listed as "No" above is a carrier you must handle, and that includes the recipes in this file.
 
 Under reduced motion the goal is to **remove the deformation**, not to compress it into a single frame: an instant jump to a 1.32x size and straight back flashes the entire control, which reads worse to a vestibular-sensitive user than a smooth animation. Keep geometry at rest and move the feedback onto `opacity`.
 
@@ -131,26 +133,36 @@ Note the deliberate change of feel: this is now a hold-to-bend, not a tap-to-pul
 Transitions asymmetrically between resting and active footprint using `layout` without dictating fixed pixel radii.
 
 ```tsx
-<motion.button
-  layout
-  onPointerDown={() => onSelect(id)}
+function MorphingClusterItem({ id, isActive, onSelect }: {
+  id: number; isActive: boolean; onSelect: (id: number) => void;
+}) {
+  const reduce = useReducedMotion();
+
   // Neither literal is the width ratio you get. flexGrow is normalized across
   // the flex line, so its contribution to width depends on the sibling count,
   // and `scale` multiplies on top of that. Measured on a 3-item row: the active
   // item ends up 1.851x its resting *rendered* width (not 1.6). Tune against a
   // measurement, not against these two numbers.
-  animate={{
-    flexGrow: isActive ? 1.6 : 1,
-    scale: isActive ? 1.12 : 0.92,
-  }}
-  whileTap={{ scale: 0.88 }}
-  transition={{ type: "spring", stiffness: 420, damping: 22 }}
->
-  {/* Inner glyph scales/rotates independently for optical crispness */}
-</motion.button>
+  return (
+    <motion.button
+      layout
+      onPointerDown={() => onSelect(id)}
+      animate={{
+        flexGrow: isActive ? 1.6 : 1,
+        scale: reduce ? 1 : isActive ? 1.12 : 0.92,
+      }}
+      whileTap={reduce ? undefined : { scale: 0.88 }}
+      transition={reduce ? { duration: 0 } : { type: "spring", stiffness: 420, damping: 22 }}
+    >
+      {/* Inner glyph scales/rotates independently for optical crispness */}
+    </motion.button>
+  );
+}
 ```
 
 The two mechanisms compound rather than replacing each other: `flexGrow` claims layout space from siblings while `scale` additionally enlarges the painted box, and the inactive neighbour shrinks to 0.92 at the same time. Measured effective width ratio on a 3-item row is 1.851 (a steady-state value, not an overshoot peak), the same figure the issue reports. Do not expect to reproduce it with arithmetic: `flexGrow` is normalized against the whole flex line, so the realized ratio moves with the sibling count and with the neighbours' own resting widths. If you need a specific footprint, measure it or drive `width` directly instead of stacking two ratios.
+
+**`flexGrow` is not covered by `MotionConfig`, so this recipe needs the branch.** Handling only `scale` leaves the width morph intact under `reduce`: measured 34 distinct widths for one selection change, against 32 without the preference — the box still animates continuously, minus the paint scaling. The branch above keeps the state change (the item must still grow to show selection) but makes it a single `duration: 0` step, and drops the `scale` pair entirely, because an instant 12% size jump is the same full-frame flash this file rules out.
 
 ---
 

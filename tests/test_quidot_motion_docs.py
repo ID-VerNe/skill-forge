@@ -23,7 +23,8 @@ D8 在缺 esbuild/typescript 时**跳过并打印原因**，不假装通过—�
   D3 Web recipe 1 同时具备：恒定目标的自终止脉冲、内层反向缩放、reduce 分支、
      脉冲在飞时的重入守卫
   D4 Web recipe 5 不再用 `boxShadow` 作为形变载体
-  D5 Web recipe 3 写明了 flexGrow 与 scale 叠加后的有效比值
+  D5 Web recipe 3 写明了 flexGrow 与 scale 叠加后的有效比值，并自带 reduce 分支
+     （flexGrow 不在 positionalKeys，只处理 scale 会让宽度照常连续变形）
   D6 Compose recipe 1 有内层反向缩放；recipe 3 写明了 weight 不是宽度比；
      Compose 侧不出现手工 reduced-motion 分支
   D6d Compose recipe 1 用自终止脉冲，不用两段式目标切换（reduce 下会闪一帧）
@@ -232,6 +233,32 @@ def t_d5_recipe3_ratio_comment():
     )
 
 
+def t_d5b_recipe3_branches_on_reduce():
+    """recipe 3 的 flexGrow 不在 positionalKeys 里，必须自己分支。
+
+    实测（3 项 flex 行，reducedMotion=reduce）：只处理 scale 时，一次选中
+    仍产生 34 个宽度离散值（无偏好时 32 个）——宽度照常连续变形。
+    所以 recipe 3 不能算「框架自动折叠」，分支必须在代码里。
+    """
+    text = read("references", "recipes-web-motion.md")
+    sec = text[text.index("## 3. Aspect-Ratio"):]
+    sec = sec[:sec.index("\n## 4.")]
+    body = "\n".join(code_blocks(sec))
+    require("useReducedMotion" in body, "recipe 3 缺 useReducedMotion 分支（flexGrow 不被折叠）")
+    require(
+        re.search(r"scale:\s*reduce\s*\?\s*1\s*:", body),
+        "recipe 3 在 reduce 下仍设 scale（12% 瞬时跳变=全帧闪烁）",
+    )
+    require(
+        re.search(r"whileTap=\{\s*reduce\s*\?\s*undefined", body),
+        "recipe 3 的 whileTap 在 reduce 下仍缩放",
+    )
+    require(
+        re.search(r"duration:\s*0", body),
+        "recipe 3 的 reduce 分支没把 flexGrow 压成单步（duration: 0）",
+    )
+
+
 # ---------------------------------------------------------------- D6
 def t_d6_compose_recipe1_counter_scale():
     text = read("references", "recipes-compose.md")
@@ -436,6 +463,7 @@ def main():
     test("D3b recipe 1 峰值解析式", t_d3b_recipe1_peak_documented)
     test("D4 recipe 5 不用 boxShadow", t_d4_recipe5_no_boxshadow)
     test("D5 recipe 3 有效比值", t_d5_recipe3_ratio_comment)
+    test("D5b recipe 3 自带 reduce 分支", t_d5b_recipe3_branches_on_reduce)
     test("D6 Compose recipe 1 反向缩放", t_d6_compose_recipe1_counter_scale)
     test("D6b Compose recipe 3 weight 语义", t_d6b_compose_recipe3_weight_semantics)
     test("D6c Compose 无手工 reduce 分支", t_d6c_compose_no_manual_reduce_branch)
