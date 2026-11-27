@@ -76,7 +76,7 @@ function toDecls(chunk) {
 
 /**
  * @param {string} src
- * @returns {{blocks: Array<{selector:string, decls:Record<string,string>, context:string[]}>, unresolved: string|null}}
+ * @returns {{blocks: Array<{selector:string, decls:Record<string,string>, order:Array<[string,string]>, context:string[]}>, unresolved: string|null}}
  */
 export function parseCss(src) {
   const blocks = [];
@@ -153,14 +153,19 @@ function walk(src, from, to, context, blocks) {
     }
 
     if (prelude) {
-      const { decls, nested } = splitBlock(inner);
-      blocks.push({ selector: prelude.replace(/\s+/g, ' '), decls, context });
+      const { decls, order, nested } = splitBlock(inner);
+      blocks.push({ selector: prelude.replace(/\s+/g, ' '), decls, order, context });
       for (const child of nested) {
         // CSS nesting: `& .child { ... }` inherits the parent context
         const merged = child.selector.includes('&')
           ? child.selector.replace(/&/g, prelude)
           : `${prelude} ${child.selector}`;
-        blocks.push({ selector: merged.replace(/\s+/g, ' '), decls: child.decls, context });
+        blocks.push({
+          selector: merged.replace(/\s+/g, ' '),
+          decls: child.decls,
+          order: child.order,
+          context,
+        });
       }
     }
 
@@ -195,6 +200,10 @@ function findMatchingBrace(src, openIndex, limit) {
 /** Separate own declarations from nested rules inside a single block body. */
 function splitBlock(body) {
   const decls = {};
+  // Source order is kept separately: `decls` is a map, so `text-box` followed by
+  // `text-box-trim` and the reverse collapse to the same two keys with different
+  // meanings. Shorthand/longhand resolution needs the sequence.
+  const order = [];
   const nested = [];
   let cursor = 0;
   let i = 0;
@@ -218,13 +227,18 @@ function splitBlock(body) {
       const selector = (lastSemi === -1 ? chunk : chunk.slice(lastSemi + 1)).trim();
       for (const piece of splitDeclarations(declPart)) {
         const entry = toDecls(piece);
-        if (entry) decls[entry[0]] = entry[1];
+        if (entry) {
+          decls[entry[0]] = entry[1];
+          order.push(entry);
+        }
       }
       if (selector) {
-        const { decls: childDecls, nested: childNested } = splitBlock(body.slice(i + 1, close));
-        nested.push({ selector, decls: childDecls });
+        const { decls: childDecls, order: childOrder, nested: childNested } = splitBlock(
+          body.slice(i + 1, close),
+        );
+        nested.push({ selector, decls: childDecls, order: childOrder });
         for (const grand of childNested) {
-          nested.push({ selector: grand.selector, decls: grand.decls });
+          nested.push({ selector: grand.selector, decls: grand.decls, order: grand.order });
         }
       }
       i = close + 1;
@@ -236,7 +250,10 @@ function splitBlock(body) {
   const tail = body.slice(cursor);
   for (const chunk of splitDeclarations(tail)) {
     const entry = toDecls(chunk);
-    if (entry) decls[entry[0]] = entry[1];
+    if (entry) {
+      decls[entry[0]] = entry[1];
+      order.push(entry);
+    }
   }
-  return { decls, nested };
+  return { decls, order, nested };
 }

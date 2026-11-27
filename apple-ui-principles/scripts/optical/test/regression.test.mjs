@@ -426,3 +426,243 @@ test('an interpolated radius fragment is not rounded-*', () => {
     JSON.stringify(report.findings, null, 2),
   );
 });
+
+// --- round 4: nested viewports, display normalisation, context merging ------
+
+test('a <symbol viewBox> is scaled into the viewport <use> gives it', () => {
+  // 10-unit artwork placed in a 24-unit viewport must cover 0..24. Measuring it
+  // as 0..10 reports a 7px offset that does not exist.
+  const shape = analyzeSvg(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="100" height="100">` +
+      '<symbol id="s" viewBox="0 0 10 10"><rect x="0" y="0" width="10" height="10"/></symbol>' +
+      '<use href="#s"/></svg>',
+  );
+  near(shape.ink.bbox.maxX, 24, 1e-6);
+  near(shape.ink.bbox.maxY, 24, 1e-6);
+});
+
+test('<use width height> overrides the default 100% viewport', () => {
+  const shape = analyzeSvg(
+    svg(
+      '<symbol id="s" viewBox="0 0 10 10"><rect x="0" y="0" width="10" height="10"/></symbol>' +
+        '<use href="#s" x="4" y="4" width="12" height="12"/>',
+    ),
+  );
+  near(shape.ink.bbox.minX, 4, 1e-6);
+  near(shape.ink.bbox.maxX, 16, 1e-6);
+});
+
+test('a nested <svg viewBox> rescales its children', () => {
+  const shape = analyzeSvg(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">` +
+      '<svg x="10" y="10" width="20" height="20" viewBox="0 0 10 10">' +
+      '<rect x="0" y="0" width="10" height="10"/></svg></svg>',
+  );
+  near(shape.ink.bbox.minX, 10, 1e-6);
+  near(shape.ink.bbox.maxX, 30, 1e-6);
+});
+
+test('a relative nested viewport is not silently taken as zero', () => {
+  const shape = analyzeSvg(
+    svg('<svg width="2em" height="2em"><rect x="0" y="0" width="4" height="4"/></svg>'),
+  );
+  assert.ok(shape.unresolved.includes('viewport-relative-units'), JSON.stringify(shape.unresolved));
+});
+
+test('root width/height turn user units into rendered px', () => {
+  const shape = analyzeSvg(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="48" height="48">` +
+      '<rect x="0" y="0" width="4" height="4"/></svg>',
+  );
+  near(shape.unitScale, 2, 1e-9);
+  const report = checkShape(shape, { mode: 'standalone', target: 'scaled.svg' });
+  const f = report.findings.find((x) => x.id === 'geometry/ink-bbox');
+  // ink centre is (2,2), viewBox centre (12,12): -10 user units = -20 px.
+  near(f.measured.dx, -20, 1e-6);
+  assert.equal(f.measured.unit, 'px');
+});
+
+test('the viewBox suggestion and the measured offset agree in sign', () => {
+  const shape = analyzeSvg(svg('<rect x="2" y="8" width="12" height="8"/>'));
+  const report = checkShape(shape, { mode: 'standalone', target: 'lo.svg' });
+  const f = report.findings.find((x) => x.id === 'geometry/ink-bbox');
+  // ink centre x is 8, viewBox centre 12 -> dx = -4, so the origin must move -4.
+  near(f.measured.dx, -4, 1e-6);
+  assert.equal(f.suggested.viewBox, '-4 0 24 24', JSON.stringify(f.suggested));
+  assert.equal(f.suggested.value, '-4px / 0px', JSON.stringify(f.suggested));
+});
+
+test('the centroid suggestion covers both axes', () => {
+  const shape = analyzeSvg(svg('<path d="M4 4 L16 6 L10 18 Z"/>'));
+  const report = checkShape(shape, { mode: 'standalone', target: 'diag.svg' });
+  const f = report.findings.find((x) => x.id === 'geometry/centroid');
+  assert.equal(f.suggested.value, '0px / 1.67px', JSON.stringify(f.suggested));
+});
+
+test('visibility:hidden is inherited but a descendant can restore it', () => {
+  const shape = analyzeSvg(
+    svg(
+      '<g visibility="hidden"><rect x="0" y="0" width="4" height="4"/>' +
+        '<rect x="10" y="10" width="4" height="4" visibility="visible"/></g>',
+    ),
+  );
+  near(shape.ink.bbox.minX, 10, 1e-6);
+  near(shape.ink.bbox.maxX, 14, 1e-6);
+});
+
+test('display:flex !important still makes text-box a no-op', () => {
+  const report = checkCss('.a{display:flex!important;text-box:trim-both}', { target: 'imp.css' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+  assert.equal(f.verdict, 'off');
+});
+
+test('display from a var() is unknown, not assumed to be flex', () => {
+  const report = checkCss('.a{display:var(--d);text-box:trim-both}', { target: 'var.css' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.equal(f.verdict, 'unknown');
+  assert.match(f.evidence, /var\(\)/);
+});
+
+test('text-box:normal is the initial value, not a request to trim', () => {
+  const report = checkCss('.c{display:flex;text-box:normal}', { target: 'normal.css' });
+  assert.equal(report.findings.length, 0, JSON.stringify(report.findings, null, 2));
+});
+
+test('shorthand and longhand resolve in source order', () => {
+  const on = checkCss('.x{text-box:normal;text-box-trim:trim-both}', { target: 'on.css' });
+  assert.equal(on.findings.length, 1, JSON.stringify(on.findings, null, 2));
+  const off = checkCss('.y{text-box:trim-both;text-box-trim:none}', { target: 'off.css' });
+  assert.equal(off.findings.length, 0, JSON.stringify(off.findings, null, 2));
+});
+
+test('display supplied by an @media block joins the base rule', () => {
+  const report = checkCss('.a{text-box:trim-both}@media (min-width:600px){.a{display:flex}}', {
+    target: 'media.css',
+  });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+  assert.equal(f.verdict, 'off');
+});
+
+test('disagreeing display across contexts degrades to unknown', () => {
+  const report = checkCss(
+    '.c{display:flex;text-box:trim-both}@media (min-width:600px){.c{display:block}}',
+    { target: 'conflict.css' },
+  );
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.equal(f.verdict, 'unknown');
+  assert.match(f.evidence, /differently/);
+});
+
+test('tailwind important modifiers do not hide the flex utility', () => {
+  for (const cls of ['flex! text-box-trim', '!flex text-box-trim']) {
+    const report = checkTsx(`<div className="${cls}" />`, { target: 'bang.tsx' });
+    const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+    assert.ok(f, `${cls}: ${JSON.stringify(report.findings, null, 2)}`);
+    assert.equal(f.verdict, 'off', cls);
+  }
+});
+
+test('text-box with no display utility at all is unknown, not a pass', () => {
+  const report = checkTsx('<div className="text-box-trim" />', { target: 'nodisp.tsx' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.equal(f.verdict, 'unknown');
+});
+
+test('a sub-pixel nudge is inside tolerance and is not reported', () => {
+  const report = checkCss('.h{font-size:16px;margin-top:.5px}', { target: 'tiny.css' });
+  assert.equal(report.findings.length, 0, JSON.stringify(report.findings, null, 2));
+});
+
+test('--size on check is refused instead of ignored', () => {
+  const r = run('check', fixture('icons/play.svg'), '--size', '48');
+  assert.equal(r.status, 64, r.stderr);
+  assert.match(r.stderr, /font/);
+});
+
+test('a percentage <use> resolves against the nearest viewport, not the root', () => {
+  const shape = analyzeSvg(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">` +
+      '<defs><symbol id="s" viewBox="0 0 10 10"><rect x="0" y="0" width="10" height="10"/></symbol></defs>' +
+      '<svg x="10" y="10" width="20" height="20"><use href="#s" width="100%" height="100%"/></svg></svg>',
+  );
+  near(shape.ink.bbox.minX, 10, 1e-6);
+  near(shape.ink.bbox.maxX, 30, 1e-6);
+});
+
+test('the unit scale is only claimed when both dimensions are absolute', () => {
+  const box = '<rect x="0" y="0" width="4" height="4"/>';
+  const head = (attrs) => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" ${attrs}>`;
+  near(analyzeSvg(`${head('width="48" height="48"')}${box}</svg>`).unitScale, 2, 1e-9);
+  // A lone width leaves the rendered box unknowable; claiming 2 would be a guess.
+  const lone = analyzeSvg(`${head('width="48"')}${box}</svg>`);
+  near(lone.unitScale, 1, 1e-9);
+  assert.equal(lone.unitSource, 'assumed');
+});
+
+test('the report exposes how the unit scale was derived', () => {
+  const assumed = checkShape(analyzeSvg(svg('<rect x="4" y="4" width="16" height="16"/>')), {
+    target: 'a.svg',
+  });
+  assert.equal(assumed.unitScale, 1);
+  assert.equal(assumed.unitSource, 'assumed');
+
+  const declared = checkShape(
+    analyzeSvg(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="48" height="48">' +
+        '<rect x="4" y="4" width="16" height="16"/></svg>',
+    ),
+    { target: 'b.svg' },
+  );
+  assert.equal(declared.unitScale, 2);
+  assert.equal(declared.unitSource, 'declared');
+});
+
+test('a clip-path that provably contains the artwork is ignored', () => {
+  // The Figma/Designer export pattern: a clip rect exactly the size of the canvas.
+  const shape = analyzeSvg(
+    svg(
+      '<defs><clipPath id="c"><rect x="0" y="0" width="24" height="24"/></clipPath></defs>' +
+        '<g clip-path="url(#c)"><rect x="4" y="4" width="16" height="16"/></g>',
+    ),
+  );
+  assert.equal(shape.unresolved.length, 0, JSON.stringify(shape.unresolved));
+  near(shape.ink.bbox.minX, 4, 1e-6);
+  near(shape.ink.bbox.maxX, 20, 1e-6);
+});
+
+test('a clip-path that cuts the artwork stays unmeasurable', () => {
+  const shape = analyzeSvg(
+    svg(
+      '<defs><clipPath id="c"><rect x="0" y="0" width="10" height="24"/></clipPath></defs>' +
+        '<g clip-path="url(#c)"><rect x="4" y="4" width="16" height="16"/></g>',
+    ),
+  );
+  assert.ok(shape.unresolved.includes('clip-path-cuts-ink'), JSON.stringify(shape.unresolved));
+  const report = checkShape(shape, { mode: 'standalone', target: 'cut.svg' });
+  assert.equal(report.verdict, 'unknown');
+});
+
+test('an unresolvable clip shape is refused, not approximated', () => {
+  const cases = [
+    '<clipPath id="c"><circle cx="12" cy="12" r="12"/></clipPath>',
+    '<clipPath id="c"><rect x="0" y="0" width="24" height="24" rx="4"/></clipPath>',
+    '<clipPath id="c" clipPathUnits="objectBoundingBox"><rect x="0" y="0" width="1" height="1"/></clipPath>',
+    '<clipPath id="c"><rect x="0" y="0" width="24" height="24"/><rect x="0" y="0" width="4" height="4"/></clipPath>',
+  ];
+  for (const clip of cases) {
+    const shape = analyzeSvg(svg(`<defs>${clip}</defs><g clip-path="url(#c)"><rect x="4" y="4" width="16" height="16"/></g>`));
+    assert.ok(shape.unresolved.includes('clip-path'), `${clip} -> ${JSON.stringify(shape.unresolved)}`);
+  }
+});
+
+test('a shape that clips itself is not walked as a container', () => {
+  const shape = analyzeSvg(
+    svg(
+      '<defs><clipPath id="c"><rect x="0" y="0" width="24" height="24"/></clipPath></defs>' +
+        '<rect clip-path="url(#c)" x="4" y="4" width="16" height="16"/>',
+    ),
+  );
+  assert.ok(shape.unresolved.includes('clip-path'), JSON.stringify(shape.unresolved));
+});

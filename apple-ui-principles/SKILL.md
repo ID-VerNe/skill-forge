@@ -37,6 +37,7 @@ Mathematical perfection often looks visually wrong because **"the human eye is n
 - **Concept:** A text node's box includes the font's ascent/descent padding plus half-leading. `align-items: center` centres the *box*, not the *letters*, so labels sit low.
 - **Action (preferred):** `text-box: trim-both cap alphabetic;` — Baseline since August 2026 (Chrome 133+, Safari 18.2+, Firefox 154+).
 - **Critical caveat:** `text-box` has **no effect on flex or grid containers**, and Chromium does not trim inline boxes. Button labels almost always live in a flex container, so the declaration silently no-ops. Apply it on an inline child, or check the report for `rule/text-box-in-flex`.
+- **What the checker accepts as "armed":** only `trim-both` / `trim-start` / `trim-end`, in the longhand or shorthand, resolved in source order. `text-box: normal` and `text-box: cap alphabetic` reset trimming to `none` (omitted shorthand components take their initial value), so neither is reported. `display: flex !important` still counts as flex; `display: var(--d)` and contexts that disagree about `display` report `unknown`.
 - **Legacy fallback:** if the target browser lacks `text-box`, compute the exact compensation with `#7` rather than guessing `margin-top: -1px`. The offset is `fontSize × (ascender + descender − capHeight) / (2 × upem)` and is independent of `line-height`.
 
 ### 4. Optical Illusions & Mach Bands (侧抑制与视觉错觉) [不可校验]
@@ -149,6 +150,16 @@ When a report holds both `off` and `unknown`, the exit code is `1` (the defect i
 ### Baking the correction
 
 For an asset that reports `geometry/centroid off`, do not scatter `translate-x-[1.5px]` through components. Shift the ink inside its own canvas (adjust the `viewBox` origin or the path), then re-run until `ok`. Any `flex items-center justify-center` downstream inherits the fix for free.
+
+`geometry/ink-bbox` prints the literal attribute to paste:
+
+```json
+{ "kind": "viewBox-origin", "value": "-4px / 0px", "viewBox": "-4 0 24 24" }
+```
+
+`value` is the delta **added to the viewBox origin** (moving the origin by `d` moves the artwork by `−d`), and `viewBox` is the resulting attribute. Prefer `viewBox` — pasting it cannot flip a sign.
+
+All reported offsets are in rendered px, not viewBox units. `meta.unitScale` says how they were derived: a root `width="48"` on a 24-unit viewBox yields `2`, and the evidence string appends `[user units ×2 = px]`. Without absolute `width`/`height` the icon convention (1 unit = 1px) applies.
 
 ---
 

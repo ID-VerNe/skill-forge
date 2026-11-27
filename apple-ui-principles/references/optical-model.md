@@ -20,7 +20,10 @@ Two rules keep that pipeline from lying:
 - **Non-rendering nodes are not ink.** `defs`, `clipPath`, `mask`, `symbol`,
   `pattern`, `marker`, `linearGradient`, `radialGradient`, `filter`, `style`,
   `title`, `desc`, `metadata` are skipped entirely, as are subtrees carrying
-  `display:none`, `visibility:hidden` or `opacity:0`.
+  `display:none` or `opacity:0`.
+- **`visibility` is not `display`.** `visibility:hidden` hides a subtree but
+  descendants may set `visibility:visible` and reappear, so the flag is carried
+  down the tree and applied per shape instead of pruning the branch.
 - **Presentation attributes live in `style` too.** `style="fill:none;stroke:…;
   stroke-width:2"` is merged over the XML attributes before anything is
   measured, so a stroke-only icon is not silently treated as an empty fill.
@@ -34,17 +37,77 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | Cause | Reported as |
 |---|---|
 | empty canvas, no shapes, all shapes `fill:none` without stroke | `geometry/no-ink` |
-| `clip-path`, `mask`, `filter` present | `geometry/unresolved-graphics` |
-| `<use>` pointing at a missing id, nested deeper than 3, carrying `width`/`height`, or targeting a non-renderable node | `geometry/unresolved-graphics` |
+| `mask` or `filter` present | `geometry/unresolved-graphics` |
+| a `clip-path` whose geometry is not a plain rect, or one that cuts the ink | `geometry/unresolved-graphics` |
+| `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
+| a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
 | a shape whose `d` failed to parse | `geometry/unresolved-graphics` |
 | even-odd outlines that partially overlap | `geometry/unresolved-graphics` (`overlapping-subpaths`) |
 | a computed centroid outside its own ink box | `geometry/unresolved-graphics` (`centroid-outside-ink`) |
 
 `<use>` is resolved when the target exists: the referenced node is re-walked
-with `x`/`y` and its own `transform` folded into the matrix, and `<symbol>`
-targets contribute their children (a symbol only renders when instantiated).
-Anything more dynamic — a viewport, a nested sprite reference — is a gap, not a
-guess.
+with `x`/`y`, its `transform` and the target's `viewBox` folded into the matrix,
+and `<symbol>` targets contribute their children (a symbol only renders when
+instantiated).
+
+### Clips
+
+Icon exporters wrap the artwork in a clip the exact size of the canvas:
+
+```svg
+<defs><clipPath id="c"><rect x="0" y="0" width="16" height="16"/></clipPath></defs>
+<g clip-path="url(#c)">…</g>
+```
+
+Refusing to measure that makes the checker blind on most real icon sets, but a
+clip is not automatically a no-op either. The rule is therefore *resolve or
+refuse*, never approximate:
+
+| Clip | Behaviour |
+|---|---|
+| single `<rect>`, no `rx`/`ry`, `clipPathUnits="userSpaceOnUse"`, no transform | resolved to an AABB and tested for containment |
+| the subtree's ink bbox fits inside that rect | the clip is a no-op; measurement proceeds |
+| the subtree's ink escapes the rect | `clip-path-cuts-ink`, `unknown` — the remainder needs a boolean intersection |
+| any other geometry (circles, paths, rounded rects, multiple children, `objectBoundingBox`) | `clip-path`, `unknown` |
+| a shape clipping itself | `clip-path`, `unknown` — the container walk would drop the shape |
+
+Rotations on the clip are folded into an axis-aligned bounding box, which is a
+*superset* of the real clip. That can only add refusals, never a wrong number.
+
+### Nested viewports
+
+`viewBox` is a coordinate system, not a comment. A `<symbol viewBox>` or a
+nested `<svg viewBox>` rescales everything below it, so measuring children in the
+outer user space reports an offset that does not exist — a 10-unit glyph placed
+in a 24-unit viewport reads as `10 × 10` ink centred at `(5,5)` instead of `(12,12)`,
+i.e. a fictitious `−7px off` on both axes.
+
+Both cases build the SVG 1.1 viewBox transform:
+
+```
+scale  = min(viewport.w / vb.w, viewport.h / vb.h)     // preserveAspectRatio: meet
+offset = viewport.origin + (viewport.size − vb.size·scale)·align − vb.origin·scale
+```
+
+`preserveAspectRatio="none"` switches to independent `sx`/`sy`. A `<use>` of a
+`<symbol>` gets a viewport of `(x, y, width ?? 100%, height ?? 100%)`; a nested
+`<svg>` gets its own `x`/`y`/`width`/`height`. Percentages resolve against the
+root viewBox; `em`/`ch`/viewport units cannot be resolved statically and become
+`unknown` rather than `0`.
+
+The nested viewport's **clip** is not modelled: ink drawn outside it is measured
+as if visible. This only matters for artwork that overflows its own viewport,
+which is a defect worth seeing.
+
+### Units
+
+Measurements are taken in viewBox user units, but every reported `measured`,
+`basis` and suggestion is in **rendered px**. The conversion comes from the root
+element's `width`/`height`: `width="48"` on a 24-unit viewBox means each user
+unit is 2px, so a 10-unit offset is reported as `20px`. Without absolute
+`width`/`height` the icon convention (1 unit = 1px) applies; `meta.unitScale`
+records which one was used, and the evidence string appends
+`[user units ×N = px]` whenever the two differ.
 
 ### Fill rule
 
@@ -73,6 +136,18 @@ which is why it is reported separately from `#2`.
 
 Stroke-only shapes expand the box by `stroke-width/2`; joins and caps are not
 modelled, so treat `±half-linewidth` as the accuracy of the bbox for stroke icons.
+
+The suggestion is a pair `(kind, value)` where `value` is the delta to **add to
+the viewBox origin**, together with the literal resulting attribute:
+
+```json
+{ "kind": "viewBox-origin", "value": "-4px / 0px", "viewBox": "-4 0 24 24" }
+```
+
+Moving the origin by `d` moves the artwork by `−d`, so the value equals the
+measured offset rather than its negation. The `viewBox` string is the
+unambiguous form — an agent that pastes it gets the centred result, whereas a
+signed number invites a sign flip.
 
 ## 3. `#2` area centroid
 
@@ -123,10 +198,45 @@ Firefox 154+). Two implementation facts matter:
 - Chromium does not trim inline boxes at all, while Firefox and Safari do.
 
 A button label is almost always a flex child, so the declaration silently
-no-ops in the exact place it is most needed. The checker only reports `off` when
-the same declaration block (or same selector, same context) also declares
-`display: flex|grid`. When `display` is absent, the parent is unknowable from
-that file → `unknown`.
+no-ops in the exact place it is most needed.
+
+### When the container type is known
+
+Rules are merged **per selector**, not per selector-and-at-rule: `@media`,
+`@supports` and `@layer` *add* declarations to a selector rather than replacing
+it, so `display` in one block and `text-box` in another still describe the same
+element. Keying the merge by context would turn that into "display was never
+declared" and a silent pass.
+
+Two escape hatches keep that merge honest:
+
+| Situation | Verdict |
+|---|---|
+| `display: flex !important` | `off` — `!important` changes priority, not layout |
+| `display: var(--d)` / `env()` | `unknown` — the value is not in this file |
+| two contexts disagree about `display` | `unknown` — the merge is not a fact |
+| no `display` anywhere for that selector | `unknown` |
+
+### What counts as a trim request
+
+`text-box` is a shorthand for `text-box-trim` + `text-box-edge`, and omitted
+components reset to their initial value. Two declarations that produce the same
+property map mean opposite things:
+
+```css
+text-box: trim-both; text-box-trim: none;   /* no trimming */
+text-box-trim: none; text-box: trim-both;   /* trimming */
+```
+
+So the checker replays declarations **in source order** rather than reading a
+map, and:
+
+- `text-box: normal` is the initial value (`trim: none`, `edge: auto`) — not a
+  request to trim, even though it is not spelled `none`;
+- `text-box: cap alphabetic` resets trimming to none, because the shorthand
+  omits the trim component;
+- only `trim-both` / `trim-start` / `trim-end` in either longhand or shorthand
+  count as arming the check.
 
 ## 6. `#5` hard-coded vertical nudges (heuristic)
 
@@ -215,14 +325,23 @@ codes stay distinct so a broken project never looks like an unverifiable one.
 - Stroke joins, caps and dashes are approximated by a constant-width band.
 - CSS is tokenised, not parsed. Unbalanced braces, unterminated strings and
   declaration-less preludes degrade to `unknown` rather than a best guess.
-- `<use>` resolution is single-target and single-pass; viewport-carrying or
-  nested sprite references degrade to `unknown`.
+- `<use>` resolution is single-target and single-pass, capped at three levels
+  of nesting. Targets without their own `viewBox` inherit the caller's user
+  space; targets sized in relative units degrade to `unknown`.
+- Nested `<svg>` viewports are transformed but not clipped (§1 "Nested
+  viewports").
+- Tailwind numeric scales are **v3's**. v4 derives every radius from
+  `--radius-*`, so a themed project may disagree with `titleRadius()`. That is
+  why non-concentric radius is `heuristic` and capped at `nudge`.
 - JSX class names are read as *literal sets*: `clsx('flex', 'text-box-trim')`
   is understood. A conditional expression (`a ? 'flex' : 'block'`) describes
   two mutually exclusive worlds, so any finding it would produce is downgraded
   to `unknown`; a class name assembled entirely at runtime produces no finding
   at all. `{/* … */}` comments are skipped, fragments and `<React.Fragment>` are
-  transparent in the element tree.
+  transparent in the element tree. A `text-box` utility with no layout-display
+  utility beside it is `unknown` — the container type lives elsewhere.
+- `--size` / `--line-height` belong to the `font` subcommand. Passing them to
+  `check` is a usage error (exit `64`) rather than a silently ignored flag.
 - Perceptual rules (Mach bands, dark-mode weight compensation) are never
   computed. They stay human judgement, marked `[不可校验]` in `SKILL.md`.
 

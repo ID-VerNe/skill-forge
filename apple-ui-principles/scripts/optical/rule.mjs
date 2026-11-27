@@ -11,6 +11,11 @@ import { buildReport } from './report.mjs';
 export { parseCss };
 
 const FLEXY = /^(inline-)?(flex|grid)$/;
+// Tailwind v3 scale (rem * 4). v4 derives every value from `--radius-*` custom
+// properties, so these numbers are wrong for a v4 project whose theme overrides
+// them: `rounded-lg` is 8px here but whatever `--radius-lg` says there. The
+// checker cannot see the theme, so a non-concentric-radius finding is advisory
+// (`heuristic`, capped at `nudge`) rather than a hard failure.
 const RADIUS_SCALE = {
   none: 0,
   sm: 2,
@@ -46,52 +51,154 @@ function isBoxTrim(token) {
   return token.includes('trim');
 }
 
+/**
+ * `text-box: normal` is the initial value, not a request to trim, and
+ * `!important` does not change what the value means.
+ */
+function trimValue(raw) {
+  if (!raw) return null;
+  const value = raw.replace(/!\s*important\s*$/i, '').trim().toLowerCase();
+  if (!value) return null;
+  if (/^none\b/.test(value)) return null;
+  if (value === 'normal') return null;
+  if (value.startsWith('var(') || value.startsWith('env(')) return 'dynamic';
+  return value;
+}
+
+/**
+ * Resolve the effective trim state from declarations *in source order*.
+ *
+ * `text-box` is a shorthand for `text-box-trim` + `text-box-edge`, and the two
+ * declarations below mean opposite things despite producing the same map:
+ *
+ *   text-box: trim-both; text-box-trim: none;   -> no trimming
+ *   text-box-trim: none; text-box: trim-both;   -> trimming
+ *
+ * Omitted components in a shorthand reset to their initial value, so
+ * `text-box: cap alphabetic` also turns trimming off.
+ */
+function effectiveTrim(order = []) {
+  let state = null;
+  for (const [prop, raw] of order) {
+    if (prop === 'text-box-trim') {
+      state = trimValue(raw);
+      continue;
+    }
+    if (prop !== 'text-box') continue;
+    const value = trimValue(raw);
+    if (!value) {
+      state = null;
+    } else if (value === 'dynamic') {
+      state = value;
+    } else {
+      const trimmed = /trim-(both|start|end)\b/.exec(value);
+      // The shorthand only requests trimming when it names a trim value.
+      state = trimmed ? value : null;
+    }
+  }
+  return state;
+}
+
+/**
+ * Rules are merged per selector, not per selector-and-at-rule: `@media` and
+ * `@supports` add declarations to the base rule rather than replacing it, so
+ * `display` in one block and `text-box` in another describe the same element.
+ * When two contexts disagree about a property, the merge is not a fact and the
+ * caller must answer `unknown`.
+ */
 function mergeBySelector(blocks) {
   const merged = new Map();
   for (const block of blocks) {
-    const key = `${block.context.join('>')}||${block.selector}`;
-    if (!merged.has(key)) {
-      merged.set(key, {
-        selector: block.selector,
-        context: block.context,
-        decls: { ...block.decls },
-      });
-    } else {
-      Object.assign(merged.get(key).decls, block.decls);
+    const key = block.selector;
+    let entry = merged.get(key);
+    if (!entry) {
+      entry = { selector: block.selector, decls: {}, order: [], seen: {}, conflicts: new Set() };
+      merged.set(key, entry);
     }
+    for (const [prop, value] of Object.entries(block.decls)) {
+      if (prop in entry.decls && entry.decls[prop] !== value) entry.conflicts.add(prop);
+      if (!(prop in entry.decls)) entry.seen[prop] = block.context;
+      entry.decls[prop] = value;
+    }
+    entry.order.push(...(block.order || Object.entries(block.decls)));
   }
   return [...merged.values()];
+}
+
+/** `display: flex !important` still lays out as a flex container. */
+function displayKind(raw) {
+  if (!raw) return { kind: 'absent' };
+  const value = raw.replace(/!\s*important\s*$/i, '').trim().toLowerCase();
+  if (!value) return { kind: 'absent' };
+  if (value.includes('var(') || value.includes('env(')) return { kind: 'dynamic' };
+  return { kind: 'static', value };
 }
 
 function textBoxFindings(blocks) {
   const findings = [];
   for (const block of mergeBySelector(blocks)) {
-    const raw = block.decls['text-box'] ?? block.decls['text-box-trim'];
-    if (!raw || /^none\b/i.test(raw.trim())) continue;
-    const display = (block.decls.display || '').trim().toLowerCase();
-    const where = block.context.length
-      ? `${block.selector} (in ${block.context.join(' > ')})`
-      : block.selector;
+    const trim = effectiveTrim(block.order);
+    if (!trim) continue;
+    const display = displayKind(block.decls.display);
+    const where = block.selector;
 
-    if (!display) {
+    if (trim === 'dynamic') {
       findings.push({
         id: 'rule/text-box-in-flex',
         layer: 'exact',
         forcedVerdict: 'unknown',
         pixel: false,
-        evidence: `${where} sets text-box but never declares display; container context is not in this file`,
+        evidence: `${where} sets text-box through a var(); the resulting trim value is not in this file`,
+        suggested: { kind: 'inspect', value: 'inline the token value and re-run' },
+      });
+      continue;
+    }
+
+    if (block.conflicts.has('display')) {
+      findings.push({
+        id: 'rule/text-box-in-flex',
+        layer: 'exact',
+        forcedVerdict: 'unknown',
+        pixel: false,
+        evidence: `${where} declares display differently in separate contexts; the container type depends on which applies`,
+        suggested: { kind: 'inspect', value: 'check each @media/@supports branch separately' },
+      });
+      continue;
+    }
+
+    if (display.kind === 'dynamic') {
+      findings.push({
+        id: 'rule/text-box-in-flex',
+        layer: 'exact',
+        forcedVerdict: 'unknown',
+        pixel: false,
+        evidence: `${where} sets text-box but display comes from a var(); the container type is not in this file`,
+        suggested: { kind: 'inspect', value: 'inline the display value and re-run' },
+      });
+      continue;
+    }
+
+    if (display.kind === 'absent') {
+      findings.push({
+        id: 'rule/text-box-in-flex',
+        layer: 'exact',
+        forcedVerdict: 'unknown',
+        pixel: false,
+        evidence: `${where} sets text-box but no rule for this selector in this file declares display; the container type is not in this file`,
         suggested: { kind: 'inspect', value: 'check the parent container for display:flex/grid' },
       });
       continue;
     }
 
-    if (FLEXY.test(display)) {
+    if (FLEXY.test(display.value)) {
+      const context = block.seen['text-box'] || block.seen.display || [];
+      const inContext = context.length ? ` (declared in ${context.join(' > ')})` : '';
       findings.push({
         id: 'rule/text-box-in-flex',
         layer: 'exact',
         forcedVerdict: 'off',
         pixel: false,
-        evidence: `${where}: display:${display} + text-box:${raw} — trimming has no effect on flex/grid containers`,
+        evidence: `${where}: display:${display.value} + text-box:${trim}${inContext} — trimming has no effect on flex/grid containers`,
         suggested: {
           kind: 'hoist',
           value: `apply text-box on the inline child of ${block.selector}`,
@@ -113,7 +220,9 @@ function nudgeFindings(blocks) {
       const m = /translateY\(\s*(-?\d*\.?\d+)px\s*\)/.exec(block.decls.transform);
       if (m) nudge = Number.parseFloat(m[1]);
     }
-    if (!nudge || Math.abs(nudge) > 3) continue;
+    // A sub-pixel nudge sits inside the tolerance band by definition; flagging it
+    // would be noise. The documented window is 1px <= |nudge| <= 3px.
+    if (!nudge || Math.abs(nudge) < 1 || Math.abs(nudge) > 3) continue;
 
     const isText = ['line-height', 'font-size', 'letter-spacing', 'font-family'].some(
       (prop) => block.decls[prop],
@@ -292,6 +401,10 @@ export function classInfo(expr) {
     .join(' ')
     .split(/\s+/)
     .map((t) => t.trim())
+    // Tailwind's important modifier is `!flex` in v3 and `flex!` in v4. Neither
+    // changes which declaration wins in a class list, only its priority, so the
+    // prefix/suffix is not part of the token's identity.
+    .map((t) => t.replace(/^!/, '').replace(/!$/, ''))
     .filter(Boolean);
 
   const interpolated = expr.includes('${');
@@ -464,6 +577,9 @@ function tailwindPadding(token, axis = '') {
   return m[1] in PADDING_SCALE ? PADDING_SCALE[m[1]] : null;
 }
 
+/** Tailwind's layout-display utilities, used to tell "not a flex container" from "unknown". */
+const DISPLAY_TOKEN = /^(block|inline|inline-block|flow-root|contents|hidden|table|table-row|table-cell|list-item)$/;
+
 function firstRadius(tokens) {
   for (const token of tokens) {
     const value = tailwindRadius(token);
@@ -493,8 +609,9 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
   for (const el of elements) {
     const info = classInfo(el.className);
     const hasBoxTrim = info.tokens.some(isBoxTrim);
+    if (!hasBoxTrim) continue;
     const flexy = info.tokens.find((t) => FLEXY.test(t));
-    if (hasBoxTrim && flexy) {
+    if (flexy) {
       findings.push(
         degradeIfConditional(info, {
           id: 'rule/text-box-in-flex',
@@ -505,7 +622,21 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
           suggested: { kind: 'hoist', value: `move text-box to the text child of <${el.tag}>` },
         }),
       );
+      continue;
     }
+    // No layout-display utility at all: the container type lives outside this
+    // element (parent, stylesheet, inline style), so it cannot be asserted.
+    if (info.tokens.some((t) => DISPLAY_TOKEN.test(t))) continue;
+    findings.push(
+      degradeIfConditional(info, {
+        id: 'rule/text-box-in-flex',
+        layer: 'exact',
+        forcedVerdict: 'unknown',
+        pixel: false,
+        evidence: `<${el.tag} className="${info.tokens.join(' ')}"> sets text-box but declares no display; the container type is not in this file`,
+        suggested: { kind: 'inspect', value: 'check the element and its stylesheet for display:flex/grid' },
+      }),
+    );
   }
 
   for (const el of elements) {

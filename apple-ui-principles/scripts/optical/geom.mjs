@@ -425,3 +425,41 @@ export function shapeToPath(tag, attrs) {
       return '';
   }
 }
+
+/**
+ * viewBox -> viewport mapping (SVG 1.1 §7.7).
+ *
+ * Icons routinely nest `<svg viewBox>` or instantiate `<symbol viewBox>` through
+ * `<use>`. Children of such a node are expressed in the *inner* user space, so
+ * without this matrix every measurement inside it is in the wrong units — which
+ * reads as a large offset in the report and as "the artwork is off-centre" in
+ * the fix. `preserveAspectRatio` defaults to `xMidYMid meet`.
+ */
+export function viewBoxMatrix(vb, rect, preserveAspectRatio = '') {
+  const w = rect.w;
+  const h = rect.h;
+  if (!(vb.w > 0) || !(vb.h > 0)) return [1, 0, 0, 1, rect.x, rect.y];
+
+  const par = String(preserveAspectRatio || '').trim();
+  if (par.toLowerCase().startsWith('none')) {
+    const sx = w / vb.w;
+    const sy = h / vb.h;
+    return [sx, 0, 0, sy, rect.x - vb.x * sx, rect.y - vb.y * sy];
+  }
+
+  const parts = par.split(/\s+/);
+  const align = parts[0] && /^(x(Min|Mid|Max))(Y(Min|Mid|Max))$/.test(parts[0]) ? parts[0] : 'xMidYMid';
+  const meetOrSlice = (parts[1] || 'meet').toLowerCase();
+
+  const scale =
+    meetOrSlice === 'slice'
+      ? Math.max(w / vb.w, h / vb.h)
+      : Math.min(w / vb.w, h / vb.h);
+
+  const fx = align.startsWith('xMin') ? 0 : align.startsWith('xMax') ? 1 : 0.5;
+  const fy = align.endsWith('YMin') ? 0 : align.endsWith('YMax') ? 1 : 0.5;
+
+  const tx = rect.x + (w - vb.w * scale) * fx - vb.x * scale;
+  const ty = rect.y + (h - vb.h * scale) * fy - vb.y * scale;
+  return [scale, 0, 0, scale, tx, ty];
+}

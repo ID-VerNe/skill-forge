@@ -161,10 +161,16 @@ function applyPolicy(report, policy) {
 
 function amountFor(f) {
   if (f.categorical || !f.relative) return '—';
-  const useX = Math.abs(f.measured.dx) >= Math.abs(f.measured.dy);
-  const px = useX ? f.measured.dx : f.measured.dy;
+  const { dx, dy } = f.measured;
+  const useX = Math.abs(dx) >= Math.abs(dy);
+  const dominant = useX ? dx : dy;
   const pct = useX ? f.relative.dx_pct : f.relative.dy_pct;
-  return `${px > 0 ? '+' : ''}${px}px (${pct}%)`;
+  const sign = (n) => `${n > 0 ? '+' : ''}${n}`;
+  // Both axes are printed when both carry signal: a suggestion of
+  // "0px / 1.67px" next to a measured "-1.67px" reads like a contradiction.
+  const pair = Math.abs(dx) >= 0.005 && Math.abs(dy) >= 0.005 ? `${sign(dx)}px / ${sign(dy)}px` : null;
+  const amount = pair ?? `${sign(dominant)}px`;
+  return `${amount} (${pct}%)`;
 }
 
 function printText(reports, explain) {
@@ -225,6 +231,12 @@ async function main() {
       return 64;
     }
     if (opts.command === 'font') return await runFont(opts);
+
+    // Silently ignoring these would let `check x.svg --size 48` look like it took
+    // effect. They belong to the `font` subcommand.
+    if (opts.size !== null || opts.lineHeight !== null) {
+      throw usage('--size and --line-height only apply to `font`; `check` derives size from the file');
+    }
 
     const policy = await loadPolicy(opts.policy);
     const reports = [];
