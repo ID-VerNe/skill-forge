@@ -1844,17 +1844,33 @@ test('a comma-separated transform list is parsed, not rejected', () => {
 });
 
 test('a clip is read in the space the element actually lives in', () => {
-  // `clip-path` on a <use> belongs to the parent's user space: x/y translate the
-  // referenced content, not the <use> itself. Trying the post-translate space as
-  // well made a correct canvas-sized clip look like it cut the ink.
+  // Chrome renders `<use x="6" y="6" clip-path="…12×12 at 0,0">` with the clip
+  // translated as well: the clip follows the referenced content, it is not the
+  // parent's rect. Reading it in the parent's space left a 6-unit strip of the
+  // content outside the clip and called a correct file `clip-path-cuts-ink`.
+  //
+  // The clip here is the *same size* as the content and starts at the origin, so
+  // the two readings disagree — a canvas-sized clip would contain the ink either
+  // way and test nothing.
   const use = analyzeSvg(
     svg(
-      '<clipPath id="c"><rect width="24" height="24"/></clipPath>' +
+      '<clipPath id="c"><rect width="12" height="12"/></clipPath>' +
         '<defs><g id="g"><rect width="12" height="12"/></g></defs>' +
         '<use href="#g" x="6" y="6" clip-path="url(#c)"/>',
     ),
   );
   assert.deepEqual(use.unresolved, []);
+
+  // Ink that really leaves the clip is still refused: a 6×6 clip against 12×12
+  // content leaves the far half outside.
+  const cut = analyzeSvg(
+    svg(
+      '<clipPath id="c"><rect width="6" height="6"/></clipPath>' +
+        '<defs><g id="g"><rect width="12" height="12"/></g></defs>' +
+        '<use href="#g" x="6" y="6" clip-path="url(#c)"/>',
+    ),
+  );
+  assert.match(cut.unresolved.join(), /clip-path-cuts-ink/);
 
   // A clip on a <symbol> lives in the space the symbol's viewBox establishes.
   // Judging it in the outer space refused every symbol that unit-scales.

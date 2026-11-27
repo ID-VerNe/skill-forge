@@ -901,9 +901,11 @@ function collect(node, inherited, out, ctx) {
         const fillPaint = paintValue(attrs.fill, inherited.fill, 'black');
         const strokePaint = paintValue(attrs.stroke, inherited.stroke, 'none');
         // A colour function this pass does not model. The shape may paint, or it
-        // may not; that is a gap, not a measurement.
+        // may not; that is a gap, not a measurement. `var()`/`env()` already carry
+        // a more specific reason above.
         for (const paint of [fillPaint, strokePaint]) {
-          if (paint !== undefined && paintKind(paint) === 'unknown') ctx.unresolved.add('unparsed-paint');
+          if (paint === undefined || isRuntimePaint(paint)) continue;
+          if (paintKind(paint) === 'unknown') ctx.unresolved.add('unparsed-paint');
         }
         // `var()` / `env()` name a value defined outside this file. Inheriting
         // the fallback colour would invent ink; ignoring the declaration would
