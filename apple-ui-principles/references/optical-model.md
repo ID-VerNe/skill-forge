@@ -31,12 +31,18 @@ Two rules keep that pipeline from lying:
 - **A broken paint server paints nothing.** `fill="url(#missing)"` is not "a
   colour we cannot read": SVG leaves the element unrendered. Counting it invented
   a region out of nothing, and every verdict built on it described ink the browser
-  never drew. `url(#g) red` carries a fallback colour and does paint; a reference
-  to a real gradient or pattern paints the same region, since only the colour
-  changes and colour is not measured. A reference to something that is **not** a
-  paint server (`url(#someClipPath)`) is refused as `paint-server` rather than
-  read as "nothing" — if the tag is one this pass has not heard of, guessing
-  would delete ink silently, which is the one failure that costs a verdict.
+  never drew. `url(#g) red` carries a fallback colour and does paint. A reference
+  to something that is **not** a paint server (`url(#someClipPath)`) is refused as
+  `paint-server` rather than read as "nothing" — if the tag is one this pass has
+  not heard of, guessing would delete ink silently, which is the one failure that
+  costs a verdict.
+- **A paint server that resolves to nothing also paints nothing.** Existence is
+  not coverage: an empty `<pattern>` is a hole in the canvas, and a gradient with
+  no stops — or whose stops all read `stop-opacity="0"` — puts down no colour.
+  `<pattern>` with content, and a gradient with at least one visible stop, paint
+  the shape's region as before (a pattern's internal geometry is not modelled, so
+  its coverage is taken at the shape's own region). Stops reached through
+  `href="#other"` are followed, because that is how export tools deduplicate them.
 - **`vector-effect="non-scaling-stroke"` keeps its width.** The band stays at the
   authored width while its path is scaled, so the area is computed from the path
   geometry at scale 1 — under `scale(4)` a 1-unit stroke on a 16-unit perimeter
@@ -98,8 +104,7 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | a `clip-path` whose geometry is not a plain rect, or one that cuts the ink | `geometry/unresolved-graphics` |
 | `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
-| a `transform` with a percentage or unit argument (`translate(10%,8)`, `2em`, `var(--t)`) | `geometry/unresolved-graphics` (`unparsed-transform`) — the value needs a context the file does not carry, and dropping just that argument would silently shift the rest |
-| a `transform` with malformed syntax — wrong argument count, unknown function, empty argument (`translate(10,)`), trailing junk | measured **untransformed**, with no finding — browsers drop the whole attribute, so the element sits in its parent's space |
+| a `transform` that is not a bare-number list — a unit (`translate(2px,0)`, `rotate(45deg)`), a percentage, `var()`, an unknown function, wrong argument count, empty argument (`translate(10,)`), trailing junk | measured **untransformed**, with no finding — the engine drops the whole attribute, so the element sits in its parent's space. The parseable prefix is never applied: that would turn `translate(10%,8)` into `translate(8,0)` |
 | a `stroke-width` in any unit — `10%` (`stroke-width-percentage`), or `2pt` / `1em` / `1in` (`stroke-width-relative`), on the shape **or any ancestor** | `geometry/unresolved-graphics`. The percentage is relative to a viewport the file does not fix, and the absolute units are declined on purpose: `pt`, `pc`, `mm` and `in` would each need a px-per-unit constant, which is a second place to be wrong about the same number. `2px` is accepted — one px *is* one user unit. Write the others in user units |
 | a `stroke-width` that overflows to infinity (`1e999`) | `geometry/unresolved-graphics` (`stroke-width-not-finite`) — one engine clamps it to the largest length and paints over the canvas, another drops the declaration |
 | a `stroke-width` that is finite but whose band area is not (`1e308`) | `geometry/unresolved-graphics` (`non-finite-ink`) — `width × length` overflows to `Infinity` and the centroid comes back `NaN`; `NaN` compares false against every tolerance, so without this check the report reads `off` with a `NaN` displacement instead of admitting it has no measurement |
@@ -108,11 +113,15 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | a `viewBox` attribute that is not four finite numbers with a positive size | `geometry/unresolved-graphics` (`invalid-viewBox`) — the element does not render, so there is no canvas to measure against |
 | no `viewBox` and a relative `width`/`height` | `geometry/unresolved-graphics` (`relative-canvas`) — the canvas is whatever the host gives it |
 | a root `width="0"` or `height="0"` | `geometry/unresolved-graphics` (`zero-canvas`) — SVG 1.1 §7.7: zero disables rendering |
+| a root `width` / `height` that is negative or not finite (`width="-2"`, `width="1e999"`) | `geometry/unresolved-graphics` (`invalid-canvas`) — the declaration is invalid, so the browser renders at its default 100% and the px-per-unit factor is not in the file. Reading `-2` as a scale flipped the sign of every reported pixel |
 | `<style>` rules this pass cannot evaluate (combinators, pseudo-classes, `@media`, geometry properties) | `geometry/unresolved-graphics` (`stylesheet-selector`, `stylesheet-conditional`, `stylesheet-geometry`) |
 | `<style>` containing `@import` | `geometry/unresolved-graphics` (`stylesheet-unparsed`) — the imported sheet may paint any element, and it is not in the file |
 | a matching rule that declares `animation` / `animation-name` (other than `none`) | `geometry/unresolved-graphics` (`css-animation`) — the paint comes from a `@keyframes` block this pass does not evaluate |
 | `fill` / `stroke` set to `var()` or `env()` | `geometry/unresolved-graphics` (`runtime-paint`) — the value is defined outside the file |
 | `fill` / `stroke` set to `url(#id)` where `#id` is not a paint server | `geometry/unresolved-graphics` (`paint-server`) — no engine paints it, but calling it "no ink" would delete real ink if the tag were one this pass has not heard of |
+| `url(#id)` pointing at an **empty** `<pattern>`, or a gradient with no stops / only transparent stops | no ink. The element exists and covers no pixel — an empty pattern is a hole in the canvas, and a gradient whose stops all read `stop-opacity="0"` paints nothing. Stops inherited through `href` are followed |
+| `fill="currentColor"` with a `color` the file sets to transparent | no ink. `currentColor` is a reference to the inherited `color`, not a colour: `color:transparent` (or `#0000`, or `rgba(0,0,0,0)`) makes the shape invisible. When `color` is absent from the file it is assumed opaque — stated in `SKILL.md` |
+| `fill-rule` set to anything but `nonzero` / `evenodd` | the declaration is dropped, so the **inherited** rule applies — `<g fill-rule="evenodd"><path fill-rule="nonsense">` still subtracts its hole |
 | `fill` / `stroke` whose value CSS cannot parse (`notacolor`, `3`, `3px`, `#12345`, `rgb(1,2`) | the declaration is dropped the way a browser drops it: `fill` keeps its initial **black and still paints**, `stroke` keeps its initial **`none` and paints nothing**. Reading the junk as paint put a 128-unit band on a blank canvas |
 | `fill` / `stroke` set to `inherit` / `unset` / `revert` / `initial` | resolved, not measured as a string: the parent's computed value for the first three, `black` (`fill`) or `none` (`stroke`) for `initial` |
 | `fill` / `stroke` with a colour function this pass does not model (`futurecolor(…)`) | `geometry/unresolved-graphics` (`unparsed-paint`) — it may paint or it may not |
@@ -185,8 +194,15 @@ Three things a stylesheet can say that are not measurements:
 - `fill: var(--x)` and `env()` name a value defined elsewhere. `transparent`,
   `#rrggbb00` and zero-alpha colours are the opposite case: they are declarations
   of *no* ink, and measuring them as solid invents a shape the render does not
-  have. `currentColor` is fine — it paints, and only its hue is unknown, which
-  never moves a centroid.
+  have.
+- `currentColor` is a **reference to the inherited `color`**, not a colour in its
+  own right. When the file sets `color: transparent` — `<g color="transparent">`,
+  `style="color:rgba(0,0,0,0)"`, or a `text-transparent` style class — the shape
+  paints nothing, and treating `currentColor` as ink reported `ok` on a blank
+  canvas. `color` is tracked in the inheritance chain and through `<style>`,
+  including its own `!important` and specificity rules. When `color` is *not* in
+  the file the pass assumes it is opaque: that is stated in `SKILL.md`, because
+  from the outside it is indistinguishable from painted.
 
 Two details that are easy to get wrong and were:
 
@@ -276,19 +292,28 @@ belongs to the host page's placement of the canvas, not to the artwork's
 internal coordinate system, so letting it through would report a `104px` offset
 for an icon that is perfectly centred.
 
-`transform` parsing is strict, and it separates two failures that look alike.
-A `%` argument, `2em` or `var(--x)` names a value defined outside the file, so
-the list is refused (`unparsed-transform`) rather than guessed: dropping the bad
-argument would shift the rest left, and `translate(10%,8)` would silently become
-`translate(8,0)`. Malformed syntax is a different answer — an unknown function,
-trailing junk after the last `)`, or the wrong argument count. Browsers drop the
-whole attribute there, so the element is measured in its untransformed space;
-applying the parseable prefix instead put ink at `translate(10 20)` for an
-attribute every engine ignores. Two notations are accepted because they are
-unambiguous rather than because they are convenient: commas *between* functions,
-as the CSS form writes them (`translate(1px,2px), rotate(45deg)`), and a `px`
-suffix on a length — on an SVG element `transform-origin` is the origin, so
-`1px` is one user unit and the number is the same either way.
+`transform` parsing is strict, and there is **one** failure mode, not two: a value
+that is not a bare-number transform list is dropped by the engine, so the element
+is measured in its untransformed space. That covers units (`translate(2px,0)`,
+`rotate(45deg)`), percentages (`translate(10%,8)`), `var()` / `env()` / `calc()`,
+an unknown function, trailing junk after the last `)`, the wrong argument count,
+and an empty argument (`translate(10,)`). All six spellings were rasterised in
+Chrome and none of them moved the element.
+
+Two things follow. The parseable prefix must **not** be applied — splicing the bad
+argument out would turn `translate(10%,8)` into `translate(8,0)` and
+`translate(10 20)` into `translate(10 20, 0)`, which is a wrong position with no
+warning. And the attribute is not the CSS property: `style="transform:rotate(45deg)"`
+*is* valid CSS, and lands in the `stylesheet-geometry` refusal instead, because a
+stylesheet can move ink in ways this pass does not evaluate.
+
+One caveat worth recording: SVG 2 nominally types the `transform` attribute as a
+CSS `<transform-list>`, where units are legal. This pass follows the engine it was
+calibrated against (Chrome). On an engine that honours the SVG 2 reading, an
+icon using `transform="rotate(45deg)"` turns where the report says it does not.
+
+Commas *between* functions are still accepted (`translate(1,2), rotate(45)`): that
+is the one CSS-ism the attribute grammar shares, and it is unambiguous.
 
 ### Units
 
@@ -352,7 +377,8 @@ weight = fill(outer + sign(self)) − fill(outer)     // fill(w) = w ≠ 0 ? 1 :
 
 The last two rows are why the winding has to accumulate. Comparing each subpath
 against its immediate parent gets two levels right and reports the island in row
-four as another hole — `576 − 400 + 64` came back `112`.
+four as another hole — `576 − 400 − 64` came back `112` where the render paints
+`240`.
 
 Summing signed areas looks like it handles all of this and handles the disjoint
 case wrong: `M0 0 H10 V10 H0 Z M20 0 V10 H30 V0 Z` — two squares, the second
@@ -424,13 +450,14 @@ correct.
    measurement. The error is in `ink.area` and, when the overlap is asymmetric,
    in the centroid; `geometry/ink-bbox` is unaffected. Catching it needs the same
    boolean machinery as case 1.
-3. The stroke model — joins, caps and dashes are approximated as a swept band.
-   Two consequences worth naming. A thick stroke over-counts its corners, because
-   `perimeter × width` counts each corner square twice: a 10-unit square with a
-   2-unit stroke is `4 × (40 × 2) = 320` by the model and `176` as a ring. And a
-   shape that is both filled and stroked counts the band over its own fill, so
-   `fill="#000" stroke="#000"` on a 16-unit square reports `384` where the union
-   is `324`.
+3. The stroke model — joins, caps and dashes are approximated as a swept band,
+   `perimeter × width`, scaled by |det|. For a convex polygon with miter joins
+   that is exact, not approximate: a 10-unit square with a 2-unit stroke is
+   `40 × 2 = 80`, which is also the ring `12² − 8²`. It over-counts where the band
+   overlaps *itself* — reflex corners, a shape thinner than its stroke, a spiral —
+   and it ignores caps and dashes entirely. And a shape that is both filled and
+   stroked counts the band over its own fill, so `fill="#000" stroke="#000"` on a
+   16-unit square reports `384` where the union is `324`.
 
 None of these can move `geometry/ink-bbox`, which depends on extreme points only.
 

@@ -420,15 +420,11 @@ function applyStylesheets(text, root, ctx) {
 function matrixFrom(attrs, base, ctx) {
   if (!attrs.transform) return base;
   const parsed = parseTransform(attrs.transform);
-  // A malformed list is dropped by the browser, so the element sits in its
-  // untransformed space; a value that needs a context (`2em`, `var(--t)`) is
-  // unknowable and stays refused. Treating them alike either invented a
-  // position or refused a drawing whose transform is simply absent.
+  // A list the engine rejects is dropped whole, so the element sits in its
+  // untransformed space. Units (`2px`, `45deg`, `10%`) and `var()` are all in that
+  // class: the `transform` attribute takes bare numbers, measured on Chrome for
+  // all six spellings.
   if (parsed === INVALID_TRANSFORM) return base;
-  if (!parsed) {
-    ctx.unresolved.add('unparsed-transform');
-    return base;
-  }
   return multiplyMatrix(base, parsed);
 }
 
@@ -497,7 +493,40 @@ function paintReference(paint, ctx) {
   }
   const target = ctx.ids.get(match[1]);
   if (!target) return 'absent';
-  return PAINT_SERVER.has(String(target.tag).toLowerCase()) ? 'paint' : 'unknown';
+  if (!PAINT_SERVER.has(String(target.tag).toLowerCase())) return 'unknown';
+  // A paint server that exists is not a paint server that paints: an empty
+  // `<pattern>` and a gradient whose stops are all transparent cover nothing, and
+  // counting the shape as solid reported `ok` on a blank canvas.
+  return paintServerPaints(target, ctx) ? 'paint' : 'absent';
+}
+
+/** Does this paint server put any colour on the canvas? */
+function paintServerPaints(target, ctx, depth = 0) {
+  if (depth > 4) return true; // stop chasing `href` chains and assume it paints
+  const tag = String(target.tag).toLowerCase();
+  if (tag === 'pattern') {
+    return (target.children || []).some((child) => child.tag !== '#comment');
+  }
+  if (tag === 'lineargradient' || tag === 'radialgradient') {
+    const stops = (target.children || []).filter((child) => String(child.tag).toLowerCase() === 'stop');
+    if (stops.length === 0) {
+      // A gradient with no stops of its own takes them from `href`; with none
+      // anywhere it has nothing to paint.
+      const attrs = effectiveAttrs(target);
+      const href = String(attrs.href || attrs['xlink:href'] || '').trim();
+      const linked = /^#(.+)$/.exec(href);
+      const next = linked ? ctx.ids.get(linked[1]) : null;
+      return next ? paintServerPaints(next, ctx, depth + 1) : false;
+    }
+    return stops.some((stop) => {
+      const attrs = effectiveAttrs(stop);
+      if (resolveOpacity(attrs['stop-opacity'], 1) <= 0) return false;
+      const colour = attrs['stop-color'];
+      if (colour !== undefined && (keywordIs(colour, 'none') || isInvisiblePaint(colour))) return false;
+      return true;
+    });
+  }
+  return true;
 }
 
 /**
@@ -545,16 +574,30 @@ function strokeWidthOf(attrs, inherited, ctx) {
  * painted: `<g fill="none"><rect fill="inherit"/>` has no ink, and the checker
  * measured the rectangle as solid because `inherit` is not the string `none`.
  */
-function paintValue(raw, inheritedValue, initial) {
-  if (raw === undefined) return inheritedValue;
-  if (paintKind(raw) !== 'inherit') return raw;
-  return String(raw).trim().toLowerCase() === 'initial' ? initial : inheritedValue;
+function paintValue(raw, inheritedValue, initial, color) {
+  const value =
+    raw === undefined
+      ? inheritedValue
+      : paintKind(raw) !== 'inherit'
+        ? raw
+        : String(raw).trim().toLowerCase() === 'initial'
+          ? initial
+          : inheritedValue;
+  // `currentColor` is not a colour, it is a reference to the inherited `color`.
+  // Treating it as "some colour, so it paints" reported `ok` on a blank canvas
+  // whenever the file (or a `text-transparent` class upstream) made `color`
+  // transparent. When `color` is set outside the file the assumption stays — but
+  // it is now stated in `SKILL.md` instead of hidden.
+  if (value !== undefined && keywordIs(value, 'currentcolor')) {
+    return color === undefined ? value : color;
+  }
+  return value;
 }
 
 /** Does a `<text>` element paint any glyph ink at all? */
 function textPaintsAnything(attrs, inherited) {
-  const fill = paintValue(attrs.fill, inherited.fill, 'black');
-  const stroke = paintValue(attrs.stroke, inherited.stroke, 'none');
+  const fill = paintValue(attrs.fill, inherited.fill, 'black', inherited.color);
+  const stroke = paintValue(attrs.stroke, inherited.stroke, 'none', inherited.color);
   const fillOff =
     fill === undefined ||
     keywordIs(fill, 'none') ||
@@ -568,14 +611,36 @@ function textPaintsAnything(attrs, inherited) {
   return !(fillOff && strokeOff);
 }
 
+/**
+ * `fill-rule` has exactly two valid values.
+ *
+ * Anything else is a dropped declaration, which means the property keeps the
+ * value it inherits — not the junk string. `fill-rule` is inherited, so
+ * `<g fill-rule="evenodd"><path fill-rule="nonsense">` must subtract the hole:
+ * reading the junk as a rule measured 400 where the render paints 300.
+ */
+const FILL_RULES = new Set(['nonzero', 'evenodd']);
+
+function fillRuleOf(attrs, inherited) {
+  const raw = attrs['fill-rule'];
+  if (raw === undefined) return inherited.fillRule;
+  const value = String(raw).trim().toLowerCase();
+  // `initial` is the initial value; `inherit`/`unset`/`revert` are the parent's,
+  // which `inherited.fillRule` already carries.
+  if (value === 'initial') return 'nonzero';
+  return FILL_RULES.has(value) ? value : inherited.fillRule;
+}
+
 /** Presentation state a node hands to its children. */
 function inheritedFor(attrs, inherited, visible, matrix, ctx) {
+  const color = attrs.color !== undefined ? attrs.color : inherited.color;
   return {
     matrix,
-    fill: paintValue(attrs.fill, inherited.fill, 'black'),
-    stroke: paintValue(attrs.stroke, inherited.stroke, 'none'),
+    color,
+    fill: paintValue(attrs.fill, inherited.fill, 'black', color),
+    stroke: paintValue(attrs.stroke, inherited.stroke, 'none', color),
     strokeWidth: strokeWidthOf(attrs, inherited, ctx),
-    fillRule: attrs['fill-rule'] || inherited.fillRule,
+    fillRule: fillRuleOf(attrs, inherited),
     // `fill-opacity` is inherited; `opacity` is not (it composites the group).
     fillOpacity: resolveOpacity(attrs['fill-opacity'], inherited.fillOpacity),
     // `stroke-opacity` inherits the same way, and a fully transparent stroke
@@ -598,9 +663,12 @@ function inheritedFor(attrs, inherited, visible, matrix, ctx) {
  * refusing is the only honest answer without a real polygon intersection.
  */
 function resolveClipRect(raw, ctx, matrix) {
-  const m = /^\s*url\(\s*#([^)\s]+)\s*\)\s*$/.exec(raw);
+  // CSS function names are case-insensitive and `url()` takes an optional
+  // quoted string: `url('#c')` and `URL(#c)` both crop, but neither matched, so
+  // both were refused as unreadable.
+  const m = /^\s*url\(\s*(['"]?)#([^'")\s]+)\1\s*\)\s*$/i.exec(String(raw).trim());
   if (!m) return null;
-  const target = ctx.ids.get(m[1]);
+  const target = ctx.ids.get(m[2]);
   if (!target || String(target.tag).toLowerCase() !== 'clippath') return null;
   const targetAttrs = effectiveAttrs(target);
   if ((targetAttrs.clipPathUnits || 'userSpaceOnUse') !== 'userSpaceOnUse') return null;
@@ -657,9 +725,14 @@ function bboxOfShapes(shapes, steps, ctx) {
       if (ctx) ctx.unresolved.add('unparsed-path');
       return null;
     }
-    const points = flat.flat().map(([x, y]) => applyMatrix(shape.matrix, x, y));
-    if (points.length === 0) continue;
-    const localBox = bboxOfPoints(points);
+    // Same rule as the ink box itself: a subpath that encloses nothing paints
+    // nothing. Including it here made a stray `M0 0` look like ink that escapes
+    // the clip, and the whole file came back `clip-path-cuts-ink` for a shape the
+    // render draws in full. A stroked line *is* ink, so it stays.
+    const mapped = flat.map((sub) => sub.map(([x, y]) => applyMatrix(shape.matrix, x, y)));
+    const painting = shape.stroked ? mapped : mapped.filter((sub) => enclosesArea(sub));
+    if (painting.length === 0) continue;
+    const localBox = bboxOfPoints(painting.flat());
     // A stroke widens the shape by half its width, measured along the *transformed*
     // normal: under `scale(4,1)` the band is 4× wider across x than across y. The
     // padding therefore has to be per-axis — the single mean scale used to be
@@ -852,15 +925,18 @@ function collect(node, inherited, out, ctx) {
       }
       if (targetTag === 'svg') {
         // Let the nested-viewport branch apply the viewBox exactly once. The
-        // <use> width/height override the target's own, and x/y are already in
-        // `useMatrix`, so the clone is placed at the origin.
+        // <use> width/height override the target's own; the target's **x/y are
+        // kept**, because they belong to it — `<svg x="9" y="9">` instanced by a
+        // `<use>` lands at 9,9, and the `<use>`'s own x/y add on top. Zeroing them
+        // moved the artwork to the origin: a centred icon came back `off` by 90px
+        // with a `viewBox="-9 -9 24 24"` suggestion that would have broken it.
         //
         // `style` is dropped: it has already been cascaded into these
         // attributes, and keeping it lets `effectiveAttrs` run the declarations
         // a second time against the flattened result — which resurrects a value
         // an `!important` stylesheet rule had just overruled.
         const { style: _style, ...flat } = effectiveAttrs(target);
-        const overrides = { ...flat, x: '0', y: '0' };
+        const overrides = { ...flat };
         if (attrs.width !== undefined) overrides.width = attrs.width;
         if (attrs.height !== undefined) overrides.height = attrs.height;
         // The clone must not carry the target's cached cascade: its attributes
@@ -898,8 +974,10 @@ function collect(node, inherited, out, ctx) {
       } else if (shape.d) {
         const strokeWidth = strokeWidthOf(attrs, inherited, ctx);
         const strokeUnits = Number.isFinite(strokeWidth) ? strokeWidth : 1;
-        const fillPaint = paintValue(attrs.fill, inherited.fill, 'black');
-        const strokePaint = paintValue(attrs.stroke, inherited.stroke, 'none');
+        // The shape's own `color` applies to its own `currentColor`.
+        const color = attrs.color !== undefined ? attrs.color : inherited.color;
+        const fillPaint = paintValue(attrs.fill, inherited.fill, 'black', color);
+        const strokePaint = paintValue(attrs.stroke, inherited.stroke, 'none', color);
         // A colour function this pass does not model. The shape may paint, or it
         // may not; that is a gap, not a measurement. `var()`/`env()` already carry
         // a more specific reason above.
@@ -947,7 +1025,7 @@ function collect(node, inherited, out, ctx) {
             String(attrs['vector-effect'] ?? '').trim().toLowerCase() === 'non-scaling-stroke',
           // Even `fill-rule` is inherited, and an inherited `evenodd` changes the
           // area of every child path.
-          fillRule: (attrs['fill-rule'] || inherited.fillRule || 'nonzero').toLowerCase(),
+          fillRule: fillRuleOf(attrs, inherited),
         });
       }
     }
@@ -1110,7 +1188,15 @@ function zeroSided(attrs) {
   for (const name of ['width', 'height']) {
     if (attrs[name] === undefined) continue;
     const value = absolutePx(attrs[name]);
+    // A `%` or em length is not a canvas this pass knows; that is the caller's
+    // `relative-canvas` case, not a dead one.
+    if (value === null) continue;
     if (value === 0) return 'zero-canvas';
+    // `width="-2"` is not "smaller than zero", it is an invalid declaration: the
+    // browser drops it and the element renders at its default 100%. Treating the
+    // negative as a scale flipped the sign of every reported pixel — a real `off`
+    // came back as `ok` with `dx=+0.167px`.
+    if (!(value > 0) || !Number.isFinite(value)) return 'invalid-canvas';
   }
   return null;
 }
@@ -1387,7 +1473,7 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
   // A canvas that failed to parse has no ink for a reason already reported;
   // adding "the canvas may be empty" would point the reader at the wrong thing.
   const canvasInvalid = (shape.unresolved || []).some(
-    (id) => id === 'invalid-viewBox' || id === 'relative-canvas',
+    (id) => id === 'invalid-viewBox' || id === 'relative-canvas' || id === 'invalid-canvas',
   );
   if (shape.noInk && !canvasInvalid) {
     // "No ink" and "no measurable ink" point the reader at different things: an

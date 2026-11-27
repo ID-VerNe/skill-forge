@@ -836,35 +836,24 @@ export function applyMatrix(m, x, y) {
 /**
  * Sentinel for a transform list a browser would throw away.
  *
- * `parseTransform` has two ways to fail and they are not the same answer:
- * syntax the engine rejects (`translate(10 20 30)`, an unknown function) leaves
- * the element **untransformed**, while a value that needs a context we do not
- * have (`2em`, `var(--t)`) is unknowable. Returning `null` for both made the
- * first look unmeasurable and, before that, made it look partially applied.
+ * There is only one way to fail. The `transform` **attribute** takes numbers
+ * only — no `2px`, no `45deg`, no `10%`, no `var()` — and Chrome answers every one
+ * of those by dropping the whole attribute, so the element sits in its parent's
+ * space. Measured on Chrome for all six spellings: the rect does not move.
+ *
+ * That contradicts SVG 2, which nominally types the attribute as a CSS
+ * `<transform-list>` (where units *are* legal). This pass follows the engine it
+ * was calibrated against; `optical-model.md` records the caveat. A unit on the CSS
+ * `transform` property is refused separately, as `stylesheet-geometry`.
  */
 export const INVALID_TRANSFORM = 'invalid-transform';
 
 /**
- * Does this argument need a context the static pass does not have?
- *
- * A length unit other than `px`, or a `var()` / `env()` / `calc()` call, names a
- * value defined elsewhere. Anything else that fails to parse (`garbage`, `foo`)
- * is a syntax error, and a browser answers those by dropping the whole list.
- */
-const CONTEXT_ARG =
-  /%|\d\s*(em|ex|ch|rem|vw|vh|vmin|vmax|pt|pc|cm|mm|in|q)$|(var|env|calc)\s*\(/i;
-
-function needsContext(raw) {
-  return CONTEXT_ARG.test(String(raw));
-}
-
-/**
  * Parse an SVG transform list into a single matrix.
- * @returns {number[]|string|null} the matrix, `INVALID_TRANSFORM` when the list
- *   is malformed (the browser drops it, so the caller uses the untransformed
- *   space), or `null` when an argument cannot be resolved to a number. Dropping
- *   the bad argument would shift the rest left — `translate(10%,8)` would
- *   silently become `translate(8,0)` — so the whole transform is refused.
+ * @returns {number[]|string} the matrix, or `INVALID_TRANSFORM` when the list is
+ *   not a bare-number transform list (the browser drops it, so the caller uses
+ *   the untransformed space). There is no third answer: refusing half a list
+ *   would have applied `translate(8,0)` to `translate(10%,8)`.
  */
 export function parseTransform(value) {
   if (!value) return IDENTITY;
@@ -872,9 +861,7 @@ export function parseTransform(value) {
   const re = /([a-zA-Z]+)\s*\(([^)]*)\)/g;
   // Anything the function list does not consume is not a transform. Splicing
   // it out silently kept `translate(10,10) garbage` looking like a clean
-  // translation, which is a wrong position with no warning. Commas *between*
-  // functions are legal in the CSS form (`translate(1px,2px), rotate(45deg)`),
-  // so they are the one separator allowed to survive.
+  // translation, which is a wrong position with no warning.
   if (
     String(value)
       .replace(re, '')
@@ -893,22 +880,9 @@ export function parseTransform(value) {
     // were `translate(10)` — the browser drops the whole attribute instead.
     if (/^\s*,|,\s*$|,\s*,/.test(match[2])) return INVALID_TRANSFORM;
     for (const raw of match[2].split(/[\s,]+/).filter((part) => part !== '')) {
-      if (name === 'rotate' || name === 'skewX' || name === 'skewY') {
-        const m = /^(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(deg|grad|rad|turn)?$/.exec(raw);
-        if (!m) return needsContext(raw) ? null : INVALID_TRANSFORM;
-        let angle = Number.parseFloat(m[1]);
-        if (m[2] === 'rad') angle = (angle * 180) / Math.PI;
-        else if (m[2] === 'grad') angle = angle * 0.9;
-        else if (m[2] === 'turn') angle = angle * 360;
-        args.push(angle);
-      } else {
-        // The CSS form writes lengths with a unit. On an SVG element `1px` is
-        // one user unit (`transform-origin` is the origin), so the number is
-        // the same either way; `em` and `%` are not, and stay refused.
-        const m = /^(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(px)?$/.exec(raw);
-        if (!m) return needsContext(raw) ? null : INVALID_TRANSFORM;
-        args.push(Number.parseFloat(m[1]));
-      }
+      const m = /^(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)$/.exec(raw);
+      if (!m) return INVALID_TRANSFORM;
+      args.push(Number.parseFloat(m[1]));
     }
     let m = IDENTITY;
     switch (name) {

@@ -139,6 +139,8 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | `icon.svg` whose subpaths overlap *within one shape* | — | `unknown`: `overlapping-subpaths`. Summing them over-counts one winding and under-counts the other, and a union needs a boolean operation the checker does not have. Split the artwork into separate shapes if the verdict matters |
 | `icon.svg` with a `fill`/`stroke` value CSS cannot parse (`notacolor`, `3`, `#12345`) | — | treated as a browser treats it: `fill` falls back to black **and still paints**, `stroke` falls back to `none` **and paints nothing**. Write the value you mean |
 | `icon.svg` with `--mode inline` | `inline` | `unknown`: the optical gutter needs a sibling text node, and the CLI has no way to hand one over. Use `standalone` |
+| `icon.svg` painting with `fill="currentColor"` | — | resolved against the `color` this file declares, transparent included. When `color` is **not** in the file, the pass assumes it is opaque — an icon hidden by a class upstream (`text-transparent`) measures as painted |
+| `icon.svg` with `transform="rotate(45deg)"` — a unit in the **attribute** | — | measured untransformed, because that is what browsers do: the `transform` attribute takes bare numbers and the whole attribute is dropped otherwise. Write `rotate(45)` |
 | `icons/` (dir) | `keyline` | fill-ratio outliers across the set (needs ≥3 icons of one family) |
 | `styles.css` | rule | `text-box` in flex/grid, hard-coded nudges |
 | `Button.tsx` | rule | same, plus concentric radii from the element tree |

@@ -829,13 +829,19 @@ test('preserveAspectRatio="slice" scales by the larger ratio', () => {
   near(shape.unitScaleY, 2, 1e-9);
 });
 
-test('a transform with an unresolvable argument is refused, not truncated', () => {
-  // Dropping "10%" would turn translate(10%,8) into translate(8,0).
-  const shape = analyzeSvg(svg('<g transform="translate(10%,8)"><rect x="0" y="0" width="4" height="4"/></g>'));
-  assert.ok(shape.unresolved.includes('unparsed-transform'), JSON.stringify(shape.unresolved));
-
-  const bad = analyzeSvg(svg('<g transform="skewX(2em)"><rect x="0" y="0" width="4" height="4"/></g>'));
-  assert.ok(bad.unresolved.includes('unparsed-transform'), JSON.stringify(bad.unresolved));
+test('a transform attribute with units is dropped, the way the engine drops it', () => {
+  // The `transform` **attribute** takes bare numbers only. Chrome discards the
+  // whole attribute for `10%`, `2em`, `2px`, `45deg` and `var()` — measured for
+  // all six spellings — so the element sits in its parent's space. Refusing them
+  // was over-cautious; applying the parseable prefix (`translate(8,0)`) was wrong.
+  for (const t of ['translate(10%,8)', 'skewX(2em)', 'translate(2px,0)', 'rotate(45deg)', 'translate(var(--t),0)']) {
+    const shape = analyzeSvg(svg(`<g transform="${t}"><rect x="4" y="4" width="4" height="4"/></g>`));
+    assert.deepEqual(shape.unresolved, [], t);
+    near(shape.ink.bbox.minX, 4, 1e-9);
+  }
+  // The same numbers without a unit do move the element.
+  const moved = analyzeSvg(svg('<g transform="translate(2,0)"><rect x="4" y="4" width="4" height="4"/></g>'));
+  near(moved.ink.bbox.minX, 6, 1e-9);
 });
 
 test('a percentage stroke-width is not read as user units', () => {
@@ -1749,9 +1755,12 @@ test('a paint that resolves at runtime is refused, not guessed', () => {
     });
     assert.equal(report.verdict, 'unknown', paint);
   }
-  // `currentColor` does paint; only its hue is unknown, and hue never moves ink.
+  // `currentColor` does paint when `color` is unknown to this pass: only its hue
+  // is unknown, and hue never moves ink. This assertion has to be about the ink —
+  // an `unresolved`-only check kept passing while the shape measured as empty.
   const current = analyzeSvg(svg('<rect width="24" height="24" fill="currentColor"/>'));
   assert.deepEqual(current.unresolved, []);
+  near(current.ink.area, 576, 1e-9);
 });
 
 test('!important attaches to the declaration that carries it, not to the property', () => {
@@ -1838,9 +1847,20 @@ test('a zero-sized canvas renders nothing instead of a centred dot', () => {
 });
 
 test('a comma-separated transform list is parsed, not rejected', () => {
-  const shape = analyzeSvg(svg('<rect transform="translate(1px, 1px), scale(1)" x="2" y="0" width="20" height="24"/>'));
-  assert.deepEqual(shape.unresolved, []);
-  near(shape.ink.bbox.minX, 3);
+  // The commas between functions are the one CSS-ism the attribute grammar shares,
+  // so a list like this parses. A `px` suffix does not: Chrome drops the whole
+  // attribute, which leaves the rect at x=2 rather than 3.
+  const withUnits = analyzeSvg(
+    svg('<rect transform="translate(1px, 1px), scale(1)" x="2" y="0" width="20" height="24"/>'),
+  );
+  assert.deepEqual(withUnits.unresolved, []);
+  near(withUnits.ink.bbox.minX, 2);
+
+  const bare = analyzeSvg(
+    svg('<rect transform="translate(1, 1), scale(1)" x="2" y="0" width="20" height="24"/>'),
+  );
+  assert.deepEqual(bare.unresolved, []);
+  near(bare.ink.bbox.minX, 3);
 });
 
 test('a clip is read in the space the element actually lives in', () => {
@@ -2158,4 +2178,152 @@ test('invisible text is not unmeasurable ink', () => {
     svg('<text x="2" y="20" visibility="hidden">hi</text><rect x="4" y="4" width="16" height="16"/>'),
   );
   assert.deepEqual(hidden.unresolved, []);
+});
+
+// --- currentColor resolves to `color`, transparent included ------------------
+
+test('currentColor is resolved, and a transparent color paints nothing', () => {
+  // `fill="currentColor"` is the most common paint in icon sets, and
+  // `color: transparent` (Tailwind's `text-transparent`) is how icons get hidden.
+  // Both were invisible to the paint checks: `currentColor` was accepted as "some
+  // colour, therefore ink" while nothing was drawn.
+  const cases = [
+    '<g color="transparent"><rect x="4" y="4" width="16" height="16" fill="currentColor"/></g>',
+    '<rect x="4" y="4" width="16" height="16" color="transparent" fill="currentColor"/>',
+    '<rect x="4" y="4" width="16" height="16" color="#0000" fill="currentColor"/>',
+    '<style>g{color:transparent}</style><g><rect x="4" y="4" width="16" height="16" fill="currentColor"/></g>',
+    '<rect x="4" y="4" width="16" height="16" style="color:rgba(0,0,0,0)" fill="currentColor"/>',
+  ];
+  for (const body of cases) {
+    const shape = analyzeSvg(svg(body));
+    assert.equal(shape.noInk, true, body);
+  }
+  // A real colour still paints, and `currentColor` follows it down the tree.
+  const painted = analyzeSvg(svg('<g color="red"><rect x="4" y="4" width="16" height="16" fill="currentColor"/></g>'));
+  near(painted.ink.area, 256, 1e-9);
+  // `stroke="currentColor"` too.
+  const stroked = analyzeSvg(
+    svg('<rect x="4" y="4" width="16" height="16" color="transparent" fill="none" stroke="currentColor" stroke-width="2"/>'),
+  );
+  assert.equal(stroked.noInk, true);
+});
+
+// --- paint servers that paint nothing ---------------------------------------
+
+test('a paint server with nothing to paint covers nothing', () => {
+  // An empty `<pattern>` and a gradient whose stops are all transparent exist as
+  // elements and cover no pixel. Counting the shape as solid reported `ok` on a
+  // blank canvas.
+  for (const defs of [
+    '<pattern id="p" width="8" height="8"/>',
+    '<linearGradient id="p"><stop offset="0" stop-opacity="0"/><stop offset="1" stop-opacity="0"/></linearGradient>',
+    '<linearGradient id="p"/>',
+    '<linearGradient id="p"><stop offset="0" stop-color="none"/></linearGradient>',
+  ]) {
+    const shape = analyzeSvg(svg(`<defs>${defs}</defs><rect x="4" y="4" width="16" height="16" fill="url(#p)"/>`));
+    assert.equal(shape.noInk, true, defs);
+  }
+  // A gradient with a visible stop paints the shape; so does one inheriting its
+  // stops through `href`.
+  const visible = analyzeSvg(
+    svg('<defs><linearGradient id="p"><stop offset="0" stop-color="#000"/></linearGradient></defs>'
+      + '<rect x="4" y="4" width="16" height="16" fill="url(#p)"/>'),
+  );
+  near(visible.ink.area, 256, 1e-9);
+  const inherited = analyzeSvg(
+    svg('<defs><linearGradient id="base"><stop offset="0" stop-color="#000"/></linearGradient>'
+      + '<linearGradient id="p" href="#base"/></defs>'
+      + '<rect x="4" y="4" width="16" height="16" fill="url(#p)"/>'),
+  );
+  near(inherited.ink.area, 256, 1e-9);
+  // A pattern with content is a real fill even though its geometry is not modelled.
+  const pattern = analyzeSvg(
+    svg('<defs><pattern id="p" width="8" height="8"><rect width="4" height="4"/></pattern></defs>'
+      + '<rect x="4" y="4" width="16" height="16" fill="url(#p)"/>'),
+  );
+  near(pattern.ink.area, 256, 1e-9);
+});
+
+// --- an <svg> referenced by <use> keeps its own x/y --------------------------
+
+test('a referenced <svg> keeps its own x/y, and the <use> offsets add on top', () => {
+  // The clone used to force x="0" y="0" on the grounds that the offset was
+  // already in the matrix — it was not: only the `<use>`'s own x/y were. A
+  // centred sprite came back `off` by 90px with a `viewBox="-9 -9 24 24"`
+  // suggestion that would have broken it.
+  const sprite = (x, y) =>
+    `<defs><svg id="s" x="${x}" y="${y}" width="6" height="6" viewBox="0 0 6 6"><rect width="6" height="6"/></svg></defs>`;
+  const placed = analyzeSvg(svg(`${sprite(9, 9)}<use href="#s"/>`));
+  assert.deepEqual(placed.unresolved, []);
+  near(placed.ink.bbox.minX, 9, 1e-9);
+  near(placed.ink.bbox.maxX, 15, 1e-9);
+  assert.equal(checkShape(placed, { target: 'sprite.svg' }).verdict, 'ok');
+
+  const both = analyzeSvg(svg(`${sprite(3, 3)}<use href="#s" x="2" y="2"/>`));
+  near(both.ink.bbox.minX, 5, 1e-9);
+  near(both.ink.bbox.maxX, 11, 1e-9);
+});
+
+// --- invalid fill-rule falls back to the inherited one ----------------------
+
+test('an invalid fill-rule keeps the rule it inherits', () => {
+  // `fill-rule` is inherited, so an unparsable value is a dropped declaration and
+  // the parent's `evenodd` still applies: 300, not 400.
+  const shape = analyzeSvg(
+    svg('<g fill-rule="evenodd"><path fill-rule="nonsense" d="M2 2 H22 V22 H2 Z M7 7 H17 V17 H7 Z"/></g>'),
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 300, 1e-9);
+  // `initial` is nonzero, which makes the hole vanish again.
+  const initial = analyzeSvg(
+    svg('<g fill-rule="evenodd"><path fill-rule="initial" d="M2 2 H22 V22 H2 Z M7 7 H17 V17 H7 Z"/></g>'),
+  );
+  near(initial.ink.area, 400, 1e-9);
+});
+
+// --- the root canvas has to be a positive number ---------------------------
+
+test('a negative or infinite root size is an invalid canvas, not a negative scale', () => {
+  // `width="-2"` is an invalid declaration: the browser drops it and renders at
+  // 100%. Dividing by it produced `unitScale = -0.0833`, flipping the sign of
+  // every reported pixel — a real `off` came back `ok` with `dx=+0.167px`.
+  for (const width of ['-2', '0', '1e999']) {
+    const shape = analyzeSvg(
+      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="${width}" height="24">`
+        + '<rect x="8" y="4" width="4" height="16"/></svg>',
+    );
+    assert.equal(shape.noInk, true, width);
+    assert.ok(
+      shape.unresolved.some((id) => id === 'zero-canvas' || id === 'invalid-canvas'),
+      `${width}: ${JSON.stringify(shape.unresolved)}`,
+    );
+  }
+});
+
+// --- clip-path reference syntax --------------------------------------------
+
+test('a quoted or upper-case clip url is still a clip url', () => {
+  // CSS function names are case-insensitive and `url()` takes an optional quoted
+  // string. Both spellings cropped in Chrome and both were refused here.
+  // The attribute itself is written with the other quote so the markup stays valid.
+  for (const attr of ["clip-path=\"url('#c')\"", "clip-path='url(\"#c\")'", 'clip-path="URL(#c)"']) {
+    const shape = analyzeSvg(
+      svg(`<defs><clipPath id="c"><rect x="4" y="4" width="16" height="16"/></clipPath></defs>`
+        + `<g ${attr}><rect x="4" y="4" width="16" height="16"/></g>`),
+    );
+    assert.deepEqual(shape.unresolved, [], attr);
+    near(shape.ink.area, 256, 1e-9);
+  }
+});
+
+test('a stray moveto in a clipped group does not claim to be cut', () => {
+  // The clip check measured every flattened point, including a `M0 0` that paints
+  // nothing, so the whole file came back `clip-path-cuts-ink` for ink the render
+  // draws in full.
+  const shape = analyzeSvg(
+    svg('<defs><clipPath id="c"><rect x="4" y="4" width="16" height="16"/></clipPath></defs>'
+      + '<g clip-path="url(#c)"><path d="M0 0 M4 4 H20 V20 H4 Z"/></g>'),
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 256, 1e-9);
 });

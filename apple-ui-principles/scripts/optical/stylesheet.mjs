@@ -24,6 +24,10 @@ const PAINT = new Set([
   'display',
   'visibility',
   'opacity',
+  // `fill="currentColor"` resolves to `color`, and a sheet is the usual place to
+  // set it. Without this, `<style>g{color:transparent}</style>` left the paint
+  // looking opaque and a blank canvas came back `ok`.
+  'color',
   'clip-path',
   // These do not have an attribute-only life: a class is the usual way to hang
   // a mask, a filter or a marker on a shape, and dropping the declaration here
