@@ -170,7 +170,7 @@ move together. If the number is inside tolerance, leave the shape alone.
 
 `value` is the delta **added to the viewBox origin** (moving the origin by `d` moves the artwork by `−d`), and `viewBox` is the resulting attribute. Prefer `viewBox` — pasting it cannot flip a sign.
 
-All reported offsets are in rendered px, not viewBox units. `meta.unitScale` says how they were derived: a root `width="48"` on a 24-unit viewBox yields `2`, and the evidence string appends `[user units ×2 = px]`. Without absolute `width`/`height` the icon convention (1 unit = 1px) applies.
+All reported offsets are in rendered px, not viewBox units. `meta.unitScale` says how they were derived: a root `width="48"` on a 24-unit viewBox yields `2`, and the evidence string appends `[user units ×2 = px]`. With no absolute `width`/`height` the icon is assumed to render at **24px on its short side**, so a 480-unit grid scales by `0.05`. That keeps the verdict a property of the drawing rather than of the canvas size — a 512-unit Font Awesome glyph and a 24-unit icon with the same 8% imbalance now agree.
 
 ---
 

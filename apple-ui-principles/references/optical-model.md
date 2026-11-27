@@ -125,10 +125,20 @@ a wrong answer with no warning.
 Measurements are taken in viewBox user units, but every reported `measured`,
 `basis` and suggestion is in **rendered px**. The conversion comes from the root
 element's `width`/`height`: `width="48"` on a 24-unit viewBox means each user
-unit is 2px, so a 10-unit offset is reported as `20px`. Without absolute
-`width`/`height` the icon convention (1 unit = 1px) applies; `meta.unitScale`,
-`meta.unitScaleX`/`unitScaleY` and `meta.unitSource` record which one was used,
-and the evidence string appends `[user units ×N = px]` whenever they differ.
+unit is 2px, so a 10-unit offset is reported as `20px`.
+
+Without absolute `width`/`height` the icon is assumed to be **rendered at 24px
+on its short side**, so a 480-unit canvas gets a scale of `0.05`. This is not
+cosmetic: the tolerance curve clamps at 1.5px, so measuring a 480-unit glyph in
+its own units applies a 0.3% threshold while a 24-unit glyph gets 2%. The same
+optical error would be `off` on one canvas and `nudge` on the other, which makes
+the verdict a property of the grid instead of the drawing. Normalising to a
+nominal 24px removes that dependence — a 480-unit Font Awesome glyph and a
+24-unit hand-drawn icon with the same 8% imbalance now reach the same verdict.
+
+`meta.unitScale`, `meta.unitScaleX`/`unitScaleY` and `meta.unitSource` record
+which conversion was used, and the evidence string appends
+`[user units ×N = px]` (or `= 24px nominal`) whenever it is not 1.
 
 `preserveAspectRatio="none"` stretches the axes independently, so there is no
 single scale: x and y are converted separately, `meta.unitScale` is `null`, and

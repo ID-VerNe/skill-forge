@@ -531,14 +531,22 @@ function uniformScale(matrix) {
  * `width="100"` with a 24-unit viewBox means every measurement is in 24ths, not
  * pixels — reporting that as `px` inflates or deflates every verdict. The scale
  * is only claimed when *both* dimensions are absolute; a lone `width="48"` or
- * `height="100%"` leaves the rendered box unknowable, so the icon convention
- * (1 unit = 1px) applies and `source` says so.
+ * `height="100%"` leaves the rendered box unknowable.
+ *
+ * When the rendered size is not in the file, the icon is assumed to be **rendered
+ * at the nominal 24px** (short side). That keeps verdicts comparable across
+ * grids: a 2% imbalance on a 24-unit icon and on a 512-unit Font Awesome glyph
+ * are the same optical error, and both should read the same way. Assuming
+ * "1 unit = 1px" instead made every 512-unit glyph look catastrophically
+ * off-centre, because the tolerance clamp then bit at 0.3% of the canvas.
  *
  * `preserveAspectRatio="none"` stretches the axes independently, so there is no
  * single number: x and y are reported separately and `unitScale` is `null`.
  */
 function rootUnitScale(attrs, viewBox) {
-  const assumed = { x: 1, y: 1, uniform: 1, source: 'assumed' };
+  const nominal = 24;
+  const reference = viewBox.w > 0 && viewBox.h > 0 ? nominal / Math.min(viewBox.w, viewBox.h) : 1;
+  const assumed = { x: reference, y: reference, uniform: reference, source: 'assumed' };
   if (attrs.width === undefined && attrs.height === undefined) return assumed;
   const w = absolutePx(attrs.width);
   const h = absolutePx(attrs.height);
@@ -741,11 +749,12 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
   const sx = shape.unitScaleX ?? 1;
   const sy = shape.unitScaleY ?? 1;
   const basis = Math.min((viewBox.w || 24) * sx, (viewBox.h || 24) * sy);
+  // The evidence is written in viewBox units; say how they became px.
   const scaleNote =
     sx === 1 && sy === 1
       ? ''
       : sx === sy
-        ? ` [user units ×${round(sx, 4)} = px]`
+        ? ` [user units ×${round(sx, 4)} = ${shape.unitSource === 'assumed' ? '24px nominal' : 'px'}]`
         : ` [user units ×${round(sx, 4)} = px horizontally, ×${round(sy, 4)} vertically]`;
 
   const dInkX = inkCenter.x - vbCenter.x;

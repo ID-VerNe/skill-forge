@@ -918,3 +918,18 @@ test('variant stripping survives nested brackets', () => {
     assert.deepEqual(classInfo(`"${token}"`).stems, [stem], token);
   }
 });
+
+test('verdicts are comparable across icon grids', () => {
+  // Same 8% imbalance drawn on a 24-unit and a 480-unit canvas must read the same.
+  const small = analyzeSvg(svg('<rect x="0" y="0" width="20" height="20"/>'));
+  const large = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480">' +
+      '<rect x="0" y="0" width="400" height="400"/></svg>',
+  );
+  near(small.unitScale, 1, 1e-9);
+  near(large.unitScale, 0.05, 1e-9);
+  const a = checkShape(small, { target: 's.svg' }).findings.find((f) => f.id === 'geometry/ink-bbox');
+  const b = checkShape(large, { target: 'l.svg' }).findings.find((f) => f.id === 'geometry/ink-bbox');
+  assert.equal(a.verdict, b.verdict, `${a.verdict} vs ${b.verdict}`);
+  near(a.relative.dx_pct, b.relative.dx_pct, 1e-9);
+});
