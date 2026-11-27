@@ -154,19 +154,9 @@ function walk(src, from, to, context, blocks) {
 
     if (prelude) {
       const { decls, order, nested } = splitBlock(inner);
-      blocks.push({ selector: prelude.replace(/\s+/g, ' '), decls, order, context });
-      for (const child of nested) {
-        // CSS nesting: `& .child { ... }` inherits the parent context
-        const merged = child.selector.includes('&')
-          ? child.selector.replace(/&/g, prelude)
-          : `${prelude} ${child.selector}`;
-        blocks.push({
-          selector: merged.replace(/\s+/g, ' '),
-          decls: child.decls,
-          order: child.order,
-          context,
-        });
-      }
+      const own = prelude.replace(/\s+/g, ' ');
+      blocks.push({ selector: own, decls, order, context });
+      for (const child of nested) emitNested(child, own, context, blocks);
     }
 
     i = close + 1;
@@ -174,8 +164,37 @@ function walk(src, from, to, context, blocks) {
   return i;
 }
 
-function findMatchingBrace(src, openIndex, limit) {
-  let depth = 0;
+/**
+ * Flatten one nested entry into blocks.
+ *
+ * A nested selector (`& .child`) names a *different* element, so it keeps its
+ * own selector. A nested at-rule names the *same* element under a condition, so
+ * it inherits the parent selector and only extends the context — `@media` inside
+ * `.btn` must not become a selector called `.btn @media …`.
+ */
+function emitNested(entry, parentSelector, context, blocks) {
+  if (entry.selector.startsWith('@')) {
+    const innerContext = [...context, entry.selector];
+    blocks.push({
+      selector: parentSelector,
+      decls: entry.decls,
+      order: entry.order,
+      context: innerContext,
+    });
+    for (const child of entry.nested || []) emitNested(child, parentSelector, innerContext, blocks);
+    return;
+  }
+
+  const merged = (
+    entry.selector.includes('&')
+      ? entry.selector.replace(/&/g, parentSelector)
+      : `${parentSelector} ${entry.selector}`
+  ).replace(/\s+/g, ' ');
+  blocks.push({ selector: merged, decls: entry.decls, order: entry.order, context });
+  for (const child of entry.nested || []) emitNested(child, merged, context, blocks);
+}
+
+function findMatchingBrace(src, openIndex, limit) {  let depth = 0;
   let i = openIndex;
   while (i < limit) {
     const ch = src[i];
@@ -233,13 +252,8 @@ function splitBlock(body) {
         }
       }
       if (selector) {
-        const { decls: childDecls, order: childOrder, nested: childNested } = splitBlock(
-          body.slice(i + 1, close),
-        );
-        nested.push({ selector, decls: childDecls, order: childOrder });
-        for (const grand of childNested) {
-          nested.push({ selector: grand.selector, decls: grand.decls, order: grand.order });
-        }
+        const sub = splitBlock(body.slice(i + 1, close));
+        nested.push({ selector, decls: sub.decls, order: sub.order, nested: sub.nested });
       }
       i = close + 1;
       cursor = i;

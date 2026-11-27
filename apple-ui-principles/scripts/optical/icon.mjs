@@ -188,6 +188,8 @@ function resolveClipRect(raw, ctx, matrix) {
   if (child.tag !== 'rect') return null;
   const a = effectiveAttrs(child);
   if (a.transform) return null;
+  // A clip rect that is itself clipped is not the shape it claims to be.
+  if (a['clip-path'] && !/^none$/i.test(a['clip-path'].trim())) return null;
   // A rounded clip removes ink at the corners, so it is not a no-op rectangle.
   if ((a.rx && Number.parseFloat(a.rx) !== 0) || (a.ry && Number.parseFloat(a.ry) !== 0)) return null;
 
@@ -217,7 +219,9 @@ function bboxOfShapes(shapes, steps) {
     if (points.length === 0) continue;
     const localBox = bboxOfPoints(points);
     let pad = 0;
-    if (shape.stroked) pad = (shape.strokeWidth * uniformScale(shape.matrix)) / 2;
+    // Under a non-uniform transform the stroke is elliptical; padding by the
+    // larger axis keeps the containment test conservative.
+    if (shape.stroked) pad = (shape.strokeWidth * maxScale(shape.matrix)) / 2;
     box = bboxUnion(box, bboxExpand(localBox, pad));
   }
   return box;
@@ -261,11 +265,14 @@ function collect(node, inherited, out, ctx) {
   // that would actually cut the drawing stays unmeasurable.
   const clipRaw = attrs['clip-path'];
   if (clipRaw && !/^none$/i.test(clipRaw.trim())) {
-    // A shape clipping itself needs the intersection, not a container walk.
+    // A shape clipping itself needs the intersection, not a container walk; and
+    // a structural element (`<use>`, `<svg>`) carries its content outside
+    // `children`, so walking those would silently drop the artwork.
+    const structural = node.tag === 'use' || node.tag === 'svg';
     const matrix = attrs.transform
       ? multiplyMatrix(inherited.matrix, parseTransform(attrs.transform))
       : inherited.matrix;
-    const rect = SHAPES.has(node.tag) ? null : resolveClipRect(clipRaw, ctx, matrix);
+    const rect = SHAPES.has(node.tag) || structural ? null : resolveClipRect(clipRaw, ctx, matrix);
     if (!rect) {
       ctx.unresolved.add('clip-path');
       return out;
@@ -471,6 +478,10 @@ function bboxExpand(box, by) {
     maxX: box.maxX + by,
     maxY: box.maxY + by,
   };
+}
+
+function maxScale(matrix) {
+  return Math.max(Math.hypot(matrix[0], matrix[1]), Math.hypot(matrix[2], matrix[3])) || 1;
 }
 
 function uniformScale(matrix) {

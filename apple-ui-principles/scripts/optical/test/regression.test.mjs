@@ -666,3 +666,54 @@ test('a shape that clips itself is not walked as a container', () => {
   );
   assert.ok(shape.unresolved.includes('clip-path'), JSON.stringify(shape.unresolved));
 });
+
+test('an at-rule nested inside a rule belongs to the parent selector', () => {
+  const css = '.btn{display:flex;@media (min-width:600px){text-box:trim-both}}';
+  const report = checkCss(css, { target: 'nestcss.css' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+  assert.equal(f.verdict, 'off');
+  // The evidence must name the real selector, not a phantom ".btn @media …".
+  assert.match(f.evidence, /^\.btn:/);
+  assert.match(f.evidence, /min-width/);
+});
+
+test('declarations before and after a nested rule keep their source order', () => {
+  const before = checkCss('.a{text-box:trim-both;@media (x){color:red}}', { target: 'b.css' });
+  assert.equal(before.findings.length, 1, JSON.stringify(before.findings, null, 2));
+
+  // Declarations *after* the nested block must still be seen, and must win.
+  const after = checkCss('.b{@media (x){color:red}text-box-trim:none}', { target: 'a.css' });
+  assert.equal(after.findings.length, 0, JSON.stringify(after.findings, null, 2));
+});
+
+test('a nested selector is still a different element', () => {
+  const css = '.btn{display:flex;@media (x){& span{text-box:trim-both}}}';
+  const report = checkCss(css, { target: 'child.css' });
+  // The span is not the flex container; `.btn`'s display must not be borrowed.
+  assert.equal(
+    report.findings.filter((f) => f.evidence.startsWith('.btn:')).length,
+    0,
+    JSON.stringify(report.findings, null, 2),
+  );
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+  // No display for `.btn span` itself -> the container type is unknown, not off.
+  assert.equal(f.verdict, 'unknown');
+  assert.match(f.evidence, /\.btn span/);
+});
+
+test('a clip on a structural element is refused, not silently dropped', () => {
+  const clip =
+    '<defs><clipPath id="c"><rect x="0" y="0" width="24" height="24"/></clipPath></defs>';
+  const cases = [
+    `${clip}<symbol id="s"><rect x="4" y="4" width="16" height="16"/></symbol><use href="#s" clip-path="url(#c)"/>`,
+    `${clip}<svg clip-path="url(#c)" x="0" y="0" width="12" height="12" viewBox="0 0 12 12"><rect x="0" y="0" width="12" height="12"/></svg>`,
+  ];
+  for (const body of cases) {
+    const shape = analyzeSvg(svg(body));
+    // Walking `children` of a <use>/<svg> would produce no ink and no complaint.
+    assert.ok(shape.unresolved.includes('clip-path'), JSON.stringify(shape.unresolved));
+    assert.equal(shape.noInk, true);
+  }
+});
