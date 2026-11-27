@@ -1391,3 +1391,162 @@ test('a partially parsed path is refused, not measured in halves', () => {
     assert.equal(checkShape(shape, { target: 'p.svg' }).verdict, 'unknown', d);
   }
 });
+
+// --- round 8: winding, self-crossing, and paint that is not paint -----------
+
+test('a hole inside a hole inside an island paints once, not twice', () => {
+  // Nonzero winding accumulates along the ancestor chain: 0 → +1 → 0 → +1.
+  // A rule that only compares against the immediate parent reads the third ring
+  // as a hole and reports 176 instead of 240.
+  const shape = analyzeSvg(
+    svg('<path fill-rule="nonzero" d="M0 0H24V24H0Z M2 2V22H22V2Z M8 8H16V16H8Z"/>'),
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 576 - 400 + 64, 1e-6);
+  // All three rings are concentric, so the centroid cannot move.
+  near(shape.ink.centroid.cx, 12, 1e-6);
+  near(shape.ink.centroid.cy, 12, 1e-6);
+});
+
+test('same-winding nesting never subtracts under nonzero', () => {
+  // The mirror image of the test above: three rings wound the same way are one
+  // solid region, because the winding goes 1 → 2 → 3 and never returns to zero.
+  const shape = analyzeSvg(svg('<path fill-rule="nonzero" d="M0 0H24V24H0Z M2 2H22V22H2Z M8 8H16V16H8Z"/>'));
+  near(shape.ink.area, 576, 1e-6);
+});
+
+test('a subpath that crosses itself is refused, not measured as zero', () => {
+  // Shoelace gives 0 for a bowtie while it paints two triangles: dropping it as
+  // "no area" loses ink with no warning, and the rest of the canvas still looks
+  // fine.
+  const bowtie = analyzeSvg(svg('<path d="M2 2 L22 22 L22 2 L2 22 Z"/>'));
+  assert.match(bowtie.unresolved.join(), /self-intersecting/);
+  const report = checkShape(bowtie, { target: 'bowtie.svg' });
+  assert.equal(report.verdict, 'unknown');
+
+  // Even-odd has the same blind spot and must refuse the same outline.
+  const evenodd = analyzeSvg(svg('<path fill-rule="evenodd" d="M2 2 L22 22 L22 2 L2 22 Z"/>'));
+  assert.match(evenodd.unresolved.join(), /self-intersecting/);
+});
+
+test('a negligible self-crossing does not disqualify real artwork', () => {
+  // Exporters emit sharp corners as a 0.04-unit doubling-back. Its area is one
+  // part in 10^8 of the drawing, so refusing it would throw away the file.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 346 346">' +
+      '<path d="M20 20h300v300h-300zm6 6h288v288h-288z"/>' +
+      '</svg>',
+  );
+  assert.deepEqual(shape.unresolved, []);
+});
+
+test('fill="transparent" is a declaration of no ink', () => {
+  for (const paint of ['transparent', '#00000000', 'rgba(0,0,0,0)', 'hsl(0 0% 0% / 0%)']) {
+    const shape = analyzeSvg(svg(`<rect width="24" height="24" fill="${paint}"/>`));
+    assert.equal(shape.noInk, true, paint);
+  }
+  // The same on the stroke side: an invisible stroke is not a hairline.
+  const stroked = analyzeSvg(svg('<rect width="24" height="24" fill="none" stroke="transparent"/>'));
+  assert.equal(stroked.noInk, true);
+});
+
+test('a paint that resolves at runtime is refused, not guessed', () => {
+  for (const paint of ['var(--icon-fill)', 'env(safe-area-inset-top, #000)']) {
+    const report = checkShape(analyzeSvg(svg(`<rect width="24" height="24" fill="${paint}"/>`)), {
+      target: 'var.svg',
+    });
+    assert.equal(report.verdict, 'unknown', paint);
+  }
+  // `currentColor` does paint; only its hue is unknown, and hue never moves ink.
+  const current = analyzeSvg(svg('<rect width="24" height="24" fill="currentColor"/>'));
+  assert.deepEqual(current.unresolved, []);
+});
+
+test('!important attaches to the declaration that carries it, not to the property', () => {
+  // `.bg` marks only the first `fill` important. Reading the flag per property
+  // let the second, normal declaration inherit it and win — restoring the
+  // background the sheet had switched off.
+  const report = checkShape(
+    analyzeSvg(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+        '<style>.bg{fill:none!important;fill:#000}</style>' +
+        '<rect class="bg" width="24" height="24"/></svg>',
+    ),
+    { target: 'imp.svg' },
+  );
+  assert.equal(report.verdict, 'unknown');
+  assert.match(report.findings.map((f) => f.evidence).join(' '), /no renderable ink/);
+});
+
+test('@import makes a stylesheet unreadable rather than empty', () => {
+  const report = checkShape(
+    analyzeSvg(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+        '<style>@import url(theme.css);</style>' +
+        '<rect width="24" height="24"/></svg>',
+    ),
+    { target: 'import.svg' },
+  );
+  assert.equal(report.verdict, 'unknown');
+  assert.match(report.findings.map((f) => f.evidence).join(' '), /stylesheet-unparsed/);
+});
+
+test('a CSS animation is not measured from its first frame', () => {
+  const animated = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>.spin{animation:turn 1s linear infinite}@keyframes turn{to{transform:rotate(360deg)}}</style>' +
+      '<rect class="spin" x="2" y="0" width="20" height="24"/></svg>',
+  );
+  assert.match(animated.unresolved.join(), /css-animation/);
+  assert.equal(checkShape(animated, { target: 'spin.svg' }).verdict, 'unknown');
+
+  // `animation: none` leaves the element at rest.
+  const still = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>.a{animation:none}</style><rect class="a" x="2" y="0" width="20" height="24"/></svg>',
+  );
+  assert.deepEqual(still.unresolved, []);
+});
+
+test('a mask on a symbol is reported, not swallowed by the symbol', () => {
+  // `<symbol>` is non-rendering on its own, so `collect` never visits it — but
+  // the <use> that instantiates it makes its mask live.
+  for (const attr of ['mask="url(#m)"', 'filter="url(#f)"', 'clip-path="url(#c)"']) {
+    const shape = analyzeSvg(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+        `<symbol id="s" ${attr}><rect width="24" height="24"/></symbol>` +
+        '<use href="#s"/></svg>',
+    );
+    assert.equal(checkShape(shape, { target: 'sym.svg' }).verdict, 'unknown', attr);
+  }
+});
+
+test('a rotated viewport is measured across its real corners', () => {
+  // The two diagonal corners of a rotated rect lie on the same diagonal, so
+  // transforming only those collapses the viewport to a line and every drawing
+  // inside it reads as outside.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<g transform="rotate(45 12 12)">' +
+      '<symbol id="s" viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8"/></symbol>' +
+      '<use href="#s" x="2" y="2" width="20" height="20"/></g></svg>',
+  );
+  assert.deepEqual(shape.unresolved, []);
+});
+
+test('a zero-sized canvas renders nothing instead of a centred dot', () => {
+  for (const side of ['width="0"', 'height="0"']) {
+    const shape = analyzeSvg(
+      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" ${side}>` +
+        '<rect width="24" height="24"/></svg>',
+    );
+    assert.equal(shape.noInk, true, side);
+    assert.match(shape.unresolved.join(), /zero-canvas/, side);
+  }
+});
+
+test('a comma-separated transform list is parsed, not rejected', () => {
+  const shape = analyzeSvg(svg('<rect transform="translate(1px, 1px), scale(1)" x="2" y="0" width="20" height="24"/>'));
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.bbox.minX, 3);
+});

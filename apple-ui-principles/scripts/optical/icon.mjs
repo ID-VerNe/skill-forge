@@ -24,7 +24,7 @@ import {
   IDENTITY,
 } from './geom.mjs';
 import { buildReport, tolFor } from './report.mjs';
-import { cascade, parseStyle } from './stylesheet.mjs';
+import { cascade, isInvisiblePaint, isRuntimePaint, parseStyle } from './stylesheet.mjs';
 
 const round = (n, d = 3) => Math.round(n * 10 ** d) / 10 ** d;
 
@@ -89,6 +89,16 @@ const GEOMETRY_ANIMATION = new Set([
   'stroke-width',
   'stroke-dasharray',
   'stroke-dashoffset',
+  'stroke-linecap',
+  'stroke-linejoin',
+  // `fill`, `stroke`, `fill-rule` and the opacity properties belong here too,
+  // but only some of their values change the ink — see `movesInk` below.
+  'fill',
+  'stroke',
+  'fill-rule',
+  'fill-opacity',
+  'stroke-opacity',
+  'color',
   'visibility',
   'display',
   'clip-path',
@@ -97,6 +107,24 @@ const GEOMETRY_ANIMATION = new Set([
   'offset',
   'path',
 ]);
+
+/**
+ * Does animating this attribute change what the ink *is*?
+ *
+ * The set above says "this attribute matters"; not every value does. A colour
+ * cycle from `#000` to `#f00` repaints without moving or resizing anything, so
+ * the geometry still stands and refusing it would make the checker useless on
+ * the most common SVG animation there is. `none` / `transparent` / zero alpha
+ * switch the ink off, and `evenodd` turns holes into solid — those do.
+ */
+function movesInk(target, values) {
+  if (target === 'fill' || target === 'stroke') return /\bnone\b|\btransparent\b/.test(values);
+  if (target === 'fill-rule') return /\bevenodd\b/.test(values);
+  if (target === 'opacity' || target === 'fill-opacity' || target === 'stroke-opacity') {
+    return /(^|[\s;,])0(\.0*)?($|[\s;,])/.test(values);
+  }
+  return GEOMETRY_ANIMATION.has(target);
+}
 
 /** Minimal XML scanner: enough for icon markup, strict enough to fail loudly. */
 function parseXml(text) {
@@ -278,19 +306,11 @@ function noteAnimation(root, ctx) {
       const attrs = node.attrs || {};
       const target = String(attrs.attributeName || '').trim().toLowerCase();
       const values = `${attrs.from || ''} ${attrs.to || ''} ${attrs.values || ''}`.toLowerCase();
-      const movesInk =
-        tag !== 'animate' && tag !== 'set'
-          ? true
-          : target === ''
-            ? true
-            : GEOMETRY_ANIMATION.has(target)
-              ? true
-              : target === 'fill' || target === 'stroke'
-                ? /\bnone\b|\btransparent\b/.test(values)
-                : target === 'opacity' || target === 'fill-opacity'
-                  ? /\b0\b|\b0\.0*\b/.test(values)
-                  : false;
-      if (movesInk) {
+      // `animateTransform` / `animateMotion` move the element whatever they are
+      // pointed at. `animate` / `set` are only as dangerous as their target.
+      const matters =
+        tag !== 'animate' && tag !== 'set' ? true : target === '' ? true : movesInk(target, values);
+      if (matters) {
         ctx.unresolved.add('animated-ink');
         return;
       }
@@ -427,9 +447,12 @@ function resolveClipRect(raw, ctx, matrix) {
 function bboxOfShapes(shapes, steps) {
   let box = null;
   for (const shape of shapes) {
-    const points = flattenPath(shape.d, steps)
-      .flat()
-      .map(([x, y]) => applyMatrix(shape.matrix, x, y));
+    const flat = flattenPath(shape.d, steps);
+    // A partially parsed path contributes only the fragments svgpath could read,
+    // so the box it produces is smaller than the ink it paints. Measuring the
+    // fragments would call ink "inside the viewport" that plainly is not.
+    if (flat.parseError) return null;
+    const points = flat.flat().map(([x, y]) => applyMatrix(shape.matrix, x, y));
     if (points.length === 0) continue;
     const localBox = bboxOfPoints(points);
     let pad = 0;
@@ -582,6 +605,14 @@ function collect(node, inherited, out, ctx) {
         // A symbol carries presentation attributes of its own — sprite sets put
         // `fill`, `stroke` and `fill-rule` there precisely so the children can
         // omit them. Dropping them changed the area of every referenced path.
+        //
+        // It also carries `mask` / `filter` / `clip-path`, which `collect` can
+        // never report because `<symbol>` is non-rendering on its own. Re-check
+        // them here, at the one point where a symbol becomes visible.
+        for (const attr of UNRESOLVABLE) {
+          const value = symbolAttrs[attr];
+          if (value && !/^none$/i.test(String(value).trim())) ctx.unresolved.add(attr);
+        }
         const symbolLocal = inheritedFor(symbolAttrs, local, visible, useMatrix, ctx);
         let matrix = matrixFrom(symbolAttrs, useMatrix, ctx);
         if (symbolAttrs.viewBox !== undefined) {
@@ -598,9 +629,11 @@ function collect(node, inherited, out, ctx) {
         symbolLocal.matrix = matrix;
         symbolLocal.viewport = { w: vpW, h: vpH };
         // A symbol clips to the viewport the <use> gives it, exactly like a
-        // nested <svg>.
-        withViewport({ x: 0, y: 0, w: vpW, h: vpH }, useMatrix, ctx, sink, (clipped) => {
-          for (const child of target.children || []) collect(child, symbolLocal, clipped, inner);
+        // nested <svg>. Its own clip-path applies on top of that.
+        withClip(symbolAttrs, [matrix, useMatrix], ctx, sink, (clipped) => {
+          withViewport({ x: 0, y: 0, w: vpW, h: vpH }, useMatrix, ctx, clipped, (viewport) => {
+            for (const child of target.children || []) collect(child, symbolLocal, viewport, inner);
+          });
         });
         return;
       }
@@ -608,7 +641,13 @@ function collect(node, inherited, out, ctx) {
         // Let the nested-viewport branch apply the viewBox exactly once. The
         // <use> width/height override the target's own, and x/y are already in
         // `useMatrix`, so the clone is placed at the origin.
-        const overrides = { ...effectiveAttrs(target), x: '0', y: '0' };
+        //
+        // `style` is dropped: it has already been cascaded into these
+        // attributes, and keeping it lets `effectiveAttrs` run the declarations
+        // a second time against the flattened result — which resurrects a value
+        // an `!important` stylesheet rule had just overruled.
+        const { style: _style, ...flat } = effectiveAttrs(target);
+        const overrides = { ...flat, x: '0', y: '0' };
         if (attrs.width !== undefined) overrides.width = attrs.width;
         if (attrs.height !== undefined) overrides.height = attrs.height;
         // The clone must not carry the target's cached cascade: its attributes
@@ -645,13 +684,27 @@ function collect(node, inherited, out, ctx) {
         ctx.unresolved.add('unparsed-shape');
       } else if (shape.d) {
         const strokeWidth = strokeWidthOf(attrs, inherited, ctx);
+        const fillPaint = attrs.fill ?? inherited.fill;
+        const strokePaint = attrs.stroke ?? inherited.stroke;
+        // `var()` / `env()` name a value defined outside this file. Inheriting
+        // the fallback colour would invent ink; ignoring the declaration would
+        // delete it. Neither is a measurement, so refuse the drawing.
+        if (isRuntimePaint(fillPaint) || isRuntimePaint(strokePaint)) {
+          ctx.unresolved.add('runtime-paint');
+        }
         out.push({
           d: shape.d,
           matrix: own,
-          filled: !keywordIs(attrs.fill ?? inherited.fill, 'none') && fillOpacityOf(attrs, inherited) !== 0,
+          // `transparent` and zero-alpha colours are declarations of no paint:
+          // the shape is there and covers nothing.
+          filled:
+            !keywordIs(fillPaint, 'none') &&
+            !isInvisiblePaint(fillPaint) &&
+            fillOpacityOf(attrs, inherited) !== 0,
           stroked:
-            (attrs.stroke ?? inherited.stroke) !== undefined &&
-            !keywordIs(attrs.stroke ?? inherited.stroke, 'none'),
+            strokePaint !== undefined &&
+            !keywordIs(strokePaint, 'none') &&
+            !isInvisiblePaint(strokePaint),
           strokeWidth: Number.isFinite(strokeWidth) ? strokeWidth : 1,
           // Even `fill-rule` is inherited, and an inherited `evenodd` changes the
           // area of every child path.
@@ -687,14 +740,15 @@ function withViewport(rect, outerMatrix, ctx, out, emit) {
   if (captured.length === 0) return;
   const box = bboxOfShapes(captured, ctx.steps);
   if (!box) return;
-  const a = applyMatrix(outerMatrix, rect.x, rect.y);
-  const b = applyMatrix(outerMatrix, rect.x + rect.w, rect.y + rect.h);
-  const viewRect = {
-    minX: Math.min(a[0], b[0]),
-    minY: Math.min(a[1], b[1]),
-    maxX: Math.max(a[0], b[0]),
-    maxY: Math.max(a[1], b[1]),
-  };
+  // All four corners: under a rotation the two diagonal ones would both land on
+  // the same diagonal of the rotated rect and collapse the viewport to a line,
+  // turning every drawing inside it into spurious `unknown`.
+  const viewRect = bboxOfPoints([
+    applyMatrix(outerMatrix, rect.x, rect.y),
+    applyMatrix(outerMatrix, rect.x + rect.w, rect.y),
+    applyMatrix(outerMatrix, rect.x, rect.y + rect.h),
+    applyMatrix(outerMatrix, rect.x + rect.w, rect.y + rect.h),
+  ]);
   if (!rectContains(viewRect, box)) {
     ctx.unresolved.add('ink-outside-viewport');
     return;
@@ -788,8 +842,17 @@ function uniformScale(matrix) {
  * `preserveAspectRatio="none"` stretches the axes independently, so there is no
  * single number: x and y are reported separately and `unitScale` is `null`.
  */
-function rootUnitScale(attrs, viewBox) {
-  const nominal = 24;
+/** A root `width`/`height` that switches rendering off, if one is declared. */
+function zeroSided(attrs) {
+  for (const name of ['width', 'height']) {
+    if (attrs[name] === undefined) continue;
+    const value = absolutePx(attrs[name]);
+    if (value === 0) return 'zero-canvas';
+  }
+  return null;
+}
+
+function rootUnitScale(attrs, viewBox) {  const nominal = 24;
   const par = String(attrs.preserveAspectRatio || '').trim();
   const stretches = par.toLowerCase().startsWith('none');
   // `preserveAspectRatio="none"` has no single scale, and that is true of the
@@ -806,6 +869,9 @@ function rootUnitScale(attrs, viewBox) {
   if (attrs.width === undefined && attrs.height === undefined) return assumed;
   const w = absolutePx(attrs.width);
   const h = absolutePx(attrs.height);
+  // A single side is not enough: the missing one defaults to `100%` of the host,
+  // which is not in the file. Falling back to the nominal 24px is the same guess
+  // made when neither is present, and it is labelled `assumed`.
   if (w === null || h === null) return assumed;
   if (!(viewBox.w > 0) || !(viewBox.h > 0)) return assumed;
 
@@ -831,14 +897,20 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
   indexIds(svg, ids);
 
   // An unparseable viewBox means the element does not render, so there is no
-  // canvas to measure against and no honest verdict to give.
-  if (!viewBox) {
+  // canvas to measure against and no honest verdict to give. So does a zero
+  // width or height: SVG 1.1 §7.7 "a value of zero disables rendering of the
+  // element". Scaling by it would flatten every coordinate to the origin and
+  // report a perfectly centred dot.
+  const deadCanvas = !viewBox ? null : zeroSided(svg.attrs || {});
+  if (!viewBox || deadCanvas) {
     return {
-      viewBox: { x: 0, y: 0, w: 24, h: 24 },
+      viewBox: viewBox || { x: 0, y: 0, w: 24, h: 24 },
       ink: { bbox: null, area: 0, centroid: { cx: 0, cy: 0 } },
       strokeOnly: false,
       noInk: true,
-      unresolved: [svg.attrs && svg.attrs.viewBox !== undefined ? 'invalid-viewBox' : 'relative-canvas'],
+      unresolved: deadCanvas
+        ? [deadCanvas]
+        : [svg.attrs && svg.attrs.viewBox !== undefined ? 'invalid-viewBox' : 'relative-canvas'],
       unitScale: null,
       unitScaleX: null,
       unitScaleY: null,
@@ -902,10 +974,17 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
 
     if (shape.filled) {
       const net = shape.fillRule === 'evenodd' ? netShapeEvenOdd(subpaths) : netShape(subpaths);
-      if (net.overlapping) {
+      if (net.selfIntersecting) {
+        // A subpath crossing itself paints an area the shoelace formula cannot
+        // express. The outline is still real ink, so its box counts even though
+        // its area does not.
+        ctx.unresolved.add('self-intersecting');
+        bbox = bboxUnion(bbox, localBox);
+      } else if (net.overlapping) {
         // Partially overlapping outlines need a boolean XOR; refuse rather than
         // report a centroid that may sit outside the artwork.
         ctx.unresolved.add('overlapping-subpaths');
+        bbox = bboxUnion(bbox, localBox);
       } else if (net.area > 0) {
         filledArea += net.area;
         filledCx += net.cx * net.area;

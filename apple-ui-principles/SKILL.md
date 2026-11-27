@@ -131,6 +131,7 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | `icon.svg` | `standalone` | ink box vs viewBox, centroid vs ink box |
 | `icon.svg` with `<text>`/`<image>` | — | `unknown`: visible ink that is not geometry |
 | `icon.svg` painting through `<style>`/`class` | — | paint is resolved: sheet normal < inline normal < sheet `!important` < inline `!important` |
+| `icon.svg` with `fill="var(--x)"` or `@import` | — | `unknown`: the value lives outside the file. Replace it with a literal to measure the icon — a themed colour does not change the area, but `none` does, and the checker cannot tell which you have |
 | `icon.svg` with `%` geometry or a `%` `stroke-width` | — | `unknown`: relative to a viewport the checker cannot see |
 | `icon.svg` that animates, or draws outside its viewport | — | `unknown`: one frame is not the drawing, and the browser clips the rest |
 | `icons/` (dir) | `keyline` | fill-ratio outliers across the set (needs ≥3 icons of one family) |

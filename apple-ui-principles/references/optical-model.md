@@ -48,13 +48,18 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | a geometry length in `%`, `em`, `pt`… | `geometry/unresolved-graphics` (`unparsed-length`) — a percentage is relative to a viewport we cannot see, and `parseFloat("100%")` is `100` |
 | a `viewBox` attribute that is not four finite numbers with a positive size | `geometry/unresolved-graphics` (`invalid-viewBox`) — the element does not render, so there is no canvas to measure against |
 | no `viewBox` and a relative `width`/`height` | `geometry/unresolved-graphics` (`relative-canvas`) — the canvas is whatever the host gives it |
+| a root `width="0"` or `height="0"` | `geometry/unresolved-graphics` (`zero-canvas`) — SVG 1.1 §7.7: zero disables rendering |
 | `<style>` rules this pass cannot evaluate (combinators, pseudo-classes, `@media`, geometry properties) | `geometry/unresolved-graphics` (`stylesheet-selector`, `stylesheet-conditional`, `stylesheet-geometry`) |
+| `<style>` containing `@import` | `geometry/unresolved-graphics` (`stylesheet-unparsed`) — the imported sheet may paint any element, and it is not in the file |
+| a matching rule that declares `animation` / `animation-name` (other than `none`) | `geometry/unresolved-graphics` (`css-animation`) — the paint comes from a `@keyframes` block this pass does not evaluate |
+| `fill` / `stroke` set to `var()` or `env()` | `geometry/unresolved-graphics` (`runtime-paint`) — the value is defined outside the file |
 | `<?xml-stylesheet?>` pointing at an external sheet | `geometry/unresolved-graphics` (`external-stylesheet`) |
-| animation that moves ink (`animateTransform`, `animateMotion`, `animate` on a geometry attribute) | `geometry/unresolved-graphics` (`animated-ink`) — one frame is not the drawing |
+| animation that moves ink (`animateTransform`, `animateMotion`, `animate` on a geometry attribute, or on `fill`/`stroke` with a `none` endpoint) | `geometry/unresolved-graphics` (`animated-ink`) — one frame is not the drawing |
 | ink that leaves its viewport | `geometry/unresolved-graphics` (`ink-outside-viewport`) — the browser clips it |
 | groups nested more than 200 deep | `geometry/unresolved-graphics` (`nesting-too-deep`) |
 | two subpaths with the same outline | `geometry/unresolved-graphics` (`overlapping-subpaths`) — they cancel under even-odd and render once under nonzero, so the sum is wrong either way |
 | even-odd outlines that partially overlap | `geometry/unresolved-graphics` (`overlapping-subpaths`) |
+| a subpath that crosses itself over more than 0.1% of its own area | `geometry/unresolved-graphics` (`self-intersecting`) — the shoelace formula integrates the winding number, so a bowtie comes back zero while painting two triangles, and a pentagram comes back 40% too large. Smaller crossings are measured as if they were simple, and the error that introduces is bounded by the tolerance below |
 | a computed centroid outside its own ink box | `geometry/unresolved-graphics` (`centroid-outside-ink`) |
 | a file the CLI could not read or parse in a batch | `geometry/input-error` |
 | an empty directory passed to keyline mode | `geometry/keyline-empty` |
@@ -82,10 +87,16 @@ sheet normal  <  inline normal  <  sheet !important  <  inline !important
 ```
 
 then specificity (`#id` > `.class` > `tag`) breaking ties before source order.
-Importance belongs to a *declaration*, not to its block: in
-`.bg{fill:none !important; stroke:#000}` only `fill` is important, so a later
+Importance belongs to a *declaration*, not to its block or its property name:
+in `.bg{fill:none !important; stroke:#000}` only `fill` is important, so a later
 `#bg{stroke:none}` still wins on `stroke`. Marking the whole block important
 painted a background and turned a certain `off` into `ok`.
+
+The same rule decides duplicates *within* one block. `fill:none !important;
+fill:#000` resolves to `none`, because a normal declaration never displaces an
+earlier important one. Collecting important flags in a per-property set made the
+second declaration inherit the first one's flag, so both looked equally important
+and the later one won — again painting a background the sheet had switched off.
 
 The supported selector grammar is deliberately small: a compound of one tag,
 one `#id` and any number of `.classes`, in any order, plus `*`, and comma lists
@@ -93,6 +104,20 @@ of those. Anything else — descendant combinators, `:hover`, `[attr=…]`, `@me
 — that would change a paint property becomes `unresolved`. A rule we might have
 to apply and did not is exactly the case where a guess turns into a wrong
 verdict.
+
+Three things a stylesheet can say that are not measurements:
+
+- `@import` pulls in a sheet that is not in the file. Every rule after it is a
+  guess, so the whole `<style>` is refused rather than read as if the import
+  were not there.
+- `animation` / `animation-name` (anything but `none`) hands the paint to a
+  `@keyframes` block this pass does not evaluate. The static declarations still
+  look complete, which is how an animated icon used to come back `ok`.
+- `fill: var(--x)` and `env()` name a value defined elsewhere. `transparent`,
+  `#rrggbb00` and zero-alpha colours are the opposite case: they are declarations
+  of *no* ink, and measuring them as solid invents a shape the render does not
+  have. `currentColor` is fine — it paints, and only its hue is unknown, which
+  never moves a centroid.
 
 Two details that are easy to get wrong and were:
 
@@ -172,7 +197,11 @@ for an icon that is perfectly centred.
 argument, `2em`, `var(--x)`, or trailing junk after the last `)` — invalidates
 the *whole* list. Dropping the bad part would shift the rest left: `translate(10%,8)`
 would silently become `translate(8,0)`, and `translate(10,10) garbage` would keep
-the translation.
+the translation. Two notations are accepted because they are unambiguous rather
+than because they are convenient: commas *between* functions, as the CSS form
+writes them (`translate(1px,2px), rotate(45deg)`), and a `px` suffix on a
+length — on an SVG element `transform-origin` is the origin, so `1px` is one
+user unit and the number is the same either way.
 
 ### Units
 
@@ -216,35 +245,57 @@ with the same winding as their container, so anything that used the signed area
 here would flip both the area and the centroid.
 
 **nonzero** is decided per subpath, because winding only carries meaning
-*inside* another outline:
+*inside* another outline. The winding number just outside a subpath is the sum of
+its ancestors' directions; just inside it is that plus its own. A region is
+painted where the winding is non-zero, so a subpath contributes its area exactly
+when crossing its own boundary flips the paint on or off:
 
-| Position | Contribution |
-|---|---|
-| no container | `+|A|` — two disjoint regions each have winding 1, so an opposite direction is not a hole |
-| inside a container, opposite direction | `−|A|` — a hole |
-| inside a container, same direction | `0` — winding 2 still paints once |
+```
+outer  = Σ sign(ancestor)              // accumulating, not just the parent
+weight = fill(outer + sign(self)) − fill(outer)     // fill(w) = w ≠ 0 ? 1 : 0
+```
 
-Summing signed areas looks like it handles all three and handles two of them
-wrong. `M0 0 H10 V10 H0 Z M20 0 V10 H30 V0 Z` — two squares, the second drawn the
-other way — summed to **zero**, so the whole icon read as "no ink".
+| Nesting | Winding outside → inside | Contribution |
+|---|---|---|
+| no container | 0 → ±1 | `+|A|` — two disjoint regions each have winding 1, so an opposite direction is not a hole |
+| two levels, opposite | +1 → 0 | `−|A|` — a hole |
+| two levels, same | +1 → +2 | `0` — still paints, once |
+| three levels, +then−then+ | +1 → 0 → +1 | `+|A|` — an island inside a hole inside an island paints |
+| four levels, alternating | +1 → 0 → +1 → 0 | `−|A|` |
+
+The last two rows are why the winding has to accumulate. Comparing each subpath
+against its immediate parent gets two levels right and reports the island in row
+four as another hole — `576 − 400 + 64` came back `112`.
+
+Summing signed areas looks like it handles all of this and handles the disjoint
+case wrong: `M0 0 H10 V10 H0 Z M20 0 V10 H30 V0 Z` — two squares, the second
+drawn the other way — sums to **zero**, so the whole icon reads as "no ink".
 
 Containment is classified per vertex: a subpath is *inside* another only when
-none of its vertices fall outside, and vertices lying on the boundary are ignored
-so an L-shaped icon whose hole shares a corner still measures correctly. Two
-subpaths with the same bounding box and the same absolute area are treated as one
-outline drawn twice — under even-odd they cancel to nothing, under nonzero they
-render once, and in both cases summing them is wrong.
+none of its vertices fall outside and **at least one lands strictly inside**.
+Vertices on the boundary are otherwise ignored, so an L-shaped icon whose hole
+shares a corner still measures — but "no vertex outside" alone would also call a
+notch sitting in a concavity a hole. Two subpaths with the same bounding box and
+the same absolute area are treated as one outline drawn twice: under even-odd
+they cancel to nothing, under nonzero they render once, and in both cases summing
+them is wrong.
 
-**What is still approximate.** Three things, and they are why `off` on
+A subpath that crosses itself defeats the shoelace formula entirely — it
+integrates the winding number, not the painted area, so a bowtie returns `0`
+while painting two triangles and a pentagram returns 40% too much. The checker
+sums the bounding boxes of the crossing segments as an upper bound on the
+doubled region and refuses when that exceeds 0.1% of the subpath's own area.
+Below that the outline is measured as if it were simple; the error it introduces
+is smaller than the tolerance the verdict is judged against.
+
+**What is still approximate.** Two things, and they are why `off` on
 `geometry/centroid` deserves a second look at the artwork:
 
 1. Partially overlapping outlines. An even-odd XOR needs a boolean polygon
    operation, so the checker reports `overlapping-subpaths` rather than a
    centroid that may land outside the artwork. Under `nonzero` a genuine overlap
    is still summed, which over-counts area.
-2. Nesting deeper than two levels under `nonzero` (an island inside a hole inside
-   an island). The rule above is pairwise.
-3. The stroke model — joins, caps and dashes are approximated as a swept band.
+2. The stroke model — joins, caps and dashes are approximated as a swept band.
 
 None of these can move `geometry/ink-bbox`, which depends on extreme points only.
 
@@ -297,8 +348,8 @@ lengthen the opposite arm, thin the heavy side, or accept the offset as taste
 
 ## 3. `#2` area centroid
 
-Shoelace area and polygon centroid, summed over subpaths with the *signed* area
-so holes subtract:
+Shoelace area and polygon centroid per subpath, combined by the winding rule
+above so holes subtract:
 
 ```
 A  = ½ Σ (x_i·y_{i+1} − x_{i+1}·y_i)

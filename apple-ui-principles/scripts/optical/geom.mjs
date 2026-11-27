@@ -136,11 +136,96 @@ export function subpathCentroid(points) {
  * wound opposite to their container to subtract, which is what non-zero fill
  * relies on.
  */
+/**
+ * How much a single outline's self-crossings can disturb its shoelace area.
+ *
+ * A bowtie (`M0 0 L8 8 L8 0 L0 8 Z`) has a shoelace area of exactly zero while
+ * painting two triangles. Dropping it as "no area" loses ink silently, and any
+ * other shape on the canvas keeps the report looking fine. A pentagram is the
+ * opposite lie: shoelace counts the centre twice and reports 40% too much.
+ *
+ * The size of the lie is the area painted with winding ≥ 2, which the shoelace
+ * formula folds in once per extra wrap. That region sits next to the crossing
+ * point, so the bounding box of the two crossing segments bounds it. Returned
+ * as a sum over crossings — an upper bound, which is the safe direction: the
+ * caller refuses only when the disturbance could matter.
+ *
+ * Curves arrive here already flattened, so the polygon is implicitly closed and
+ * its last vertex often lands a few ULPs away from its first. That sliver would
+ * read as a genuine crossing against the opening edge, so coincident vertices
+ * are collapsed before the sweep.
+ */
+function selfCrossingArea(poly) {
+  const box = bboxOfPoints(poly);
+  if (!box) return 0;
+  const extent = Math.max(box.maxX - box.minX, box.maxY - box.minY, 1);
+  const eps = 1e-9 * extent;
+
+  const pts = [];
+  for (const point of poly) {
+    const last = pts[pts.length - 1];
+    if (last && Math.hypot(point[0] - last[0], point[1] - last[1]) <= eps) continue;
+    pts.push(point);
+  }
+  while (
+    pts.length > 1 &&
+    Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) <= eps
+  ) {
+    pts.pop();
+  }
+  const n = pts.length;
+  if (n < 4) return 0;
+
+  let area = 0;
+  for (let i = 0; i < n; i += 1) {
+    const a1 = pts[i];
+    const a2 = pts[(i + 1) % n];
+    for (let j = i + 2; j < n; j += 1) {
+      if (i === 0 && j === n - 1) continue; // adjacent through the closing edge
+      const b1 = pts[j];
+      const b2 = pts[(j + 1) % n];
+      if (!properlyCrosses([a1, a2], [b1, b2])) continue;
+      const minX = Math.min(a1[0], a2[0], b1[0], b2[0]);
+      const maxX = Math.max(a1[0], a2[0], b1[0], b2[0]);
+      const minY = Math.min(a1[1], a2[1], b1[1], b2[1]);
+      const maxY = Math.max(a1[1], a2[1], b1[1], b2[1]);
+      area += (maxX - minX) * (maxY - minY);
+    }
+  }
+  return area;
+}
+
+/**
+ * Is a self-crossing big enough to change the verdict?
+ *
+ * A subpath drawn with a 0.04-unit doubling-back inside a 350-unit canvas paints
+ * an area the shoelace formula misses by one part in 10⁸. Refusing that would
+ * throw away most real icon artwork for a rounding error. One part in a thousand
+ * is the line.
+ */
+const SELF_CROSSING_TOLERANCE = 1e-3;
+
+function selfCrossingMatters(poly, area) {
+  const disturbed = selfCrossingArea(poly);
+  if (disturbed === 0) return false;
+  return disturbed > SELF_CROSSING_TOLERANCE * Math.max(area, 0);
+}
+
 export function netShape(subpaths) {
   // Two subpaths with the same outline are one region, not two. Summing them
   // doubles the area and drags the centroid towards it, so refuse instead.
   const boxes = subpaths.map((sub) => bboxOfPoints(sub));
   const areas = subpaths.map((sub) => Math.abs(subpathSignedArea(sub)));
+  // A subpath crossing itself has no shoelace area at all. The formula returns
+  // the integral of the winding number, not the painted area, so a pentagram
+  // comes back 2×its centre pentagon too large and a bowtie comes back zero
+  // while painting two triangles. Both are silent lies — but only when the
+  // doubled region is big enough to move the number.
+  for (let i = 0; i < subpaths.length; i += 1) {
+    if (selfCrossingMatters(subpaths[i], areas[i])) {
+      return { area: 0, cx: 0, cy: 0, selfIntersecting: true };
+    }
+  }
   for (let i = 0; i < subpaths.length; i += 1) {
     for (let j = i + 1; j < subpaths.length; j += 1) {
       if (sameOutline(boxes[i], boxes[j], areas[i], areas[j])) {
@@ -149,40 +234,65 @@ export function netShape(subpaths) {
     }
   }
 
-  // Winding only carries meaning *inside* another outline. Two disjoint regions
-  // each have winding 1 whatever their direction, so subtracting one from the
-  // other is arithmetic on a sign the renderer ignores. Inside a container the
-  // rule is the opposite: the same direction means winding 2 (still one fill, so
-  // the inner adds nothing) and the opposite direction means a hole.
+  // Winding only carries meaning *inside* another outline. Count it properly:
+  // the winding number just outside a subpath is the sum of its ancestors'
+  // directions, and just inside it is that plus its own. A region is painted
+  // when its winding is non-zero, so a subpath contributes its area exactly when
+  // crossing its own boundary flips the paint on or off.
+  //
+  //   weight = fill(winding inside) − fill(winding outside)
+  //
+  // Two levels same-direction: outside 0 → inside +1 gives +1, and the inner one
+  // adds zero. Two levels opposite: +1 then 0 gives −1, a hole. Three levels
+  // (hole inside hole inside island) comes out +1 again, which a rule that only
+  // compares against the immediate parent gets backwards.
   const signed = subpaths.map((sub) => subpathSignedArea(sub));
   const parentOf = subpaths.map((sub, i) => {
     let nearest = -1;
     for (let j = 0; j < subpaths.length; j += 1) {
       if (i === j) continue;
       if (!boxContainsBox(boxes[j], boxes[i], 1e-6)) continue;
-      if (!sub.every((vertex) => classifyPoint(vertex, subpaths[j], 1e-6) !== 'outside')) continue;
+      // "No vertex outside" is not enough: a notch that sits in a concavity with
+      // every vertex on the boundary is not inside. Require one strict interior
+      // vertex, the same test even-odd uses.
+      let strictInside = false;
+      let outside = false;
+      for (const vertex of sub) {
+        const where = classifyPoint(vertex, subpaths[j], 1e-6);
+        if (where === 'inside') strictInside = true;
+        else if (where === 'outside') {
+          outside = true;
+          break;
+        }
+      }
+      if (outside || !strictInside) continue;
       if (nearest === -1 || areas[j] < areas[nearest]) nearest = j;
     }
     return nearest;
   });
+
+  const fill = (winding) => (winding !== 0 ? 1 : 0);
+  const outsideWinding = new Array(subpaths.length).fill(null);
+  const windingAt = (index) => {
+    if (outsideWinding[index] !== null) return outsideWinding[index];
+    const parent = parentOf[index];
+    // Containment is strictly by area, so this chain always terminates.
+    const value = parent === -1 ? 0 : windingAt(parent) + Math.sign(signed[parent]);
+    outsideWinding[index] = value;
+    return value;
+  };
 
   let area = 0;
   let mx = 0;
   let my = 0;
   for (const [index, sub] of subpaths.entries()) {
     const { cx, cy } = subpathCentroid(sub);
-    const parent = parentOf[index];
-    let weight;
-    if (parent === -1) {
-      weight = areas[index];
-    } else if (Math.sign(signed[index]) === Math.sign(signed[parent])) {
-      weight = 0;
-    } else {
-      weight = -areas[index];
-    }
-    area += weight;
-    mx += cx * weight;
-    my += cy * weight;
+    const outer = windingAt(index);
+    const weight = fill(outer + Math.sign(signed[index])) - fill(outer);
+    if (weight === 0) continue;
+    area += weight * areas[index];
+    mx += cx * weight * areas[index];
+    my += cy * weight * areas[index];
   }
   if (Math.abs(area) < 1e-12) {
     return { area: 0, cx: 0, cy: 0 };
@@ -299,6 +409,15 @@ export function netShapeEvenOdd(subpaths) {
   }));
   const eps = 1e-6;
 
+  // Even-odd has the same blind spot: it counts boundary crossings, and a
+  // subpath that crosses itself produces crossings the containment test never
+  // sees. A bowtie is the cheap case (zero shoelace area, non-zero paint).
+  for (const item of items) {
+    if (selfCrossingMatters(item.sub, item.area)) {
+      return { area: 0, cx: 0, cy: 0, overlapping: false, selfIntersecting: true };
+    }
+  }
+
   const containers = items.map(() => 0);
   let overlapping = false;
 
@@ -399,8 +518,17 @@ export function parseTransform(value) {
   const re = /([a-zA-Z]+)\s*\(([^)]*)\)/g;
   // Anything the function list does not consume is not a transform. Splicing
   // it out silently kept `translate(10,10) garbage` looking like a clean
-  // translation, which is a wrong position with no warning.
-  if (String(value).replace(re, '').trim() !== '') return null;
+  // translation, which is a wrong position with no warning. Commas *between*
+  // functions are legal in the CSS form (`translate(1px,2px), rotate(45deg)`),
+  // so they are the one separator allowed to survive.
+  if (
+    String(value)
+      .replace(re, '')
+      .replace(/,/g, ' ')
+      .trim() !== ''
+  ) {
+    return null;
+  }
   re.lastIndex = 0;
   let match = re.exec(value);
   while (match) {
@@ -416,8 +544,12 @@ export function parseTransform(value) {
         else if (m[2] === 'turn') angle = angle * 360;
         args.push(angle);
       } else {
-        if (!/^-?\d*\.?\d+$/.test(raw)) return null;
-        args.push(Number.parseFloat(raw));
+        // The CSS form writes lengths with a unit. On an SVG element `1px` is
+        // one user unit (`transform-origin` is the origin), so the number is
+        // the same either way; `em` and `%` are not, and stay refused.
+        const m = /^(-?\d*\.?\d+)(px)?$/.exec(raw);
+        if (!m) return null;
+        args.push(Number.parseFloat(m[1]));
       }
     }
     let m = IDENTITY;

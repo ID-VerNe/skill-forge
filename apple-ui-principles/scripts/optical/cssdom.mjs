@@ -132,7 +132,11 @@ function walk(src, from, to, context, blocks) {
     }
 
     if (src[i] === ';') {
-      // at-statement such as @import / @charset — nothing to check
+      // An at-statement with no body. `@charset` and friends change nothing
+      // here, but `@import` pulls in a whole stylesheet whose rules we never
+      // see — the file may paint any element in it. That is not a rule we can
+      // skip, it is a rule we cannot read.
+      if (/^@import\b/i.test(prelude)) throw new Unresolved('@import pulls in a sheet');
       i += 1;
       continue;
     }
