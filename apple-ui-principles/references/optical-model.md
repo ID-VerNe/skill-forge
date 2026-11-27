@@ -28,6 +28,16 @@ Two rules keep that pipeline from lying:
   stroke *is* ink: only the alpha changes, not the band. A negative width is an
   invalid declaration, which browsers drop, so the element inherits its parent's
   width instead of drawing in the opposite direction.
+- **A broken paint server paints nothing.** `fill="url(#missing)"` is not "a
+  colour we cannot read": SVG leaves the element unrendered. Counting it invented
+  a region out of nothing, and every verdict built on it described ink the browser
+  never drew. `url(#g) red` carries a fallback colour and does paint; a reference
+  to a real gradient or pattern paints the same region, since only the colour
+  changes and colour is not measured.
+- **`vector-effect="non-scaling-stroke"` keeps its width.** The band stays at the
+  authored width while its path is scaled, so the area is computed from the path
+  geometry at scale 1 — under `scale(4)` a 1-unit stroke on a 16-unit perimeter
+  covers 64 units, not 256.
 - **`visibility` is not `display`.** `visibility:hidden` hides a subtree but
   descendants may set `visibility:visible` and reappear, so the flag is carried
   down the tree and applied per shape instead of pruning the branch.
@@ -44,13 +54,15 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | Cause | Reported as |
 |---|---|
 | empty canvas, no shapes, all shapes `fill:none` without stroke | `geometry/no-ink` |
-| `mask` or `filter` present | `geometry/unresolved-graphics` |
+| `mask` or `filter` present, as an attribute, in `style`, or through a class | `geometry/unresolved-graphics` — a class-based mask used to be dropped between the sheet and the node, which reported the unmasked shape as measurable |
+| `marker`, `marker-start`, `marker-mid`, `marker-end` other than `none` | `geometry/unresolved-graphics` (`marker-end`) — a marker draws its own shape outside the path it decorates; arrowheads routinely stick out past the ink box |
 | `<text>`, `<image>`, `<foreignObject>`, `<video>`, `<canvas>`, `<switch>` | `geometry/unresolved-graphics` (`unsupported-ink:*`) — visible, but not geometry |
 | a `clip-path` whose geometry is not a plain rect, or one that cuts the ink | `geometry/unresolved-graphics` |
 | `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
 | a `transform` with a percentage or unit argument, or with trailing junk | `geometry/unresolved-graphics` (`unparsed-transform`) |
 | a percentage or relative `stroke-width`, on the shape **or any ancestor** | `geometry/unresolved-graphics` (`stroke-width-percentage`, `stroke-width-relative`) |
+| a `stroke-width` that overflows to infinity (`1e999`) | `geometry/unresolved-graphics` (`stroke-width-not-finite`) — one engine clamps it to the largest length and paints over the canvas, another drops the declaration |
 | a `d` the path parser rejects or only partially parses | `geometry/unresolved-graphics` (`unparsed-path`) — svgpath reports `M0 0 L` as "missed param" and still returns one point |
 | a geometry length in `%`, `em`, `pt`… | `geometry/unresolved-graphics` (`unparsed-length`) — a percentage is relative to a viewport we cannot see, and `parseFloat("100%")` is `100` |
 | a `viewBox` attribute that is not four finite numbers with a positive size | `geometry/unresolved-graphics` (`invalid-viewBox`) — the element does not render, so there is no canvas to measure against |
@@ -67,6 +79,7 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | two subpaths with the same outline | `geometry/unresolved-graphics` (`overlapping-subpaths`) — they cancel under even-odd and render once under nonzero, so the sum is wrong either way |
 | even-odd outlines that partially overlap | `geometry/unresolved-graphics` (`overlapping-subpaths`) |
 | a subpath that crosses itself over more than 0.1% of its own area | `geometry/unresolved-graphics` (`self-intersecting`) — the shoelace formula integrates the winding number, so a bowtie comes back zero while painting two triangles, and a pentagram comes back 40% too large. Smaller crossings are measured as if they were simple, and the error that introduces is bounded by the tolerance below |
+| two lobes joined at one shared vertex and wound in **opposite** directions | `geometry/unresolved-graphics` (`self-intersecting`) — nothing crosses, so the test above stays quiet, yet shoelace subtracts one lobe from the other: `M12 12 L4 2 L2 12 L12 12 L16 8 L17 12 Z` measures 40 where the render paints 60. The outline is split at its repeated vertices; same-wound lobes add up and are measured normally |
 | a computed centroid outside its own ink box | `geometry/unresolved-graphics` (`centroid-outside-ink`) |
 | a file the CLI could not read or parse in a batch | `geometry/input-error` |
 | an empty directory passed to keyline mode | `geometry/keyline-empty` |
@@ -205,20 +218,28 @@ offset would describe a drawing nobody can see. Under a rotated ancestor the
 viewport rect is taken as its axis-aligned bounding box, which is a superset —
 lenient, and stated here rather than hidden.
 
+`overflow="visible"` is the one declaration that turns that clip off, and then
+the escaping ink is measured as authored. `auto` and `scroll` still clip (they
+add scrollbars), so only the literal `visible` opts out.
+
 A `transform` on the **root** `<svg>` is ignored on purpose. That transform
 belongs to the host page's placement of the canvas, not to the artwork's
 internal coordinate system, so letting it through would report a `104px` offset
 for an icon that is perfectly centred.
 
-`transform` parsing is strict: anything that is not a function call — a `%`
-argument, `2em`, `var(--x)`, or trailing junk after the last `)` — invalidates
-the *whole* list. Dropping the bad part would shift the rest left: `translate(10%,8)`
-would silently become `translate(8,0)`, and `translate(10,10) garbage` would keep
-the translation. Two notations are accepted because they are unambiguous rather
-than because they are convenient: commas *between* functions, as the CSS form
-writes them (`translate(1px,2px), rotate(45deg)`), and a `px` suffix on a
-length — on an SVG element `transform-origin` is the origin, so `1px` is one
-user unit and the number is the same either way.
+`transform` parsing is strict, and it separates two failures that look alike.
+A `%` argument, `2em` or `var(--x)` names a value defined outside the file, so
+the list is refused (`unparsed-transform`) rather than guessed: dropping the bad
+argument would shift the rest left, and `translate(10%,8)` would silently become
+`translate(8,0)`. Malformed syntax is a different answer — an unknown function,
+trailing junk after the last `)`, or the wrong argument count. Browsers drop the
+whole attribute there, so the element is measured in its untransformed space;
+applying the parseable prefix instead put ink at `translate(10 20)` for an
+attribute every engine ignores. Two notations are accepted because they are
+unambiguous rather than because they are convenient: commas *between* functions,
+as the CSS form writes them (`translate(1px,2px), rotate(45deg)`), and a `px`
+suffix on a length — on an SVG element `transform-origin` is the origin, so
+`1px` is one user unit and the number is the same either way.
 
 ### Units
 

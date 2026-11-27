@@ -1402,13 +1402,23 @@ test('CSS keywords are case-insensitive', () => {
   near(shape.ink.bbox.minX, 14);
 });
 
-test('trailing junk invalidates the whole transform list', () => {
-  // `translate(10,10) garbage` is not a translation. Splicing it out moved the
-  // artwork 10 units and said nothing.
+test('trailing junk drops the whole transform list, as a browser does', () => {
+  // `translate(10,10) garbage` is not a translation and not a half-translation:
+  // the attribute is invalid, so the element is untransformed. Refusing would
+  // have been right too, but the browser's answer is knowable — and it is not
+  // "shifted by 10".
   const shape = analyzeSvg(
     svg('<g transform="translate(10,10) garbage"><rect x="0" y="0" width="2" height="2"/></g>'),
   );
-  assert.match(shape.unresolved.join(), /unparsed-transform/);
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.bbox.minX, 0, 1e-9);
+  near(shape.ink.bbox.minY, 0, 1e-9);
+  // The same for a wrong argument count: `rotate(45 12 12 5)` is not a rotation.
+  const rotated = analyzeSvg(
+    svg('<g transform="rotate(45 12 12 5)"><rect x="0" y="0" width="2" height="2"/></g>'),
+  );
+  assert.deepEqual(rotated.unresolved, []);
+  near(rotated.ink.bbox.minX, 0, 1e-9);
 });
 
 test('a directory with an unreadable icon reports unknown, never ok', () => {
@@ -1538,6 +1548,132 @@ test('a stroke that draws nothing is not a hairline', () => {
     svg('<rect width="24" height="24" fill="none" stroke="#000" stroke-width="-4"/>'),
   );
   near(negative.ink.area, 24 * 4 * 1, 1e-6);
+});
+
+test('two lobes meeting at a vertex are refused only when they subtract', () => {
+  // No crossing anywhere: the triangles touch at (12,12). Shoelace still walks
+  // them in order, so opposite winding subtracts one from the other — 50 − 10
+  // = 40 where the render paints 60.
+  const mixed = analyzeSvg(
+    svg('<path d="M12 12 L4 2 L2 12 L12 12 L16 8 L17 12 Z"/>'),
+  );
+  assert.ok(mixed.unresolved.includes('self-intersecting'), JSON.stringify(mixed.unresolved));
+
+  // Wound the same way the lobes add up and the shoelace total is the painted
+  // area. Refusing this would be the over-correction that blinds a real icon.
+  const same = analyzeSvg(
+    svg('<path d="M12 12 L4 2 L2 12 L12 12 L17 12 L16 8 Z"/>'),
+  );
+  assert.deepEqual(same.unresolved, []);
+  near(same.ink.area, 60, 1e-6);
+});
+
+test('a mask, a filter or a marker hung on a class still counts', () => {
+  // These used to be dropped between the sheet and the node, so the element
+  // looked unmasked and came back `ok` on ink nobody could measure.
+  const cases = [
+    ['mask', '.a{mask:url(#k)}', '<defs><mask id="k"></mask></defs>'],
+    ['filter', '.b{filter:blur(2px)}', ''],
+    ['marker-end', '.c{marker-end:url(#a)}', ''],
+  ];
+  for (const [prop, rule, defs] of cases) {
+    const cls = /^\.(\w+)/.exec(rule)[1];
+    const shape = analyzeSvg(
+      svg(`${defs}<style>${rule}</style><path class="${cls}" d="M2 12 H22" stroke="#000"/>`),
+    );
+    assert.ok(
+      shape.unresolved.some((u) => u.startsWith(prop)),
+      `${prop}: ${JSON.stringify(shape.unresolved)}`,
+    );
+  }
+});
+
+test('a paint server that does not exist paints nothing', () => {
+  // SVG says an invalid paint reference leaves the element unrendered, so the
+  // shape is not ink — counting it invented a 20×20 region.
+  const missing = analyzeSvg(svg('<rect x="2" y="2" width="20" height="20" fill="url(#nope)"/>'));
+  assert.equal(missing.noInk, true);
+
+  // A reference to a real gradient or pattern paints the same region; only the
+  // colour changes, and colour is not part of the measurement.
+  const gradient = analyzeSvg(
+    svg(
+      '<defs><linearGradient id="g"><stop offset="0" stop-color="#000"/></linearGradient></defs>' +
+        '<rect x="2" y="2" width="20" height="20" fill="url(#g)"/>',
+    ),
+  );
+  near(gradient.ink.area, 400, 1e-6);
+
+  // `url(#g) red` carries a fallback paint, so a broken reference still paints.
+  const fallback = analyzeSvg(svg('<rect x="2" y="2" width="20" height="20" fill="url(#nope) red"/>'));
+  near(fallback.ink.area, 400, 1e-6);
+
+  // A reference to a non-paint-server is invalid too.
+  const clip = analyzeSvg(
+    svg(
+      '<defs><clipPath id="c"><rect width="4" height="4"/></clipPath></defs>' +
+        '<rect x="2" y="2" width="20" height="20" fill="url(#c)"/>',
+    ),
+  );
+  assert.equal(clip.noInk, true);
+});
+
+test('overflow="visible" lets a nested viewport draw outside itself', () => {
+  const clipped = (extra) =>
+    analyzeSvg(
+      svg(`<svg x="0" y="0" width="10" height="10" viewBox="0 0 10 10" ${extra}>` +
+        '<rect width="20" height="20"/></svg>'),
+    );
+  // Default: the nested viewport is `overflow: hidden`, so the escaping ink is
+  // cut off and cannot be measured.
+  assert.ok(clipped('').unresolved.includes('ink-outside-viewport'));
+  assert.ok(clipped('overflow="hidden"').unresolved.includes('ink-outside-viewport'));
+  // `visible` says to draw it anyway, and then it is measurable.
+  const open = clipped('overflow="visible"');
+  assert.deepEqual(open.unresolved, []);
+  near(open.ink.area, 400, 1e-6);
+});
+
+test('a marker is ink the path does not describe', () => {
+  const shape = analyzeSvg(
+    svg('<path d="M2 12 H22" stroke="#000" stroke-width="2" marker-end="url(#arrow)"/>'),
+  );
+  assert.ok(shape.unresolved.includes('marker-end'), JSON.stringify(shape.unresolved));
+  // `none` is the resting value and adds nothing.
+  const plain = analyzeSvg(
+    svg('<path d="M2 12 H22" stroke="#000" stroke-width="2" marker-end="none"/>'),
+  );
+  assert.deepEqual(plain.unresolved, []);
+});
+
+test('a non-scaling stroke ignores the ancestor scale', () => {
+  // The path quadruples, the band does not: perimeter 16 units × scale 4 ×
+  // width 1 = 64, not 256.
+  const scaled = (effect) =>
+    analyzeSvg(
+      svg(`<g transform="scale(4)"><rect width="4" height="4" fill="none" stroke="#000" ` +
+        `stroke-width="1" ${effect}/></g>`),
+    );
+  near(scaled('vector-effect="non-scaling-stroke"').ink.area, 64, 1e-6);
+  near(scaled('').ink.area, 256, 1e-6);
+});
+
+test('a stroke width that overflows to infinity is refused', () => {
+  // One engine clamps 1e999 to the largest length and paints a band over the
+  // whole canvas; another drops the declaration. Neither is "1 unit".
+  const shape = analyzeSvg(svg('<rect width="24" height="24" fill="none" stroke="#000" stroke-width="1e999"/>'));
+  assert.ok(shape.unresolved.includes('stroke-width-not-finite'), JSON.stringify(shape.unresolved));
+});
+
+test('width/height on a <use> of a plain group is ignored, not refused', () => {
+  const shape = analyzeSvg(
+    svg(
+      '<defs><g id="g"><rect width="12" height="12"/></g></defs>' +
+        '<use href="#g" x="6" y="6" width="24" height="24"/>',
+    ),
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 144, 1e-6);
 });
 
 test('a paint that resolves at runtime is refused, not guessed', () => {

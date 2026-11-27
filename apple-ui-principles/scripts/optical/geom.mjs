@@ -256,6 +256,59 @@ function cancelsToNothing(poly, sceneArea) {
   return span > SELF_CROSSING_TOLERANCE * Math.max(sceneArea, 1e-9);
 }
 
+/**
+ * Two lobes joined at one shared vertex, wound in opposite directions.
+ *
+ * `M12 12 L4 2 L2 12 L12 12 L16 8 L17 12 Z` never crosses itself — the two
+ * triangles meet at (12,12) — so the crossing test stays quiet. Shoelace still
+ * walks them in sequence, and opposite winding makes it *subtract* one lobe from
+ * the other: 50 − 10 = 40 where the render paints 60. Splitting the outline at
+ * its repeated vertices recovers both loops; when their signs disagree the
+ * shoelace total is not a painted area and the shape has to be refused.
+ */
+function selfTouchingLoopsMatter(points, area) {
+  if (!points || points.length < 5) return false;
+  const box = bboxOfPoints(points);
+  if (!box) return false;
+  // Vertices that coincide are the whole signal, so the key grid has to be
+  // tighter than any real detail but wider than flattening noise.
+  const eps = Math.max(box.maxX - box.minX, box.maxY - box.minY, 1) * 1e-9;
+  const keyOf = (p) => `${Math.round(p[0] / eps)}:${Math.round(p[1] / eps)}`;
+
+  const open = []; // chains currently being walked, each { key, index }
+  const positions = new Map(); // key → index into `open`
+  const loops = [];
+  for (let i = 0; i < points.length; i += 1) {
+    const key = keyOf(points[i]);
+    const at = positions.get(key);
+    if (at === undefined) {
+      positions.set(key, open.length);
+      open.push({ key, index: i });
+      continue;
+    }
+    // The implicit close of a flattened subpath repeats the first vertex at the
+    // very end; that is not a touch, it is the outline ending.
+    if (at === 0 && i === points.length - 1) continue;
+    if (i - open[at].index >= 3) loops.push(subpathSignedArea(points.slice(open[at].index, i + 1)));
+    for (let k = at + 1; k < open.length; k += 1) positions.delete(open[k].key);
+    open.length = at + 1;
+    open[at] = { key, index: i };
+  }
+  if (open.length >= 3) loops.push(subpathSignedArea(points.slice(open[0].index)));
+
+  if (loops.length < 2) return false;
+  const total = Math.abs(area) || loops.reduce((s, a) => s + Math.abs(a), 0);
+  // Same 0.1% bar as a true crossing: a hair-thin lobe cannot move the number.
+  const bar = SELF_CROSSING_TOLERANCE * Math.max(total, 1e-9);
+  let positive = false;
+  let negative = false;
+  for (const a of loops) {
+    if (a > bar) positive = true;
+    else if (a < -bar) negative = true;
+  }
+  return positive && negative;
+}
+
 /** Union bbox area of a set of subpaths — the scale a cancellation is judged on. */
 function sceneAreaOf(subpaths) {
   let minX = Infinity;
@@ -292,6 +345,11 @@ export function netShape(subpaths) {
   // doubled region is big enough to move the number.
   for (let i = 0; i < subpaths.length; i += 1) {
     if (selfCrossingMatters(subpaths[i], areas[i])) {
+      return { area: 0, cx: 0, cy: 0, selfIntersecting: true };
+    }
+    // A crossing is not the only way one outline can lie about its area; two
+    // lobes meeting at a vertex lie just as quietly.
+    if (selfTouchingLoopsMatter(subpaths[i], areas[i])) {
       return { area: 0, cx: 0, cy: 0, selfIntersecting: true };
     }
   }
@@ -598,10 +656,37 @@ export function applyMatrix(m, x, y) {
 }
 
 /**
+ * Sentinel for a transform list a browser would throw away.
+ *
+ * `parseTransform` has two ways to fail and they are not the same answer:
+ * syntax the engine rejects (`translate(10 20 30)`, an unknown function) leaves
+ * the element **untransformed**, while a value that needs a context we do not
+ * have (`2em`, `var(--t)`) is unknowable. Returning `null` for both made the
+ * first look unmeasurable and, before that, made it look partially applied.
+ */
+export const INVALID_TRANSFORM = 'invalid-transform';
+
+/**
+ * Does this argument need a context the static pass does not have?
+ *
+ * A length unit other than `px`, or a `var()` / `env()` / `calc()` call, names a
+ * value defined elsewhere. Anything else that fails to parse (`garbage`, `foo`)
+ * is a syntax error, and a browser answers those by dropping the whole list.
+ */
+const CONTEXT_ARG =
+  /%|\d\s*(em|ex|ch|rem|vw|vh|vmin|vmax|pt|pc|cm|mm|in|q)$|(var|env|calc)\s*\(/i;
+
+function needsContext(raw) {
+  return CONTEXT_ARG.test(String(raw));
+}
+
+/**
  * Parse an SVG transform list into a single matrix.
- * @returns {number[]|null} `null` when any argument cannot be resolved to a
- *   number. Dropping the bad argument would shift the rest left — `translate(10%,8)`
- *   would silently become `translate(8,0)` — so the whole transform is refused.
+ * @returns {number[]|string|null} the matrix, `INVALID_TRANSFORM` when the list
+ *   is malformed (the browser drops it, so the caller uses the untransformed
+ *   space), or `null` when an argument cannot be resolved to a number. Dropping
+ *   the bad argument would shift the rest left — `translate(10%,8)` would
+ *   silently become `translate(8,0)` — so the whole transform is refused.
  */
 export function parseTransform(value) {
   if (!value) return IDENTITY;
@@ -618,7 +703,7 @@ export function parseTransform(value) {
       .replace(/,/g, ' ')
       .trim() !== ''
   ) {
-    return null;
+    return INVALID_TRANSFORM;
   }
   re.lastIndex = 0;
   let match = re.exec(value);
@@ -627,8 +712,8 @@ export function parseTransform(value) {
     const args = [];
     for (const raw of match[2].split(/[\s,]+/).filter((part) => part !== '')) {
       if (name === 'rotate' || name === 'skewX' || name === 'skewY') {
-        const m = /^(-?\d*\.?\d+)(deg|grad|rad|turn)?$/.exec(raw);
-        if (!m) return null;
+        const m = /^(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(deg|grad|rad|turn)?$/.exec(raw);
+        if (!m) return needsContext(raw) ? null : INVALID_TRANSFORM;
         let angle = Number.parseFloat(m[1]);
         if (m[2] === 'rad') angle = (angle * 180) / Math.PI;
         else if (m[2] === 'grad') angle = angle * 0.9;
@@ -638,8 +723,8 @@ export function parseTransform(value) {
         // The CSS form writes lengths with a unit. On an SVG element `1px` is
         // one user unit (`transform-origin` is the origin), so the number is
         // the same either way; `em` and `%` are not, and stay refused.
-        const m = /^(-?\d*\.?\d+)(px)?$/.exec(raw);
-        if (!m) return null;
+        const m = /^(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(px)?$/.exec(raw);
+        if (!m) return needsContext(raw) ? null : INVALID_TRANSFORM;
         args.push(Number.parseFloat(m[1]));
       }
     }
@@ -647,23 +732,31 @@ export function parseTransform(value) {
     switch (name) {
       case 'matrix':
         if (args.length === 6) m = args;
-        else return null;
+        else return INVALID_TRANSFORM;
         break;
       case 'translate':
+        // Wrong argument counts are a different failure from an unreadable
+        // value: a browser drops the invalid function and the whole list falls
+        // back to `none`, while `2em` needs a context we do not have. Treating
+        // the two alike either invented a transform or refused a measurable
+        // icon — `translate(10 20 30)` was applied as `translate(10 20)`.
+        if (args.length < 1 || args.length > 2) return INVALID_TRANSFORM;
         m = [1, 0, 0, 1, args[0] || 0, args[1] || 0];
         break;
       case 'scale': {
+        if (args.length < 1 || args.length > 2) return INVALID_TRANSFORM;
         const sx = args[0] ?? 1;
         const sy = args[1] ?? sx;
         m = [sx, 0, 0, sy, 0, 0];
         break;
       }
       case 'rotate': {
+        if (args.length !== 1 && args.length !== 3) return INVALID_TRANSFORM;
         const rad = ((args[0] || 0) * Math.PI) / 180;
         const cos = Math.cos(rad);
         const sin = Math.sin(rad);
         const rot = [cos, sin, -sin, cos, 0, 0];
-        if (args.length >= 3) {
+        if (args.length === 3) {
           const [, cx, cy] = args;
           m = multiplyMatrix(
             multiplyMatrix([1, 0, 0, 1, cx, cy], rot),
@@ -675,13 +768,15 @@ export function parseTransform(value) {
         break;
       }
       case 'skewX':
+        if (args.length !== 1) return INVALID_TRANSFORM;
         m = [1, 0, Math.tan(((args[0] || 0) * Math.PI) / 180), 1, 0, 0];
         break;
       case 'skewY':
+        if (args.length !== 1) return INVALID_TRANSFORM;
         m = [1, Math.tan(((args[0] || 0) * Math.PI) / 180), 0, 1, 0, 0];
         break;
       default:
-        return null;
+        return INVALID_TRANSFORM;
     }
     result = multiplyMatrix(result, m);
     match = re.exec(value);

@@ -16,6 +16,7 @@ import {
   netShapeEvenOdd,
   bboxOfPoints,
   parseTransform,
+  INVALID_TRANSFORM,
   applyMatrix,
   multiplyMatrix,
   shapeToPath,
@@ -48,7 +49,10 @@ const NON_RENDERING = new Set([
   'desc',
   'metadata',
 ]);
-const UNRESOLVABLE = ['mask', 'filter'];
+// Properties that put ink where this module cannot follow it: a mask or filter
+// rewrites the painted region, and a marker draws a shape of its own outside the
+// path it decorates (arrowheads routinely stick out past the ink box).
+const UNRESOLVABLE = ['mask', 'filter', 'marker', 'marker-start', 'marker-mid', 'marker-end'];
 // Elements that paint, but not as geometry we can measure.
 const UNMEASURABLE_INK = new Set([
   'text',
@@ -385,6 +389,11 @@ function applyStylesheets(text, root, ctx) {
 function matrixFrom(attrs, base, ctx) {
   if (!attrs.transform) return base;
   const parsed = parseTransform(attrs.transform);
+  // A malformed list is dropped by the browser, so the element sits in its
+  // untransformed space; a value that needs a context (`2em`, `var(--t)`) is
+  // unknowable and stays refused. Treating them alike either invented a
+  // position or refused a drawing whose transform is simply absent.
+  if (parsed === INVALID_TRANSFORM) return base;
   if (!parsed) {
     ctx.unresolved.add('unparsed-transform');
     return base;
@@ -413,6 +422,38 @@ function strokeOpacityOf(attrs, inherited) {
   return resolveOpacity(attrs['stroke-opacity'], inherited.strokeOpacity ?? 1);
 }
 
+// Elements a `fill: url(#…)` reference may legitimately point at. Anything else
+// — a `<mask>`, a `<clipPath>`, a missing id — makes the paint declaration
+// invalid, and an invalid paint is `none`, not the colour of the shape it was
+// meant to be.
+const PAINT_SERVER = new Set([
+  'lineargradient',
+  'radialgradient',
+  'pattern',
+  'solidcolor',
+  'meshgradient',
+  'meshpatch',
+  'meshrow',
+]);
+
+/**
+ * True when a paint value references a paint server that does not exist.
+ *
+ * `url(#missing)` is not "a colour we cannot read": SVG says the element is not
+ * rendered, so the shape has no ink at all. Counting it as painted invented a
+ * 20×20 region out of nothing — and any verdict built on it was about ink the
+ * browser never drew. `url(#g) red` carries a fallback colour and does paint.
+ */
+function paintAbsent(paint, ctx) {
+  if (paint === undefined || paint === null) return false;
+  const match = /^url\(\s*['"]?#([^)'"\s]+)['"]?\s*\)([\s\S]*)$/i.exec(String(paint).trim());
+  if (!match) return false;
+  if (match[2].trim() !== '') return false;
+  const target = ctx.ids.get(match[1]);
+  if (!target) return true;
+  return !PAINT_SERVER.has(String(target.tag).toLowerCase());
+}
+
 /**
  * `stroke-width` is in user units, or a percentage of the viewport diagonal —
  * which needs a rendered viewport we do not have. Refuse the percentage rather
@@ -430,6 +471,14 @@ function strokeWidthOf(attrs, inherited, ctx) {
   const value = parseLength(raw);
   if (value === null) {
     ctx.unresolved.add('stroke-width-relative');
+    return inherited.strokeWidth;
+  }
+  if (!Number.isFinite(value)) {
+    // `stroke-width="1e999"` overflows to infinity. One engine clamps it to the
+    // largest representable length and paints a band that covers the canvas,
+    // another drops the declaration as invalid. Both writes are defensible, so
+    // the width is unverifiable rather than one of them.
+    ctx.unresolved.add('stroke-width-not-finite');
     return inherited.strokeWidth;
   }
   if (value < 0) {
@@ -614,7 +663,7 @@ function collect(node, inherited, out, ctx) {
     withClip(attrs, matrix, ctx, out, (sink) => {
       withViewport({ x: 0, y: 0, w: vpW, h: vpH }, outerMatrix, ctx, sink, (inner) => {
         for (const child of node.children || []) collect(child, local, inner, ctx);
-      });
+      }, clipsViewport(attrs));
     });
     return out;
   }
@@ -643,10 +692,10 @@ function collect(node, inherited, out, ctx) {
     const useMatrix = multiplyMatrix(own, [1, 0, 0, 1, x, y]);
     const targetTag = String(target.tag).toLowerCase();
 
-    // width/height on a <use> only mean anything for viewport-establishing targets.
-    if (targetTag !== 'symbol' && targetTag !== 'svg' && (attrs.width !== undefined || attrs.height !== undefined)) {
-      ctx.unresolved.add('use-viewport-ignored');
-    }
+    // `width`/`height` on a <use> only size a viewport-establishing target and
+    // are ignored otherwise. That is well-defined, not ambiguous: generators emit
+    // them on plain <g> references all the time, and refusing those turned a
+    // measurable icon into an `unknown` for a pair of attributes with no effect.
 
     const inner = { ...ctx, depth: ctx.depth + 1 };
     const local = inheritedFor(attrs, inherited, visible, useMatrix, ctx);
@@ -704,7 +753,7 @@ function collect(node, inherited, out, ctx) {
         withClip(symbolAttrs, matrix, ctx, sink, (clipped) => {
           withViewport({ x: 0, y: 0, w: vpW, h: vpH }, useMatrix, ctx, clipped, (viewport) => {
             for (const child of target.children || []) collect(child, symbolLocal, viewport, inner);
-          });
+          }, clipsViewport(symbolAttrs));
         });
         return;
       }
@@ -772,7 +821,8 @@ function collect(node, inherited, out, ctx) {
           filled:
             !keywordIs(fillPaint, 'none') &&
             !isInvisiblePaint(fillPaint) &&
-            fillOpacityOf(attrs, inherited) !== 0,
+            fillOpacityOf(attrs, inherited) !== 0 &&
+            !paintAbsent(fillPaint, ctx),
           // `stroke-width: 0` and `stroke-opacity: 0` both draw nothing; the
           // band would otherwise be invented from a stroke the render omits.
           stroked:
@@ -780,8 +830,14 @@ function collect(node, inherited, out, ctx) {
             !keywordIs(strokePaint, 'none') &&
             !isInvisiblePaint(strokePaint) &&
             strokeOpacityOf(attrs, inherited) !== 0 &&
-            strokeUnits !== 0,
+            strokeUnits !== 0 &&
+            !paintAbsent(strokePaint, ctx),
           strokeWidth: strokeUnits,
+          // `vector-effect="non-scaling-stroke"` keeps the band at its authored
+          // width however the ancestors scale the shape — the area loop below
+          // must not multiply it by the matrix.
+          nonScalingStroke:
+            String(attrs['vector-effect'] ?? '').trim().toLowerCase() === 'non-scaling-stroke',
           // Even `fill-rule` is inherited, and an inherited `evenodd` changes the
           // area of every child path.
           fillRule: (attrs['fill-rule'] || inherited.fillRule || 'nonzero').toLowerCase(),
@@ -800,20 +856,40 @@ function collect(node, inherited, out, ctx) {
 }
 
 /**
+ * Every nested `<svg>` and `<symbol>` clips by default; `overflow` is the one
+ * declaration that turns that off. `auto` and `scroll` still clip (with
+ * scrollbars), so only the literal `visible` opts out.
+ */
+function clipsViewport(attrs) {
+  const raw = attrs.overflow;
+  if (raw === undefined || raw === null) return true;
+  return String(raw).trim().toLowerCase() !== 'visible';
+}
+
+/**
  * A viewport clips what it contains — `overflow: hidden` is the default for a
  * nested `<svg>` and for `<symbol>`. Measuring ink the browser would cut off
  * produces an `off` nobody can reproduce by looking at the render, so refuse
  * when the drawing leaves the viewport.
+ *
+ * `overflow="visible"` turns the clip off, and the drawing is measured as
+ * authored. Refusing it reported ink the user can plainly see as unmeasurable —
+ * the conservative direction, but it made the whole icon disappear from the
+ * report for a declaration that says exactly what to do.
  *
  * `outerMatrix` maps the viewport's own space to root space; the rect is that
  * viewport. Under a rotated ancestor the rect becomes its AABB, which is a
  * superset — lenient in the direction that matters least, but stated in
  * `optical-model.md` rather than hidden.
  */
-function withViewport(rect, outerMatrix, ctx, out, emit) {
+function withViewport(rect, outerMatrix, ctx, out, emit, clips = true) {
   const captured = [];
   emit(captured);
   if (captured.length === 0) return;
+  if (!clips) {
+    out.push(...captured);
+    return;
+  }
   const box = bboxOfShapes(captured, ctx.steps, ctx);
   if (!box) return;
   // All four corners: under a rotation the two diagonal ones would both land on
@@ -1067,7 +1143,11 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
     }
 
     if (shape.stroked) {
-      const width = Math.max(shape.strokeWidth * uniformScale(shape.matrix), 0.0001);
+      // A non-scaling stroke keeps its authored width in the viewport space, so
+      // the ancestor scale must not stretch the band: under `scale(4)` a 1-unit
+      // stroke stays 1 unit wide while the path quadruples.
+      const strokeScale = shape.nonScalingStroke ? 1 : uniformScale(shape.matrix);
+      const width = Math.max(shape.strokeWidth * strokeScale, 0.0001);
       for (const sub of subpaths) {
         for (let i = 1; i < sub.length; i += 1) {
           const [x0, y0] = sub[i - 1];

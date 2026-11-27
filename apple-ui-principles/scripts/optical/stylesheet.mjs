@@ -25,6 +25,14 @@ const PAINT = new Set([
   'visibility',
   'opacity',
   'clip-path',
+  // These do not have an attribute-only life: a class is the usual way to hang
+  // a mask, a filter or a marker on a shape, and dropping the declaration here
+  // made the element look unmasked — a confident `ok` on ink nobody can measure.
+  'mask',
+  'filter',
+  'marker-start',
+  'marker-mid',
+  'marker-end',
 ]);
 
 /** Properties that would move the ink; unsupported through CSS here. */
