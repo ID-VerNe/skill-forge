@@ -1,0 +1,234 @@
+// A deliberately small CSS tokeniser.
+//
+// It is not a CSS parser and does not try to be. Its only contract is: return
+// declaration blocks it is *certain* about, and refuse the rest. A checker that
+// mis-splits a rule produces confidently wrong evidence, which is worse than
+// having no checker at all — hence `unresolved` instead of best-effort guessing.
+
+const GROUPING_AT_RULES = new Set([
+  '@media',
+  '@supports',
+  '@layer',
+  '@container',
+  '@scope',
+  '@document',
+]);
+
+class Unresolved extends Error {}
+
+function skipString(src, i) {
+  const quote = src[i];
+  let j = i + 1;
+  while (j < src.length) {
+    if (src[j] === '\\') {
+      j += 2;
+      continue;
+    }
+    if (src[j] === quote) return j + 1;
+    j += 1;
+  }
+  throw new Unresolved('unterminated string');
+}
+
+function skipComment(src, i) {
+  const end = src.indexOf('*/', i + 2);
+  if (end === -1) throw new Unresolved('unterminated comment');
+  return end + 2;
+}
+
+/** Split a declaration body on semicolons that are not inside strings or parens. */
+function splitDeclarations(body) {
+  const out = [];
+  let depth = 0;
+  let start = 0;
+  let i = 0;
+  while (i < body.length) {
+    const ch = body[i];
+    if (ch === '/' && body[i + 1] === '*') {
+      i = skipComment(body, i);
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipString(body, i);
+      continue;
+    }
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth = Math.max(0, depth - 1);
+    else if (ch === ';' && depth === 0) {
+      out.push(body.slice(start, i));
+      start = i + 1;
+    }
+    i += 1;
+  }
+  if (start < body.length) out.push(body.slice(start));
+  return out;
+}
+
+function toDecls(chunk) {
+  const colon = chunk.indexOf(':');
+  if (colon === -1) return null;
+  const prop = chunk.slice(0, colon).trim().toLowerCase();
+  const value = chunk.slice(colon + 1).trim();
+  if (!prop || !value) return null;
+  if (!/^[-a-z][-a-z0-9]*$/.test(prop)) return null;
+  return [prop, value];
+}
+
+/**
+ * @param {string} src
+ * @returns {{blocks: Array<{selector:string, decls:Record<string,string>, context:string[]}>, unresolved: string|null}}
+ */
+export function parseCss(src) {
+  const blocks = [];
+  try {
+    walk(src, 0, src.length, [], blocks);
+    return { blocks, unresolved: null };
+  } catch (err) {
+    if (err instanceof Unresolved) {
+      return { blocks: [], unresolved: err.message };
+    }
+    throw err;
+  }
+}
+
+function walk(src, from, to, context, blocks) {
+  let i = from;
+  while (i < to) {
+    // skip whitespace and comments
+    while (i < to && /\s/.test(src[i])) i += 1;
+    if (i >= to) break;
+    if (src[i] === '/' && src[i + 1] === '*') {
+      i = skipComment(src, i);
+      continue;
+    }
+
+    // read prelude up to '{' or ';'
+    let start = i;
+    let depth = 0;
+    while (i < to) {
+      const ch = src[i];
+      if (ch === '/' && src[i + 1] === '*') {
+        i = skipComment(src, i);
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        i = skipString(src, i);
+        continue;
+      }
+      if (ch === '(') depth += 1;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0 && (ch === '{' || ch === ';' || ch === '}')) break;
+      i += 1;
+    }
+
+    const prelude = src.slice(start, i).trim();
+    if (i >= to) {
+      if (prelude) throw new Unresolved(`dangling prelude: ${prelude.slice(0, 40)}`);
+      break;
+    }
+
+    if (src[i] === ';') {
+      // at-statement such as @import / @charset — nothing to check
+      i += 1;
+      continue;
+    }
+
+    if (src[i] === '}') {
+      if (prelude) throw new Unresolved('declaration outside a block');
+      return i;
+    }
+
+    // src[i] === '{'
+    const close = findMatchingBrace(src, i, to);
+    const inner = src.slice(i + 1, close);
+
+    if (prelude.startsWith('@')) {
+      const name = prelude.split(/\s+/)[0].toLowerCase();
+      if (GROUPING_AT_RULES.has(name)) {
+        walk(src, i + 1, close, [...context, prelude], blocks);
+      }
+      // other at-rules with bodies (@font-face, @keyframes) are irrelevant here
+      i = close + 1;
+      continue;
+    }
+
+    if (prelude) {
+      const { decls, nested } = splitBlock(inner);
+      blocks.push({ selector: prelude.replace(/\s+/g, ' '), decls, context });
+      for (const child of nested) {
+        // CSS nesting: `& .child { ... }` inherits the parent context
+        const merged = child.selector.includes('&')
+          ? child.selector.replace(/&/g, prelude)
+          : `${prelude} ${child.selector}`;
+        blocks.push({ selector: merged.replace(/\s+/g, ' '), decls: child.decls, context });
+      }
+    }
+
+    i = close + 1;
+  }
+  return i;
+}
+
+function findMatchingBrace(src, openIndex, limit) {
+  let depth = 0;
+  let i = openIndex;
+  while (i < limit) {
+    const ch = src[i];
+    if (ch === '/' && src[i + 1] === '*') {
+      i = skipComment(src, i);
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipString(src, i);
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+    i += 1;
+  }
+  throw new Unresolved('unbalanced braces');
+}
+
+/** Separate own declarations from nested rules inside a single block body. */
+function splitBlock(body) {
+  const decls = {};
+  const nested = [];
+  let cursor = 0;
+  let i = 0;
+  while (i < body.length) {
+    const ch = body[i];
+    if (ch === '/' && body[i + 1] === '*') {
+      i = skipComment(body, i);
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipString(body, i);
+      continue;
+    }
+    if (ch === '{') {
+      const close = findMatchingBrace(body, i, body.length);
+      const selector = body.slice(cursor, i).trim();
+      const { decls: childDecls, nested: childNested } = splitBlock(body.slice(i + 1, close));
+      nested.push({ selector, decls: childDecls });
+      for (const grand of childNested) {
+        nested.push({
+          selector: grand.selector,
+          decls: grand.decls,
+        });
+      }
+      i = close + 1;
+      cursor = i;
+      continue;
+    }
+    i += 1;
+  }
+  const tail = body.slice(cursor);
+  for (const chunk of splitDeclarations(tail)) {
+    const entry = toDecls(chunk);
+    if (entry) decls[entry[0]] = entry[1];
+  }
+  return { decls, nested };
+}
