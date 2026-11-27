@@ -15,6 +15,7 @@ import {
   netShape,
   netShapeEvenOdd,
   bboxOfPoints,
+  enclosesArea,
   parseTransform,
   INVALID_TRANSFORM,
   applyMatrix,
@@ -25,7 +26,14 @@ import {
   IDENTITY,
 } from './geom.mjs';
 import { buildReport, tolFor } from './report.mjs';
-import { cascade, isInvisiblePaint, isRuntimePaint, parseStyle } from './stylesheet.mjs';
+import {
+  cascade,
+  isDroppedPaint,
+  isInvisiblePaint,
+  isRuntimePaint,
+  paintKind,
+  parseStyle,
+} from './stylesheet.mjs';
 
 const round = (n, d = 3) => Math.round(n * 10 ** d) / 10 ** d;
 
@@ -216,7 +224,12 @@ function parseXml(text) {
     const selfClosing = raw.endsWith('/');
     const body = selfClosing ? raw.slice(0, -1).trim() : raw;
     const space = body.search(/[\s]/);
-    const tag = (space === -1 ? body : body.slice(0, space)).toLowerCase();
+    // `xmlns:svg="…/svg"` makes `<svg:rect>` the same element as `<rect>`; some
+    // exporters write the prefix on every node. Keeping it meant `SHAPES` did not
+    // match, the element fell through to the container branch, and its geometry
+    // vanished without a word: a 400-unit rect measured as 16.
+    const rawTag = (space === -1 ? body : body.slice(0, space)).toLowerCase();
+    const tag = rawTag.replace(/^[^:]+:/, '');
     const attrText = space === -1 ? '' : body.slice(space);
     const attrs = {};
     const attrRe = /([\w:.-]+)\s*=\s*("([^"]*)"|'([^']*)')/g;
@@ -305,7 +318,21 @@ function absolutePx(value) {
  */
 function effectiveAttrs(node) {
   if (node.effective) return node.effective;
-  return { ...node.attrs, ...parseStyle(node.attrs.style).decls };
+  const merged = { ...node.attrs };
+  for (const [prop, value] of Object.entries(parseStyle(node.attrs.style).decls)) {
+    // A paint value CSS cannot parse is dropped by the browser, which leaves the
+    // property at its inherited or initial value. Keeping the junk string meant
+    // "not none, therefore paint" — six spellings of an invisible shape reported
+    // as `ok`. Dropping the inline declaration lets the presentation attribute
+    // apply, which is what the cascade does; dropping the attribute as well is
+    // what "the declaration never happened" means for the paint itself.
+    if ((prop === 'fill' || prop === 'stroke') && isDroppedPaint(value)) continue;
+    merged[prop] = value;
+  }
+  for (const prop of ['fill', 'stroke']) {
+    if (merged[prop] !== undefined && isDroppedPaint(merged[prop])) delete merged[prop];
+  }
+  return merged;
 }
 
 function indexIds(node, map) {
@@ -338,7 +365,11 @@ function extractSheets(text) {
     attrRe.lastIndex = 0;
     // A CDATA wrapper is transport, not CSS.
     const css = m[2].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '');
-    out.push({ css, type: attrs.type || 'text/css' });
+    // `media="print"` is a media query, and the screen is what the icon is shown
+    // on. The sheet's declarations do not apply at all — silently applying them
+    // painted a shape the render leaves empty.
+    const media = String(attrs.media || '').trim().toLowerCase();
+    out.push({ css, type: attrs.type || 'text/css', media });
     m = re.exec(visible);
   }
   return out;
@@ -411,7 +442,11 @@ function resolveOpacity(raw, fallback) {
   const text = String(raw).trim();
   const pct = /^(-?\d*\.?\d+)%$/.exec(text);
   const value = pct ? Number(pct[1]) / 100 : parseLength(text);
-  return value === null || !Number.isFinite(value) ? fallback : value;
+  if (value === null || !Number.isFinite(value)) return fallback;
+  // Clamped, not merely compared. `opacity="-1"` is out of range and every engine
+  // clamps it to 0 — the shape disappears. Reading the raw value meant `-1 !== 0`,
+  // so the ink stayed on the canvas and the file came back `ok`.
+  return Math.min(Math.max(value, 0), 1);
 }
 
 function fillOpacityOf(attrs, inherited) {
@@ -501,12 +536,44 @@ function strokeWidthOf(attrs, inherited, ctx) {
   return value;
 }
 
+/**
+ * Resolve the CSS-wide keywords a paint declaration may carry.
+ *
+ * `fill` and `stroke` are inherited properties, so `inherit`, `unset` and
+ * `revert` all resolve to the parent's value; only `initial` restores the
+ * property's initial value. Treating the keyword as a colour kept the child
+ * painted: `<g fill="none"><rect fill="inherit"/>` has no ink, and the checker
+ * measured the rectangle as solid because `inherit` is not the string `none`.
+ */
+function paintValue(raw, inheritedValue, initial) {
+  if (raw === undefined) return inheritedValue;
+  if (paintKind(raw) !== 'inherit') return raw;
+  return String(raw).trim().toLowerCase() === 'initial' ? initial : inheritedValue;
+}
+
+/** Does a `<text>` element paint any glyph ink at all? */
+function textPaintsAnything(attrs, inherited) {
+  const fill = paintValue(attrs.fill, inherited.fill, 'black');
+  const stroke = paintValue(attrs.stroke, inherited.stroke, 'none');
+  const fillOff =
+    fill === undefined ||
+    keywordIs(fill, 'none') ||
+    isInvisiblePaint(fill) ||
+    fillOpacityOf(attrs, inherited) <= 0;
+  const strokeOff =
+    stroke === undefined ||
+    keywordIs(stroke, 'none') ||
+    isInvisiblePaint(stroke) ||
+    strokeOpacityOf(attrs, inherited) <= 0;
+  return !(fillOff && strokeOff);
+}
+
 /** Presentation state a node hands to its children. */
 function inheritedFor(attrs, inherited, visible, matrix, ctx) {
   return {
     matrix,
-    fill: attrs.fill !== undefined ? attrs.fill : inherited.fill,
-    stroke: attrs.stroke !== undefined ? attrs.stroke : inherited.stroke,
+    fill: paintValue(attrs.fill, inherited.fill, 'black'),
+    stroke: paintValue(attrs.stroke, inherited.stroke, 'none'),
     strokeWidth: strokeWidthOf(attrs, inherited, ctx),
     fillRule: attrs['fill-rule'] || inherited.fillRule,
     // `fill-opacity` is inherited; `opacity` is not (it composites the group).
@@ -522,9 +589,13 @@ function inheritedFor(attrs, inherited, visible, matrix, ctx) {
 
 /**
  * Resolve `clip-path: url(#id)` to an axis-aligned rect in root user space, or
- * `null` when the clip is anything other than a plain rectangle. Rotations are
- * folded into an AABB, which is a superset of the clip — conservative in the
- * safe direction (it can only produce more refusals, never a wrong measurement).
+ * `null` when the clip is anything other than a plain rectangle.
+ *
+ * A rotated or skewed space is refused. Transforming the rect's four corners and
+ * taking their bounding box produces a **superset** of the clip, and a superset
+ * cannot cut anything — so the test below concludes "the ink fits" for ink the
+ * render actually clips away. That is a wrong number, not a conservative one:
+ * refusing is the only honest answer without a real polygon intersection.
  */
 function resolveClipRect(raw, ctx, matrix) {
   const m = /^\s*url\(\s*#([^)\s]+)\s*\)\s*$/.exec(raw);
@@ -564,6 +635,10 @@ function resolveClipRect(raw, ctx, matrix) {
     applyMatrix(matrix, x + w, y + h),
     applyMatrix(matrix, x, y + h),
   ];
+  // Axis-aligned or flipped only: anything with rotation or skew turns the rect
+  // into a parallelogram, and its bounding box is bigger than the clip.
+  const scale = Math.max(Math.hypot(matrix[0], matrix[1]), Math.hypot(matrix[2], matrix[3]), 1e-12);
+  if (Math.abs(matrix[1]) > 1e-9 * scale || Math.abs(matrix[2]) > 1e-9 * scale) return null;
   const box = bboxOfPoints(corners);
   return box;
 }
@@ -585,15 +660,14 @@ function bboxOfShapes(shapes, steps, ctx) {
     const points = flat.flat().map(([x, y]) => applyMatrix(shape.matrix, x, y));
     if (points.length === 0) continue;
     const localBox = bboxOfPoints(points);
-    let pad = 0;
-    // Under a non-uniform transform the stroke is elliptical; padding by the
-    // larger axis keeps the containment test conservative. A non-scaling stroke
-    // keeps its authored width no matter what the ancestors do.
-    if (shape.stroked) {
-      const strokeScale = shape.nonScalingStroke ? 1 : maxScale(shape.matrix);
-      pad = (shape.strokeWidth * strokeScale) / 2;
-    }
-    box = bboxUnion(box, bboxExpand(localBox, pad));
+    // A stroke widens the shape by half its width, measured along the *transformed*
+    // normal: under `scale(4,1)` the band is 4× wider across x than across y. The
+    // padding therefore has to be per-axis — the single mean scale used to be
+    // lenient in one direction and strict in the other.
+    const pad = shape.stroked
+      ? strokePadding(shape.matrix, shape.strokeWidth, shape.nonScalingStroke)
+      : { x: 0, y: 0 };
+    box = bboxUnion(box, bboxExpandBy(localBox, pad.x, pad.y));
   }
   return box;
 }
@@ -631,8 +705,12 @@ function collect(node, inherited, out, ctx) {
 
   // Ink we can see but cannot measure. Silently treating these as empty would
   // report "the canvas has nothing in it", which is a different — and false —
-  // statement.
+  // statement. Ink that is not painted is a different case again: `<text
+  // fill="none">` draws nothing, and refusing it made a file with one invisible
+  // label unmeasurable.
   if (UNMEASURABLE_INK.has(tag)) {
+    if (!visible) return out;
+    if (tag === 'text' && !textPaintsAnything(attrs, inherited)) return out;
     ctx.unresolved.add(`unsupported-ink:${tag}`);
     return out;
   }
@@ -820,8 +898,13 @@ function collect(node, inherited, out, ctx) {
       } else if (shape.d) {
         const strokeWidth = strokeWidthOf(attrs, inherited, ctx);
         const strokeUnits = Number.isFinite(strokeWidth) ? strokeWidth : 1;
-        const fillPaint = attrs.fill ?? inherited.fill;
-        const strokePaint = attrs.stroke ?? inherited.stroke;
+        const fillPaint = paintValue(attrs.fill, inherited.fill, 'black');
+        const strokePaint = paintValue(attrs.stroke, inherited.stroke, 'none');
+        // A colour function this pass does not model. The shape may paint, or it
+        // may not; that is a gap, not a measurement.
+        for (const paint of [fillPaint, strokePaint]) {
+          if (paint !== undefined && paintKind(paint) === 'unknown') ctx.unresolved.add('unparsed-paint');
+        }
         // `var()` / `env()` name a value defined outside this file. Inheriting
         // the fallback colour would invent ink; ignoring the declaration would
         // delete it. Neither is a measurement, so refuse the drawing.
@@ -976,23 +1059,30 @@ function bboxUnion(a, b) {
 }
 
 function bboxExpand(box, by) {
-  if (!box || by === 0) return box;
+  return bboxExpandBy(box, by, by);
+}
+
+function bboxExpandBy(box, x, y) {
+  if (!box || (x === 0 && y === 0)) return box;
   return {
-    minX: box.minX - by,
-    minY: box.minY - by,
-    maxX: box.maxX + by,
-    maxY: box.maxY + by,
+    minX: box.minX - x,
+    minY: box.minY - y,
+    maxX: box.maxX + x,
+    maxY: box.maxY + y,
   };
 }
 
-function maxScale(matrix) {
-  return Math.max(Math.hypot(matrix[0], matrix[1]), Math.hypot(matrix[2], matrix[3])) || 1;
-}
-
-function uniformScale(matrix) {
-  const sx = Math.hypot(matrix[0], matrix[1]);
-  const sy = Math.hypot(matrix[2], matrix[3]);
-  return (sx + sy) / 2 || 1;
+/**
+ * How far a stroke of `width` reaches past the path, per axis, in root space.
+ *
+ * A round band of radius `r` becomes an ellipse under a linear map, and its
+ * extent along each root axis is `r` times the length of that axis row of the
+ * matrix. A non-scaling stroke keeps `r` no matter what the ancestors do.
+ */
+function strokePadding(matrix, width, nonScaling) {
+  const r = width / 2;
+  if (nonScaling) return { x: r, y: r };
+  return { x: r * Math.hypot(matrix[0], matrix[2]), y: r * Math.hypot(matrix[1], matrix[3]) };
 }
 
 /**
@@ -1142,46 +1232,74 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
     }
     const points = subpaths.flat();
     const localBox = bboxOfPoints(points);
+    // A stray `M0 0` or a bare line inside an otherwise solid path spans a
+    // bounding box and paints nothing. Unioning it into the ink box pulled the box
+    // back to the origin: a 4..20 square came back as 0..20, `off` by 2 units, with
+    // a suggested `viewBox="-2 -2 24 24"` that would have broken a correct icon.
+    const enclosing = subpaths.filter((sub) => enclosesArea(sub));
+    const fillBox = enclosing.length > 0 ? bboxOfPoints(enclosing.flat()) : null;
 
     if (shape.filled) {
       const net = shape.fillRule === 'evenodd' ? netShapeEvenOdd(subpaths) : netShape(subpaths);
-      if (net.selfIntersecting) {
+      // `scale(1e308)` overflows the coordinates: the area is `NaN`, which is not
+      // `> 0`, so the shape was dropped without a reason and the rest of the file
+      // reported `ok`. A number that is not a number is not a measurement.
+      if (!Number.isFinite(net.area) || !Number.isFinite(net.cx) || !Number.isFinite(net.cy)) {
+        ctx.unresolved.add('non-finite-ink');
+        bbox = bboxUnion(bbox, fillBox);
+      } else if (net.selfIntersecting) {
         // A subpath crossing itself paints an area the shoelace formula cannot
         // express. The outline is still real ink, so its box counts even though
         // its area does not.
         ctx.unresolved.add('self-intersecting');
-        bbox = bboxUnion(bbox, localBox);
+        bbox = bboxUnion(bbox, fillBox);
       } else if (net.overlapping) {
         // Partially overlapping outlines need a boolean XOR; refuse rather than
         // report a centroid that may sit outside the artwork.
         ctx.unresolved.add('overlapping-subpaths');
-        bbox = bboxUnion(bbox, localBox);
+        bbox = bboxUnion(bbox, fillBox);
       } else if (net.area > 0) {
         filledArea += net.area;
         filledCx += net.cx * net.area;
         filledCy += net.cy * net.area;
-        bbox = bboxUnion(bbox, localBox);
+        bbox = bboxUnion(bbox, fillBox);
       }
     }
 
     if (shape.stroked) {
-      // A non-scaling stroke keeps its authored width in the viewport space, so
-      // the ancestor scale must not stretch the band: under `scale(4)` a 1-unit
-      // stroke stays 1 unit wide while the path quadruples.
-      const strokeScale = shape.nonScalingStroke ? 1 : uniformScale(shape.matrix);
-      const width = Math.max(shape.strokeWidth * strokeScale, 0.0001);
-      for (const sub of subpaths) {
+      const width = shape.strokeWidth;
+      // The band area is `perimeter × width`, and a linear map scales area by
+      // |det|. The perimeter used here is the **authored** one: the root-space
+      // outline is already stretched along the path's own direction, so pairing it
+      // with a scale factor counted the scale twice — `scale(4,1)` on a 10-unit
+      // square with a 2-unit stroke reported 500 where the band is 4×(40×2)=320.
+      // A non-scaling stroke is the other way round: it keeps its authored width
+      // in root space, so the root-space length is the one to multiply.
+      const perimeter = shape.nonScalingStroke ? subpaths : raw;
+      const det = shape.nonScalingStroke
+        ? 1
+        : Math.abs(shape.matrix[0] * shape.matrix[3] - shape.matrix[1] * shape.matrix[2]);
+      for (const sub of perimeter) {
         for (let i = 1; i < sub.length; i += 1) {
           const [x0, y0] = sub[i - 1];
           const [x1, y1] = sub[i];
           const len = Math.hypot(x1 - x0, y1 - y0);
-          const weight = len * width;
+          const weight = len * width * det;
           strokeArea += weight;
-          strokeMx += ((x0 + x1) / 2) * weight;
-          strokeMy += ((y0 + y1) / 2) * weight;
+          // The centroid has to be reported in root space, so the local segments
+          // are mapped before they are weighted.
+          if (shape.nonScalingStroke) {
+            strokeMx += ((x0 + x1) / 2) * weight;
+            strokeMy += ((y0 + y1) / 2) * weight;
+          } else {
+            const [mx, my] = applyMatrix(shape.matrix, (x0 + x1) / 2, (y0 + y1) / 2);
+            strokeMx += mx * weight;
+            strokeMy += my * weight;
+          }
         }
       }
-      strokeBox = bboxUnion(strokeBox, bboxExpand(localBox, width / 2));
+      const pad = strokePadding(shape.matrix, width, shape.nonScalingStroke);
+      strokeBox = bboxUnion(strokeBox, bboxExpandBy(localBox, pad.x, pad.y));
     }
   }
 
@@ -1270,13 +1388,20 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
     (id) => id === 'invalid-viewBox' || id === 'relative-canvas',
   );
   if (shape.noInk && !canvasInvalid) {
+    // "No ink" and "no measurable ink" point the reader at different things: an
+    // empty canvas is the artwork's problem, an unresolved shape is the checker's.
+    const blocked = (shape.unresolved || []).length > 0;
     findings.push({
       id: 'geometry/no-ink',
       layer: 'exact',
       forcedVerdict: 'unknown',
       pixel: false,
-      evidence: 'no renderable ink was found (empty canvas, unresolved shapes, or only non-rendering nodes)',
-      suggested: { kind: 'inspect', value: 'check the source; the canvas may be empty or use unsupported syntax' },
+      evidence: blocked
+        ? 'nothing could be measured: the ink on this canvas did not resolve (see the unresolved findings)'
+        : 'no renderable ink was found (empty canvas, unresolved shapes, or only non-rendering nodes)',
+      suggested: blocked
+        ? { kind: 'inspect', value: 'resolve the listed features, then re-run' }
+        : { kind: 'inspect', value: 'check the source; the canvas may be empty or use unsupported syntax' },
     });
   }
 

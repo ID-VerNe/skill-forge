@@ -64,7 +64,9 @@ export function parseStyle(value) {
   const decls = {};
   const important = new Set();
   if (!value) return { decls, important };
-  for (const part of String(value).split(';')) {
+  // An inline style is CSS too, comments included: `style="fill:/* x */none"`.
+  const text = String(value).replace(/\/\*[\s\S]*?\*\//g, ' ');
+  for (const part of text.split(';')) {
     const colon = part.indexOf(':');
     if (colon === -1) continue;
     const prop = part.slice(0, colon).trim().toLowerCase();
@@ -132,6 +134,110 @@ const RUNTIME_PAINT = /^(var|env)\s*\(/i;
 
 export function isRuntimePaint(value) {
   return RUNTIME_PAINT.test(String(value ?? '').trim());
+}
+
+/**
+ * What kind of value a `fill`/`stroke` holds.
+ *
+ * The checker used to ask one question — "is this the string `none`?" — and treat
+ * every other answer as paint. That is true for a colour and false for the two
+ * other things a paint declaration can be:
+ *
+ * - **Invalid.** `stroke="notacolor"`, `stroke="3"`, `fill="#12345"`. CSS drops a
+ *   declaration it cannot parse, so the property keeps its initial value: `fill`
+ *   falls back to black (**and still paints**), `stroke` falls back to `none`
+ *   (**and paints nothing**). The shape looked painted either way, so six
+ *   spellings of "no ink" came back `ok` on a blank canvas.
+ * - **Unknowable.** A colour function this module does not model. Refusing is
+ *   honest: the shape may or may not paint.
+ *
+ * `inherit`/`unset`/`revert` hand the value to the parent, and `initial` restores
+ * black/none — those are resolved where the parent's value is known. The keyword
+ * lists are closed sets defined by CSS, so a bare identifier outside them is
+ * genuinely invalid rather than merely unknown to this code.
+ */
+const CSS_WIDE = new Set(['inherit', 'unset', 'revert', 'revert-layer', 'initial']);
+
+const NAMED = new Set(
+  (
+    'aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond blue ' +
+    'blueviolet brown burlywood cadetblue chartreuse chocolate coral cornflowerblue cornsilk ' +
+    'crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen darkgrey darkkhaki ' +
+    'darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon darkseagreen ' +
+    'darkslateblue darkslategray darkslategrey darkturquoise darkviolet deeppink deepskyblue ' +
+    'dimgray dimgrey dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro ghostwhite ' +
+    'gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki ' +
+    'lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan ' +
+    'lightgoldenrodyellow lightgray lightgreen lightgrey lightpink lightsalmon lightseagreen ' +
+    'lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen ' +
+    'magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen ' +
+    'mediumslateblue mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream ' +
+    'mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered orchid ' +
+    'palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum ' +
+    'powderblue purple rebeccapurple red rosybrown royalblue saddlebrown salmon sandybrown ' +
+    'seagreen seashell sienna silver skyblue slateblue slategray slategrey snow springgreen ' +
+    'steelblue tan teal thistle tomato turquoise violet wheat white whitesmoke yellow yellowgreen ' +
+    // CSS system colours are valid paint too, and a checker that forgot them would
+    // call real ink invalid — which for `stroke` means deleting it.
+    'canvas canvastext linktext visitedtext activetext buttonface buttontext buttonborder ' +
+    'field fieldtext highlight highlighttext selecteditem selecteditemtext mark marktext ' +
+    'graytext accentcolor accentcolortext activeborder activecaption appworkspace background ' +
+    'buttonhighlight buttonshadow captiontext inactiveborder inactivecaption inactivecaptiontext ' +
+    'infobackground infotext menu menutext scrollbar threeddarkshadow threedface threedhighlight ' +
+    'threedlightshadow threedshadow window windowframe windowtext'
+  ).split(' '),
+);
+
+const COLOR_FUNCTIONS = new Set([
+  'rgb',
+  'rgba',
+  'hsl',
+  'hsla',
+  'hwb',
+  'lab',
+  'lch',
+  'oklab',
+  'oklch',
+  'color',
+  'color-mix',
+  'light-dark',
+  'device-cmyk',
+]);
+
+const URL_PAINT = /^url\(/i;
+
+/** @returns {'none'|'paint'|'invalid'|'unknown'|'inherit'} */
+export function paintKind(value) {
+  const s = String(value ?? '').trim().toLowerCase();
+  if (s === '') return 'invalid';
+  // `rgb(1,2` is not a colour function with a tail, it is a parse error: CSS
+  // cannot tokenise it, so the declaration is dropped like any other junk.
+  let depth = 0;
+  for (const ch of s) {
+    if (ch === '(') depth += 1;
+    else if (ch === ')') {
+      depth -= 1;
+      if (depth < 0) return 'invalid';
+    }
+  }
+  if (depth !== 0) return 'invalid';
+  if (CSS_WIDE.has(s)) return 'inherit';
+  if (s === 'none') return 'none';
+  if (URL_PAINT.test(s)) return 'paint';
+  if (s === 'currentcolor' || s === 'context-fill' || s === 'context-stroke') return 'paint';
+  if (s === 'transparent') return 'paint';
+  if (s.startsWith('#')) return /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/.test(s) ? 'paint' : 'invalid';
+  const fn = /^([a-z-]+)\s*\(/.exec(s);
+  if (fn) return COLOR_FUNCTIONS.has(fn[1]) ? 'paint' : 'unknown';
+  if (NAMED.has(s)) return 'paint';
+  // A bare identifier that is not a colour keyword is a value CSS cannot parse.
+  if (/^[a-z][a-z0-9-]*$/.test(s)) return 'invalid';
+  return 'invalid';
+}
+
+/** True when the declaration would be dropped by CSS and the initial value wins. */
+export function isDroppedPaint(value) {
+  return paintKind(value) === 'invalid';
 }
 
 /**
@@ -215,6 +321,14 @@ export function cascade(sheets, root) {
       unresolved.add('stylesheet-type');
       continue;
     }
+    // Media queries choose whether a sheet applies at all, and `@media` inside the
+    // body is refused for the same reason. `media="print"` was applied as if every
+    // condition matched.
+    const media = String(sheet.media || 'all').trim().toLowerCase();
+    if (media !== '' && media !== 'all' && media !== 'screen') {
+      unresolved.add('stylesheet-conditional');
+      continue;
+    }
     const parsed = parseCss(sheet.css);
     if (parsed.unresolved) {
       // A mis-split rule is exactly the case where a guess becomes a wrong
@@ -240,6 +354,10 @@ export function cascade(sheets, root) {
           continue;
         }
         if (!PAINT.has(prop)) continue;
+        // A declaration CSS cannot parse never reaches the element, so the next
+        // candidate wins — pushing it as the winner would have hidden the
+        // declaration that actually applies.
+        if ((prop === 'fill' || prop === 'stroke') && isDroppedPaint(value)) continue;
         decls.push([prop, value, important]);
       }
       // A block that only animates still has to reach the node: it decides that

@@ -41,6 +41,41 @@ Two rules keep that pipeline from lying:
   authored width while its path is scaled, so the area is computed from the path
   geometry at scale 1 — under `scale(4)` a 1-unit stroke on a 16-unit perimeter
   covers 64 units, not 256.
+- **A paint value that does not parse is not a colour.** `fill`/`stroke` were
+  asked one question — *is this the string `none`?* — and everything else became
+  paint. CSS drops a declaration it cannot parse and the property keeps its
+  initial value, which is **black for `fill` (still paint)** and **`none` for
+  `stroke` (nothing at all)**. Six spellings of an invisible shape came back `ok`:
+  `stroke="notacolor"`, `stroke="3"`, `fill-opacity="-1"`, `<g opacity="-1">`,
+  `fill="inherit"` under `fill="none"`, and `fill:/* hidden */none` through a
+  class. Opacity is clamped to `[0,1]` the way the spec says, the CSS-wide
+  keywords are resolved against the parent, and comments are whitespace.
+- **Anisotropic scaling multiplies area by |det|.** The band is `perimeter ×
+  width`, and a linear map scales area by the determinant of the matrix. Pairing
+  the already-stretched root-space perimeter with the mean of the two scales
+  counted the scale twice: `scale(4,1)` on a 10-unit square with a 2-unit stroke
+  reported `500` where `4 × (40 × 2)` is `320`. The box pads per axis
+  (`r·hypot(a,c)` and `r·hypot(b,d)`), because the band is an ellipse there.
+- **The ink box is made of ink.** A subpath that encloses nothing — a stray
+  `M0 0`, a bare line — spans a bounding box and paints nothing. Unioning it into
+  the box pulled a correct `4..20` square back to the origin: `off` by 2px, with a
+  `viewBox="-2 -2 24 24"` suggestion that would have broken the icon. Only
+  subpaths that enclose area contribute to a *filled* box; a stroked line is ink
+  and still widens it.
+- **A prefixed tag is the same tag.** `xmlns:svg="…/svg"` makes `<svg:rect>` the
+  same element as `<rect>`. Keeping the prefix missed the shape test, sent the
+  node down the container branch, and deleted its geometry in silence: a
+  400-unit rect measured as 16.
+- **A clip in a rotated space is not a rectangle.** Transforming the clip rect's
+  corners and taking their bounding box yields a *superset*, and a superset cannot
+  cut anything — so the test concludes "the ink fits" for ink the render clips.
+  Rotated and skewed spaces are refused instead.
+- **A number that is not a number is not a measurement.** `scale(1e308)` overflows
+  the coordinates; the shoelace sum is `NaN`, and `NaN > 0` is false, so the shape
+  disappeared without a reason while the rest of the file reported `ok`.
+- **Touching is not overlapping.** Two subpaths that share a region cannot be
+  added (see §1); two that share only an edge or a corner — butted rectangles, a
+  hole meeting its container at a corner — add up exactly and stay measurable.
 - **`visibility` is not `display`.** `visibility:hidden` hides a subtree but
   descendants may set `visibility:visible` and reappear, so the flag is carried
   down the tree and applied per shape instead of pruning the branch.
@@ -63,8 +98,9 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | a `clip-path` whose geometry is not a plain rect, or one that cuts the ink | `geometry/unresolved-graphics` |
 | `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
-| a `transform` with a percentage or unit argument, or with trailing junk | `geometry/unresolved-graphics` (`unparsed-transform`) |
-| a percentage or relative `stroke-width`, on the shape **or any ancestor** | `geometry/unresolved-graphics` (`stroke-width-percentage`, `stroke-width-relative`) |
+| a `transform` with a percentage or unit argument (`translate(10%,8)`, `2em`, `var(--t)`) | `geometry/unresolved-graphics` (`unparsed-transform`) — the value needs a context the file does not carry, and dropping just that argument would silently shift the rest |
+| a `transform` with malformed syntax — wrong argument count, unknown function, empty argument (`translate(10,)`), trailing junk | measured **untransformed**, with no finding — browsers drop the whole attribute, so the element sits in its parent's space |
+| a `stroke-width` in any unit — `10%` (`stroke-width-percentage`), or `2pt` / `1em` / `1in` (`stroke-width-relative`), on the shape **or any ancestor** | `geometry/unresolved-graphics`. The percentage is relative to a viewport the file does not fix, and the absolute units are declined on purpose: `pt`, `pc`, `mm` and `in` would each need a px-per-unit constant, which is a second place to be wrong about the same number. `2px` is accepted — one px *is* one user unit. Write the others in user units |
 | a `stroke-width` that overflows to infinity (`1e999`) | `geometry/unresolved-graphics` (`stroke-width-not-finite`) — one engine clamps it to the largest length and paints over the canvas, another drops the declaration |
 | a `stroke-width` that is finite but whose band area is not (`1e308`) | `geometry/unresolved-graphics` (`non-finite-ink`) — `width × length` overflows to `Infinity` and the centroid comes back `NaN`; `NaN` compares false against every tolerance, so without this check the report reads `off` with a `NaN` displacement instead of admitting it has no measurement |
 | a `d` the path parser rejects or only partially parses | `geometry/unresolved-graphics` (`unparsed-path`) — svgpath reports `M0 0 L` as "missed param" and still returns one point |
@@ -77,11 +113,19 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | a matching rule that declares `animation` / `animation-name` (other than `none`) | `geometry/unresolved-graphics` (`css-animation`) — the paint comes from a `@keyframes` block this pass does not evaluate |
 | `fill` / `stroke` set to `var()` or `env()` | `geometry/unresolved-graphics` (`runtime-paint`) — the value is defined outside the file |
 | `fill` / `stroke` set to `url(#id)` where `#id` is not a paint server | `geometry/unresolved-graphics` (`paint-server`) — no engine paints it, but calling it "no ink" would delete real ink if the tag were one this pass has not heard of |
+| `fill` / `stroke` whose value CSS cannot parse (`notacolor`, `3`, `3px`, `#12345`, `rgb(1,2`) | the declaration is dropped the way a browser drops it: `fill` keeps its initial **black and still paints**, `stroke` keeps its initial **`none` and paints nothing**. Reading the junk as paint put a 128-unit band on a blank canvas |
+| `fill` / `stroke` set to `inherit` / `unset` / `revert` / `initial` | resolved, not measured as a string: the parent's computed value for the first three, `black` (`fill`) or `none` (`stroke`) for `initial` |
+| `fill` / `stroke` with a colour function this pass does not model (`futurecolor(…)`) | `geometry/unresolved-graphics` (`unparsed-paint`) — it may paint or it may not |
+| a CSS comment inside a declaration value (`fill:/* … */none`) | the value is `none`; comments are whitespace |
+| `<style media="print">` — any medium other than `all` or `screen` | `geometry/unresolved-graphics` (`stylesheet-conditional`), and the sheet's declarations are **not** applied |
 | `<?xml-stylesheet?>` pointing at an external sheet | `geometry/unresolved-graphics` (`external-stylesheet`) |
 | animation that moves ink (`animateTransform`, `animateMotion`, `animate` on a geometry attribute, or on `fill`/`stroke`/an opacity reaching zero paint) | `geometry/unresolved-graphics` (`animated-ink`) — one frame is not the drawing |
 | ink that leaves its viewport | `geometry/unresolved-graphics` (`ink-outside-viewport`) — the browser clips it |
 | groups nested more than 200 deep | `geometry/unresolved-graphics` (`nesting-too-deep`) |
 | two subpaths with the same outline | `geometry/unresolved-graphics` (`overlapping-subpaths`) — they cancel under even-odd and render once under nonzero, so the sum is wrong either way |
+| two subpaths that share a region, under either fill rule | `geometry/unresolved-graphics` (`overlapping-subpaths`) — see §1 for why both windings are wrong, and why butted rectangles and corner-touching holes are not this |
+| a `clip-path` reached through a rotated or skewed ancestor | `geometry/unresolved-graphics` (`clip-path`) — the bounding box of a rotated rect is a *superset* of the clip, so "the ink fits" would be answered yes for ink the render cuts away |
+| a shape whose area is not finite (`scale(1e308)` overflowing the coordinates) | `geometry/unresolved-graphics` (`non-finite-ink`) — `NaN` is not `> 0`, so the shape used to vanish without a word while the rest of the file reported `ok` |
 | even-odd outlines that partially overlap | `geometry/unresolved-graphics` (`overlapping-subpaths`) |
 | a subpath that crosses itself over more than 0.1% of its own area | `geometry/unresolved-graphics` (`self-intersecting`) — the shoelace formula integrates the winding number, so a bowtie comes back zero while painting two triangles, and a pentagram comes back 40% too large. Smaller crossings are measured as if they were simple, and the error that introduces is bounded by the tolerance below |
 | two **disjoint** lobes joined at one shared vertex and wound in opposite directions | `geometry/unresolved-graphics` (`self-intersecting`) — nothing crosses, so the test above stays quiet, yet shoelace subtracts one lobe from the other: `M12 12 L4 2 L2 12 L12 12 L16 8 L17 12 Z` measures 40 where the render paints 60. The outline is split at its repeated vertices; same-wound lobes add up, and opposite-wound lobes that overlap are subtracted by the renderer too, so both are measured normally |
@@ -360,10 +404,19 @@ correct.
 **What is still approximate.** Three things, and they are why `off` on
 `geometry/centroid` deserves a second look at the artwork:
 
-1. Partially overlapping outlines. An even-odd XOR needs a boolean polygon
-   operation, so the checker reports `overlapping-subpaths` rather than a
-   centroid that may land outside the artwork. Under `nonzero` a genuine overlap
-   is still summed, which over-counts area.
+1. Outlines that overlap *within* one shape are refused, not summed — under both
+   fill rules. `netShape` groups subpaths by the outline that contains them and
+   compares siblings: a shared vertex is the figure-eight case, a shared edge is
+   two butted rectangles, and neither is interference, but a genuine overlap is.
+   Non-zero makes the two windings wrong in opposite directions. Two solids wound
+   the same way paint their union once while the sum counts the overlap twice
+   (`M2 2H14V14H2Z M8 8H20V20H8Z`: 252 painted, 288 summed). Two *holes* are
+   worse: the overlap comes back to winding −1, so it is painted after all, and
+   both holes had been subtracted in full. A 24-unit square with a 10×10 hole at
+   `4,4` and another at `4.1,4.1` paints `572` at `(12.02, 12.02)`; the formula
+   said `376` at `(13.57, 13.57)` — 35% of the area and 1.5 units of mass. This
+   costs 3 of antd's 834 files, and one of them (`outlined/mail`) was `ok` on a
+   23%-low area with a centroid 33 units off.
 2. Overlap **between shapes**. Each `<path>` is measured on its own and the areas
    are added, so two opaque shapes painted over each other count twice while the
    render paints once. A three-shape shield logo where one path is the same
@@ -372,6 +425,12 @@ correct.
    in the centroid; `geometry/ink-bbox` is unaffected. Catching it needs the same
    boolean machinery as case 1.
 3. The stroke model — joins, caps and dashes are approximated as a swept band.
+   Two consequences worth naming. A thick stroke over-counts its corners, because
+   `perimeter × width` counts each corner square twice: a 10-unit square with a
+   2-unit stroke is `4 × (40 × 2) = 320` by the model and `176` as a ring. And a
+   shape that is both filled and stroked counts the band over its own fill, so
+   `fill="#000" stroke="#000"` on a 16-unit square reports `384` where the union
+   is `324`.
 
 None of these can move `geometry/ink-bbox`, which depends on extreme points only.
 
@@ -605,6 +664,16 @@ codes stay distinct so a broken project never looks like an unverifiable one.
 - No rendering. Font fallback, glyph hinting, sub-pixel positioning and
   `letter-spacing` accumulation are out of scope.
 - Stroke joins, caps and dashes are approximated by a constant-width band.
+- `stroke-width` is only read when it is a bare number or `px`. Absolute units
+  (`pt`, `pc`, `mm`, `cm`, `in`) are refused rather than converted: the px-per-unit
+  constants are a second place to get the same number wrong, and real icon files
+  write user units.
+- A `clip-path` reached through a rotated or skewed ancestor is refused. The
+  bounding box of the rotated rect is a superset of the clip, and using it would
+  answer "the ink fits" for ink the render cuts away.
+- Two subpaths that share a region inside one shape are refused rather than
+  unioned. This costs coverage deliberately: 3 of antd's 834 files, one of which
+  was `ok` on a 23%-low area.
 - Tailwind variant prefixes (`md:`, `dark:hover:`, `supports-[…]:`) are stripped
   before matching, because `hidden md:flex` and `md:flex` describe the same
   container. The consequence is that a variant-qualified `flex` is treated as

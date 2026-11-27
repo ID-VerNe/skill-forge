@@ -67,11 +67,20 @@ function splitDeclarations(body) {
   return out;
 }
 
+/**
+ * Comments are blank space in CSS, including inside a value: `fill:/* … *\/none`
+ * is `fill:none`. The scanner already skips over them to find the semicolons, but
+ * the slice it returns still contained them, so the value looked like an unknown
+ * paint and the shape was measured as solid.
+ */
+const stripComments = (text) =>
+  text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\s+/g, ' ').trim();
+
 function toDecls(chunk) {
   const colon = chunk.indexOf(':');
   if (colon === -1) return null;
-  const prop = chunk.slice(0, colon).trim().toLowerCase();
-  const value = chunk.slice(colon + 1).trim();
+  const prop = stripComments(chunk.slice(0, colon)).toLowerCase();
+  const value = stripComments(chunk.slice(colon + 1));
   if (!prop || !value) return null;
   if (!/^[-a-z][-a-z0-9]*$/.test(prop)) return null;
   return [prop, value];

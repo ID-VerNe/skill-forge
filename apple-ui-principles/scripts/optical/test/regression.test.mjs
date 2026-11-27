@@ -1950,3 +1950,196 @@ test('a > inside an attribute value does not cut the tag', () => {
   );
   near(single.ink.area, 80, 1e-9);
 });
+
+// --- paint validity, not just "is it the string none" -----------------------
+
+test('a paint value CSS cannot parse is dropped, not painted', () => {
+  // An invalid declaration never reaches the element, so `stroke` keeps its
+  // initial value (`none`) and the shape is empty. Reading the junk string as a
+  // colour put a 128-unit band on a canvas the render leaves blank.
+  for (const paint of ['notacolor', '3', '3px', '#12345', 'rgb(1,2', '']) {
+    const shape = analyzeSvg(
+      svg(`<rect x="4" y="4" width="16" height="16" fill="none" stroke="${paint}" stroke-width="2"/>`),
+    );
+    assert.equal(shape.noInk, true, `stroke="${paint}"`);
+  }
+  // `fill` falls back to its initial value, black — which still paints, so the
+  // area is the rectangle either way. The point is that it is not *absent*.
+  const filled = analyzeSvg(svg('<rect x="4" y="4" width="16" height="16" fill="notacolor"/>'));
+  near(filled.ink.area, 256, 1e-9);
+});
+
+test('a colour function this pass does not model is refused, not guessed', () => {
+  const shape = analyzeSvg(svg('<rect width="24" height="24" fill="futurecolor(1 2 3)"/>'));
+  assert.ok(shape.unresolved.includes('unparsed-paint'), JSON.stringify(shape.unresolved));
+});
+
+test('a negative opacity paints nothing, because CSS clamps it to zero', () => {
+  for (const body of [
+    '<rect x="4" y="4" width="16" height="16" fill-opacity="-1"/>',
+    '<g opacity="-1"><rect x="4" y="4" width="16" height="16"/></g>',
+    '<rect x="4" y="4" width="16" height="16" fill="none" stroke="#000" stroke-width="2" stroke-opacity="-1"/>',
+  ]) {
+    const shape = analyzeSvg(svg(body));
+    assert.equal(shape.noInk, true, body);
+  }
+  // Above 1 clamps to 1 and still paints.
+  const opaque = analyzeSvg(svg('<rect x="4" y="4" width="16" height="16" opacity="4"/>'));
+  near(opaque.ink.area, 256, 1e-9);
+});
+
+test('inherit takes the parent paint, which may be none', () => {
+  const empty = analyzeSvg(svg('<g fill="none"><rect x="4" y="4" width="16" height="16" fill="inherit"/></g>'));
+  assert.equal(empty.noInk, true);
+  const solid = analyzeSvg(svg('<g fill="#000"><rect x="4" y="4" width="16" height="16" fill="inherit"/></g>'));
+  near(solid.ink.area, 256, 1e-9);
+  // `initial` restores black for fill and none for stroke.
+  const initial = analyzeSvg(
+    svg('<g fill="none"><rect x="4" y="4" width="16" height="16" fill="initial"/></g>'),
+  );
+  near(initial.ink.area, 256, 1e-9);
+  const stroked = analyzeSvg(
+    svg('<g stroke="#000"><rect x="4" y="4" width="16" height="16" fill="none" stroke="initial" stroke-width="2"/></g>'),
+  );
+  assert.equal(stroked.noInk, true);
+});
+
+test('a CSS comment inside a value is whitespace', () => {
+  const shape = analyzeSvg(svg('<style>.a{fill:/* hidden */none}</style><rect class="a" x="4" y="4" width="16" height="16"/>'));
+  assert.equal(shape.noInk, true);
+  // The same in an inline style, which is CSS too.
+  const inline = analyzeSvg(svg('<rect x="4" y="4" width="16" height="16" style="fill:/* x */none"/>'));
+  assert.equal(inline.noInk, true);
+});
+
+test('a stylesheet for another medium does not paint', () => {
+  const shape = analyzeSvg(
+    svg('<style media="print">.a{fill:#000}</style><rect class="a" x="4" y="4" width="16" height="16" fill="none"/>'),
+  );
+  assert.equal(shape.noInk, true);
+  assert.ok(shape.unresolved.includes('stylesheet-conditional'), JSON.stringify(shape.unresolved));
+  // `media="screen"` applies.
+  const screen = analyzeSvg(
+    svg('<style media="screen">.a{fill:#000}</style><rect class="a" x="4" y="4" width="16" height="16" fill="none"/>'),
+  );
+  near(screen.ink.area, 256, 1e-9);
+});
+
+// --- the ink box is made of ink --------------------------------------------
+
+test('a subpath that encloses nothing does not stretch the ink box', () => {
+  // A stray `M0 0` or a bare line spans a box and paints nothing. It used to be
+  // unioned into the ink box, which pulled a correct 4..20 square back to the
+  // origin: `off` by 2px, with a `viewBox="-2 -2 24 24"` suggestion that would
+  // have broken the icon.
+  for (const extra of ['M0 0', 'M1 1 L2 1', 'M1 1 L2 2']) {
+    const shape = analyzeSvg(svg(`<path d="M4 4 H20 V20 H4 Z ${extra}"/>`));
+    assert.deepEqual(shape.unresolved, [], extra);
+    near(shape.ink.area, 256, 1e-9);
+    near(shape.ink.bbox.minX, 4, 1e-9);
+    near(shape.ink.bbox.maxX, 20, 1e-9);
+    const report = checkShape(shape, { mode: 'standalone', target: 'stray.svg' });
+    assert.equal(report.verdict, 'ok', `${extra}: ${JSON.stringify(report.findings)}`);
+  }
+  // A stroked bare line *is* ink and still widens the box.
+  const stroked = analyzeSvg(svg('<path d="M4 4 H20 V20 H4 Z M1 1 L2 2" fill="none" stroke="#000" stroke-width="2"/>'));
+  near(stroked.ink.bbox.minX, 0, 1e-6);
+});
+
+test('a prefixed element is the element, not an invisible container', () => {
+  // `xmlns:svg="…/svg"` makes `<svg:rect>` the same node as `<rect>`. Keeping the
+  // prefix meant the shape test missed and the geometry vanished silently: 400
+  // units² became 16.
+  const prefixed = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" xmlns:svg="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+      + '<svg:rect x="2" y="2" width="20" height="20"/></svg>',
+  );
+  assert.deepEqual(prefixed.unresolved, []);
+  near(prefixed.ink.area, 400, 1e-9);
+  near(prefixed.ink.bbox.minX, 2, 1e-9);
+});
+
+// --- outlines that share a region are not additive -------------------------
+
+test('sibling outlines that overlap are refused, in both windings', () => {
+  // Two holes offset by 0.1: the overlap comes back to winding −1, so it is
+  // painted and both holes were subtracted in full. 572 units² at (12.02, 12.02)
+  // measured as 376 at (13.57, 13.57).
+  const holes = analyzeSvg(svg('<path d="M0 0H24V24H0Z M4 4V14H14V4Z M4.1 4.1V14.1H14.1V4.1Z"/>'));
+  assert.ok(holes.unresolved.includes('overlapping-subpaths'), JSON.stringify(holes.unresolved));
+  // Two solids wound the same way paint their union once; the sum counts the
+  // overlap twice (252 painted, 288 summed).
+  const solids = analyzeSvg(svg('<path d="M2 2H14V14H2Z M8 8H20V20H8Z"/>'));
+  assert.ok(solids.unresolved.includes('overlapping-subpaths'), JSON.stringify(solids.unresolved));
+});
+
+test('outlines that merely touch stay measurable', () => {
+  // Butted rectangles share an edge and add up correctly; refusing them would
+  // cost every icon drawn as two halves.
+  const butted = analyzeSvg(svg('<path d="M2 2H12V22H2Z M12 2H22V22H12Z"/>'));
+  assert.deepEqual(butted.unresolved, []);
+  near(butted.ink.area, 400, 1e-9);
+  // A hole touching its container at one corner subtracts (382, not 418).
+  const corner = analyzeSvg(svg('<path d="M0 0 H20 V20 H0 Z M0 0 V6 L6 0 Z"/>'));
+  assert.deepEqual(corner.unresolved, []);
+  near(corner.ink.area, 382, 1e-9);
+});
+
+// --- transforms that promise more than they can deliver --------------------
+
+test('a non-uniform scale scales the stroke band by the area factor', () => {
+  // Band area is `perimeter × width`, and a linear map scales area by |det|. The
+  // old code multiplied the already-stretched perimeter by the mean scale, which
+  // counted the scale twice: 500 where 4 × (40 × 2) = 320.
+  const shape = analyzeSvg(
+    svg('<rect x="2" y="7" width="10" height="10" fill="none" stroke="#000" stroke-width="2" transform="scale(4,1)"/>'),
+  );
+  near(shape.ink.area, 320, 1e-6);
+  // The band is 4× wider across x than across y, so the box pads per axis.
+  near(shape.ink.bbox.minX, 4, 1e-6);
+  near(shape.ink.bbox.maxX, 52, 1e-6);
+  near(shape.ink.bbox.minY, 6, 1e-6);
+  near(shape.ink.bbox.maxY, 18, 1e-6);
+});
+
+test('a clip in a rotated space is refused, not widened', () => {
+  // The bounding box of a rotated rect is a *superset* of the clip, so "does the
+  // ink fit" answers yes for ink the render cuts away.
+  const shape = analyzeSvg(
+    '<svg viewBox="0 0 10 10"><defs><clipPath id="c"><rect width="10" height="10"/></clipPath></defs>'
+      + '<g transform="rotate(45 5 5)"><g clip-path="url(#c)"><rect x="-2" y="4" width="4" height="4"/></g></g></svg>',
+  );
+  assert.ok(shape.unresolved.includes('clip-path'), JSON.stringify(shape.unresolved));
+  // An axis-aligned ancestor still resolves.
+  const plain = analyzeSvg(
+    '<svg viewBox="0 0 10 10"><defs><clipPath id="c"><rect width="10" height="10"/></clipPath></defs>'
+      + '<g clip-path="url(#c)"><rect x="2" y="2" width="4" height="4"/></g></svg>',
+  );
+  assert.deepEqual(plain.unresolved, []);
+  near(plain.ink.area, 16, 1e-9);
+});
+
+test('a shape whose area overflows is refused, not silently dropped', () => {
+  // `scale(1e308)` makes the shoelace sum NaN, and NaN is not `> 0`, so the shape
+  // disappeared without a reason while the rest of the file reported `ok`.
+  const shape = analyzeSvg(
+    svg('<g transform="scale(1e308)"><rect x="4" y="4" width="16" height="16"/></g>'
+      + '<rect x="4" y="4" width="16" height="16"/>'),
+  );
+  assert.ok(shape.unresolved.includes('non-finite-ink'), JSON.stringify(shape.unresolved));
+});
+
+test('invisible text is not unmeasurable ink', () => {
+  // `<text fill="none">` paints nothing, so refusing it made a file with one
+  // invisible label unmeasurable.
+  const shape = analyzeSvg(svg('<text x="2" y="20" fill="none">hi</text><rect x="4" y="4" width="16" height="16"/>'));
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 256, 1e-9);
+  // Visible text is still refused: it is ink this pass cannot measure.
+  const visible = analyzeSvg(svg('<text x="2" y="20">hi</text><rect x="4" y="4" width="16" height="16"/>'));
+  assert.ok(visible.unresolved.includes('unsupported-ink:text'), JSON.stringify(visible.unresolved));
+  const hidden = analyzeSvg(
+    svg('<text x="2" y="20" visibility="hidden">hi</text><rect x="4" y="4" width="16" height="16"/>'),
+  );
+  assert.deepEqual(hidden.unresolved, []);
+});

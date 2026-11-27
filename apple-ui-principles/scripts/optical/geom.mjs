@@ -246,6 +246,7 @@ function selfCrossingMatters(poly, area) {
  */
 function cancelsToNothing(poly, sceneArea) {
   if (Math.abs(subpathSignedArea(poly)) >= 1e-12) return false;
+  if (!enclosesArea(poly)) return false;
   const box = bboxOfPoints(poly);
   if (!box) return false;
   const span = (box.maxX - box.minX) * (box.maxY - box.minY);
@@ -254,6 +255,53 @@ function cancelsToNothing(poly, sceneArea) {
   // antd's outlined Chrome has a 1.98-unit² over-and-back on an 832-unit canvas.
   // Refusing those would drop the whole logo for a rounding error.
   return span > SELF_CROSSING_TOLERANCE * Math.max(sceneArea, 1e-9);
+}
+
+/**
+ * Does this outline enclose any area at all?
+ *
+ * A zero shoelace total means one of two very different things: a figure-eight
+ * whose lobes cancel (`encloses` nothing by the sum, paints both), or a path with
+ * no enclosed area whatsoever — `M1 1 L2 2`, a single straight segment. The
+ * segment spans a bounding box, so the "cancellation" test fired on it and threw
+ * away an entire glyph whose neighbour was a perfectly solid square. Area that no
+ * region can be attributed to is not cancellation, so the lobes have to be real
+ * before the sum is allowed to mean anything.
+ *
+ * The test is a collapse check rather than a perimeter integral: after removing
+ * repeated points, the outline must contain three points that are not collinear.
+ */
+export function enclosesArea(poly) {
+  const box = bboxOfPoints(poly);
+  if (!box) return false;
+  const extent = Math.max(box.maxX - box.minX, box.maxY - box.minY, 1);
+  const eps = 1e-9 * extent;
+  const pts = [];
+  for (const point of poly) {
+    const last = pts[pts.length - 1];
+    if (last && Math.hypot(point[0] - last[0], point[1] - last[1]) <= eps) continue;
+    pts.push(point);
+  }
+  if (pts.length < 3) return false;
+  const [ax, ay] = pts[0];
+  // The farthest point from the first gives a reliable baseline; collinearity is
+  // then the perpendicular distance of every other point from that line.
+  let far = -1;
+  let farDist = 0;
+  for (let i = 1; i < pts.length; i += 1) {
+    const d = Math.hypot(pts[i][0] - ax, pts[i][1] - ay);
+    if (d > farDist) {
+      farDist = d;
+      far = i;
+    }
+  }
+  if (far === -1 || farDist <= eps) return false;
+  const [bx, by] = pts[far];
+  for (const [px, py] of pts) {
+    const cross = Math.abs((bx - ax) * (py - ay) - (by - ay) * (px - ax));
+    if (cross / farDist > eps) return true;
+  }
+  return false;
 }
 
 /**
@@ -337,15 +385,30 @@ function selfTouchingLoopsMatter(points, sceneArea) {
  * that is the figure-eight.
  */
 function interiorsOverlap(a, b) {
+  if (interiorsStrictlyOverlap(a, b)) return true;
+  // Edge midpoints, not endpoints: a shared vertex is allowed, a shared edge is
+  // not, and a midpoint of a shared edge lies on the other outline's boundary.
+  const span = Math.max(a.box.maxX - a.box.minX, a.box.maxY - a.box.minY, 1);
+  const eps = 1e-9 * span;
+  return sharesEdge(a.pts, b.pts, eps) || sharesEdge(b.pts, a.pts, eps);
+}
+
+/**
+ * Do two closed loops share a region — as opposed to merely touching?
+ *
+ * A shared vertex is not a shared region (the figure-eight), and neither is a
+ * shared edge (two rectangles butted together paint their own areas and nothing
+ * more; a retraced edge is the same arrangement inside one outline). What is not
+ * additive is a genuine overlap, and that shows up either as a vertex of one
+ * loop inside the other or as two boundaries crossing.
+ */
+function interiorsStrictlyOverlap(a, b) {
   if (!boxesIntersect(a.box, b.box)) return false;
   const span = Math.max(a.box.maxX - a.box.minX, a.box.maxY - a.box.minY, 1);
   const eps = 1e-9 * span;
   for (const p of a.pts) if (classifyPoint(p, b.pts, eps) === 'inside') return true;
   for (const p of b.pts) if (classifyPoint(p, a.pts, eps) === 'inside') return true;
-  if (outlinesCross(a.pts, b.pts)) return true;
-  // Edge midpoints, not endpoints: a shared vertex is allowed, a shared edge is
-  // not, and a midpoint of a shared edge lies on the other outline's boundary.
-  return sharesEdge(a.pts, b.pts, eps) || sharesEdge(b.pts, a.pts, eps);
+  return outlinesCross(a.pts, b.pts);
 }
 
 function sharesEdge(a, b, eps) {
@@ -469,6 +532,38 @@ export function netShape(subpaths) {
     }
     return nearest;
   });
+
+  // Sibling outlines that share a region are not additive, and refusing is the
+  // only honest answer: non-zero paint needs the union of two overlapping
+  // outlines, which is a boolean operation.
+  //
+  // Both windings are wrong, in opposite directions. Two solids wound the same
+  // way paint their union once while the sum counts the overlap twice — `M2 2H14
+  // V14H2Z M8 8H20V20H8Z` is 252 units² of ink and 288 by the formula. Two holes
+  // wound as holes are worse: the overlap comes back to winding −1, so it *is*
+  // painted, and both holes were subtracted in full. A 24-unit square with a 10×10
+  // hole at 4,4 and another at 4.1,4.1 paints 572 units² at centroid (12.02,
+  // 12.02) — the formula said 376 at (13.57, 13.57), a 35% area error and a
+  // 1.5-unit mass shift on the number the verdict is built from.
+  //
+  // Touching is not overlapping, which is why the test is strict: butted
+  // rectangles and the corner-touching hole add up correctly.
+  const siblings = new Map();
+  for (const [index] of subpaths.entries()) {
+    if (!enclosesArea(subpaths[index])) continue;
+    const key = parentOf[index];
+    if (!siblings.has(key)) siblings.set(key, []);
+    siblings.get(key).push(index);
+  }
+  for (const group of siblings.values()) {
+    for (let a = 0; a < group.length; a += 1) {
+      for (let b = a + 1; b < group.length; b += 1) {
+        const one = { pts: subpaths[group[a]], box: boxes[group[a]] };
+        const two = { pts: subpaths[group[b]], box: boxes[group[b]] };
+        if (interiorsStrictlyOverlap(one, two)) return { area: 0, cx: 0, cy: 0, overlapping: true };
+      }
+    }
+  }
 
   const fill = (winding) => (winding !== 0 ? 1 : 0);
   // Iterative on purpose: the chain is as deep as the artwork nests, and a

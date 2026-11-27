@@ -136,6 +136,9 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | `icon.svg` that animates, or draws outside its viewport | — | `unknown`: one frame is not the drawing, and the browser clips the rest |
 | `icon.svg` with `mask`/`filter`/`marker-*` (attribute, `style` or class) | — | `unknown`: mask and filter rewrite the painted region, a marker draws a shape of its own outside the path |
 | `icon.svg` with `fill="url(#missing)"` | — | measured as no ink: SVG leaves the element unrendered. A reference to a gradient or pattern is measured normally — colour is not area. Flatten these to shapes if the verdict matters |
+| `icon.svg` whose subpaths overlap *within one shape* | — | `unknown`: `overlapping-subpaths`. Summing them over-counts one winding and under-counts the other, and a union needs a boolean operation the checker does not have. Split the artwork into separate shapes if the verdict matters |
+| `icon.svg` with a `fill`/`stroke` value CSS cannot parse (`notacolor`, `3`, `#12345`) | — | treated as a browser treats it: `fill` falls back to black **and still paints**, `stroke` falls back to `none` **and paints nothing**. Write the value you mean |
+| `icon.svg` with `--mode inline` | `inline` | `unknown`: the optical gutter needs a sibling text node, and the CLI has no way to hand one over. Use `standalone` |
 | `icons/` (dir) | `keyline` | fill-ratio outliers across the set (needs ≥3 icons of one family) |
 | `styles.css` | rule | `text-box` in flex/grid, hard-coded nudges |
 | `Button.tsx` | rule | same, plus concentric radii from the element tree |
@@ -146,6 +149,12 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | `nudge` | 0 | measurable offset, acceptable band | adopt the suggestion, do not block |
 | `off` | 1 | certain defect | fix it |
 | `unknown` | 2 | context missing (display, parent, font, unmeasurable ink, relative units) | report the gap; **never guess** |
+
+`ok` is a claim about *this measurement*, not a certificate that the asset is
+optically perfect. Three deliberate approximations survive inside it — several
+`<path>`s painted over each other, dashes (`stroke-dasharray`), and a stroke under
+a non-uniform scale. On those, read `ok` as "nothing measurable was wrong" and
+look at the artwork. `optical-model.md` §1 lists the numbers.
 
 Two rules that make the output trustworthy:
 
