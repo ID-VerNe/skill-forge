@@ -409,6 +409,10 @@ function fillOpacityOf(attrs, inherited) {
   return resolveOpacity(attrs['fill-opacity'], inherited.fillOpacity ?? 1);
 }
 
+function strokeOpacityOf(attrs, inherited) {
+  return resolveOpacity(attrs['stroke-opacity'], inherited.strokeOpacity ?? 1);
+}
+
 /**
  * `stroke-width` is in user units, or a percentage of the viewport diagonal —
  * which needs a rendered viewport we do not have. Refuse the percentage rather
@@ -428,6 +432,12 @@ function strokeWidthOf(attrs, inherited, ctx) {
     ctx.unresolved.add('stroke-width-relative');
     return inherited.strokeWidth;
   }
+  if (value < 0) {
+    // A negative width is an invalid declaration: browsers drop it, so the
+    // element falls back to the inherited value rather than drawing a band of
+    // absolute width in the opposite direction.
+    return inherited.strokeWidth;
+  }
   return value;
 }
 
@@ -441,6 +451,9 @@ function inheritedFor(attrs, inherited, visible, matrix, ctx) {
     fillRule: attrs['fill-rule'] || inherited.fillRule,
     // `fill-opacity` is inherited; `opacity` is not (it composites the group).
     fillOpacity: resolveOpacity(attrs['fill-opacity'], inherited.fillOpacity),
+    // `stroke-opacity` inherits the same way, and a fully transparent stroke
+    // paints nothing — counting its band invents ink the render does not have.
+    strokeOpacity: strokeOpacityOf(attrs, inherited),
     visible,
     viewport: inherited.viewport,
     level: (inherited.level || 0) + 1,
@@ -742,6 +755,7 @@ function collect(node, inherited, out, ctx) {
         ctx.unresolved.add('unparsed-shape');
       } else if (shape.d) {
         const strokeWidth = strokeWidthOf(attrs, inherited, ctx);
+        const strokeUnits = Number.isFinite(strokeWidth) ? strokeWidth : 1;
         const fillPaint = attrs.fill ?? inherited.fill;
         const strokePaint = attrs.stroke ?? inherited.stroke;
         // `var()` / `env()` name a value defined outside this file. Inheriting
@@ -759,11 +773,15 @@ function collect(node, inherited, out, ctx) {
             !keywordIs(fillPaint, 'none') &&
             !isInvisiblePaint(fillPaint) &&
             fillOpacityOf(attrs, inherited) !== 0,
+          // `stroke-width: 0` and `stroke-opacity: 0` both draw nothing; the
+          // band would otherwise be invented from a stroke the render omits.
           stroked:
             strokePaint !== undefined &&
             !keywordIs(strokePaint, 'none') &&
-            !isInvisiblePaint(strokePaint),
-          strokeWidth: Number.isFinite(strokeWidth) ? strokeWidth : 1,
+            !isInvisiblePaint(strokePaint) &&
+            strokeOpacityOf(attrs, inherited) !== 0 &&
+            strokeUnits !== 0,
+          strokeWidth: strokeUnits,
           // Even `fill-rule` is inherited, and an inherited `evenodd` changes the
           // area of every child path.
           fillRule: (attrs['fill-rule'] || inherited.fillRule || 'nonzero').toLowerCase(),

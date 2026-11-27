@@ -21,6 +21,13 @@ Two rules keep that pipeline from lying:
   `pattern`, `marker`, `linearGradient`, `radialGradient`, `filter`, `style`,
   `title`, `desc`, `metadata` are skipped entirely, as are subtrees carrying
   `display:none` or `opacity:0`.
+- **A stroke that draws nothing is not a hairline.** `stroke-width:0` and
+  `stroke-opacity:0` both leave the canvas empty, so the band is not counted —
+  a `Math.max(width, 0.0001)` floor would otherwise manufacture a few thousands
+  of a pixel of ink and hand back `ok` for an empty drawing. A translucent
+  stroke *is* ink: only the alpha changes, not the band. A negative width is an
+  invalid declaration, which browsers drop, so the element inherits its parent's
+  width instead of drawing in the opposite direction.
 - **`visibility` is not `display`.** `visibility:hidden` hides a subtree but
   descendants may set `visibility:visible` and reappear, so the flag is carried
   down the tree and applied per shape instead of pruning the branch.

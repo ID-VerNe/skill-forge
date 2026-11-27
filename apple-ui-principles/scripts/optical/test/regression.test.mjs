@@ -1490,6 +1490,42 @@ test('fill="transparent" is a declaration of no ink', () => {
   assert.equal(stroked.noInk, true);
 });
 
+test('a stroke that draws nothing is not a hairline', () => {
+  // `stroke-width: 0` and `stroke-opacity: 0` both paint nothing. Counting the
+  // band anyway gives the drawing a centroid it does not have — a `ok` on an
+  // empty canvas, which is the one verdict that must never be invented.
+  const nothing = [
+    'stroke-width="0"',
+    'style="stroke-width:0"',
+    'stroke-opacity="0"',
+    'stroke-opacity="0%"',
+  ];
+  for (const attr of nothing) {
+    const shape = analyzeSvg(
+      svg(`<rect x="2" y="2" width="20" height="20" fill="none" stroke="#000" ${attr}/>`),
+    );
+    assert.equal(shape.noInk, true, attr);
+  }
+  // Inherited, not just local.
+  const group = analyzeSvg(
+    svg('<g stroke-opacity="0"><rect width="24" height="24" fill="none" stroke="#000" stroke-width="2"/></g>'),
+  );
+  assert.equal(group.noInk, true);
+
+  // A translucent stroke is still ink: the band is there, only fainter.
+  const faint = analyzeSvg(
+    svg('<rect width="24" height="24" fill="none" stroke="#000" stroke-width="2" stroke-opacity="0.5"/>'),
+  );
+  near(faint.ink.area, 24 * 4 * 2, 1e-6);
+
+  // A negative width is an invalid declaration — the browser drops it and the
+  // element inherits 1 rather than drawing 4 units of band backwards.
+  const negative = analyzeSvg(
+    svg('<rect width="24" height="24" fill="none" stroke="#000" stroke-width="-4"/>'),
+  );
+  near(negative.ink.area, 24 * 4 * 1, 1e-6);
+});
+
 test('a paint that resolves at runtime is refused, not guessed', () => {
   for (const paint of ['var(--icon-fill)', 'env(safe-area-inset-top, #000)']) {
     const report = checkShape(analyzeSvg(svg(`<rect width="24" height="24" fill="${paint}"/>`)), {
