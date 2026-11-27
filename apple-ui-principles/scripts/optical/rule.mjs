@@ -275,10 +275,16 @@ function extractLiterals(expr, out = []) {
   return out;
 }
 
+const STRIP_LITERALS = /'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`/g;
+const CLASS_HELPERS = /\b(?:clsx|cn|classnames|classNames|twMerge|twJoin|cva)\b/g;
+
 /**
- * Class tokens plus whether the set is conditional. `clsx(a ? 'flex' : 'block')`
- * describes two mutually exclusive worlds; asserting one of them would be a
- * guess, so callers degrade such findings to `unknown`.
+ * Class tokens plus whether the set is conditional.
+ *
+ * Deciding ambiguity by blacklist is a losing game (`?:` then `&&` then `+`…),
+ * so this works the other way round: strip everything that is provably static —
+ * string literals, Tailwind arbitrary values, known class helpers, punctuation —
+ * and if anything that looks like code remains, the set is conditional.
  */
 export function classInfo(expr) {
   if (!expr) return { tokens: [], ambiguous: false };
@@ -287,7 +293,15 @@ export function classInfo(expr) {
     .split(/\s+/)
     .map((t) => t.trim())
     .filter(Boolean);
-  const ambiguous = /[?]|(\|\|)|(\?\?)|(\$\{)/.test(expr);
+
+  const interpolated = expr.includes('${');
+  const residual = expr
+    .replace(STRIP_LITERALS, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(CLASS_HELPERS, ' ')
+    .replace(/[\s(),.[\]]/g, '');
+
+  const ambiguous = interpolated || /[?&|+]|[\w$]/.test(residual);
   return { tokens, ambiguous };
 }
 
@@ -303,19 +317,55 @@ function nearestParent(stack) {
   return null;
 }
 
+/** `<` only starts a tag when what follows looks like one. */
+function isTagStart(text, lt) {
+  const ch = text[lt + 1];
+  if (ch === undefined) return false;
+  if (!/[A-Za-z/!>]/.test(ch)) return false;
+  // `a < b`, `1 < 2`, `'x' < y` — a comparison, not markup
+  const prev = text[lt - 1];
+  if (prev && /[\w$)\]'"]/.test(prev)) return false;
+  return true;
+}
+
+function nextTagStart(text, from) {
+  let i = from;
+  for (;;) {
+    const lt = text.indexOf('<', i);
+    if (lt === -1) return -1;
+    if (isTagStart(text, lt)) return lt;
+    i = lt + 1;
+  }
+}
+
+/** Expressions whose whole content cannot contain live JSX. */
+function isOpaqueExpression(body) {
+  const t = body.trim();
+  return (
+    t.startsWith('/*') ||
+    t.startsWith('//') ||
+    t.startsWith("'") ||
+    t.startsWith('"') ||
+    t.startsWith('`')
+  );
+}
+
 export function parseJsx(text) {
   const elements = [];
   const stack = [];
   let i = 0;
 
   while (i < text.length) {
-    // JSX comments contain markup that must not be treated as live code.
-    const comment = text.indexOf('{/*', i);
-    const lt = text.indexOf('<', i);
-    if (comment !== -1 && (lt === -1 || comment < lt)) {
-      const end = text.indexOf('*/}', comment);
-      i = end === -1 ? text.length : end + 3;
-      continue;
+    const brace = text.indexOf('{', i);
+    const lt = nextTagStart(text, i);
+
+    // A text expression (`{'<div>'}`) or a comment never opens a tag.
+    if (brace !== -1 && (lt === -1 || brace < lt)) {
+      const balanced = readBalanced(text, brace, '{', '}');
+      if (balanced && isOpaqueExpression(text.slice(brace + 1, balanced.end))) {
+        i = balanced.end + 1;
+        continue;
+      }
     }
     if (lt === -1) break;
 
@@ -398,11 +448,13 @@ export function parseJsx(text) {
 function tailwindRadius(token) {
   if (!token.startsWith('rounded')) return null;
   const suffix = token.slice('rounded'.length);
-  if (suffix !== '' && !suffix.startsWith('-')) return null;
-  const key = suffix.replace(/^-/, '');
-  if (key.includes('-')) return null; // side-specific radii are out of scope
-  if (!(key in RADIUS_SCALE)) return null;
-  return RADIUS_SCALE[key];
+  if (suffix === '') return RADIUS_SCALE[''];
+  if (!suffix.startsWith('-')) return null;
+  const key = suffix.slice(1);
+  // `rounded-` (an interpolated class) and side-specific radii are not a
+  // uniform corner radius.
+  if (!key || key.includes('-')) return null;
+  return key in RADIUS_SCALE ? RADIUS_SCALE[key] : null;
 }
 
 function tailwindPadding(token, axis = '') {

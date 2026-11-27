@@ -175,6 +175,35 @@ function classifyPoint(point, polygon, eps) {
   return pointInPolygon(point, polygon) ? 'inside' : 'outside';
 }
 
+/** Orientation sign of the triplet p→q→r (0 for collinear). */
+function orientation([px, py], [qx, qy], [rx, ry]) {
+  const value = (qy - py) * (rx - qx) - (qx - px) * (ry - qy);
+  if (Math.abs(value) < 1e-9) return 0;
+  return Math.sign(value);
+}
+
+/** True only for a proper crossing; touching endpoints do not count. */
+function properlyCrosses([a1, a2], [b1, b2]) {
+  const o1 = orientation(a1, a2, b1);
+  const o2 = orientation(a1, a2, b2);
+  const o3 = orientation(b1, b2, a1);
+  const o4 = orientation(b1, b2, a2);
+  return o1 * o2 < 0 && o3 * o4 < 0;
+}
+
+function outlinesCross(a, b) {
+  for (let i = 0; i < a.length; i += 1) {
+    const a1 = a[i];
+    const a2 = a[(i + 1) % a.length];
+    for (let j = 0; j < b.length; j += 1) {
+      const b1 = b[j];
+      const b2 = b[(j + 1) % b.length];
+      if (properlyCrosses([a1, a2], [b1, b2])) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Net fill under the even-odd rule. Winding direction is irrelevant: a subpath
  * nested an odd number of levels deep is a hole, two levels deep is solid
@@ -197,6 +226,15 @@ export function netShapeEvenOdd(subpaths) {
 
   const containers = items.map(() => 0);
   let overlapping = false;
+
+  for (let i = 0; i < items.length; i += 1) {
+    for (let j = i + 1; j < items.length; j += 1) {
+      // Crossing outlines are never a nesting relation, even when no vertex of
+      // one lands inside the other (a plus sign, for instance).
+      if (outlinesCross(items[i].sub, items[j].sub)) overlapping = true;
+    }
+  }
+
   for (let i = 0; i < items.length; i += 1) {
     for (let j = 0; j < items.length; j += 1) {
       if (i === j) continue;

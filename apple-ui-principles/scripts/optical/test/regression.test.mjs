@@ -366,3 +366,63 @@ test('fragments are transparent in the element tree', () => {
   const f = report.findings.find((x) => x.id === 'rule/non-concentric-radius');
   assert.ok(f, JSON.stringify(report.findings, null, 2));
 });
+
+// --- round 3: crossing outlines, comparison operators, && conditions --------
+
+test('evenodd outlines that cross without containing a vertex are refused', () => {
+  const shape = analyzeSvg(svg('<path fill-rule="evenodd" d="M2 6 H22 V10 H2 Z M12 2 H18 V22 H12 Z"/>'));
+  const report = checkShape(shape, { mode: 'standalone', target: 'plus.svg' });
+  assert.equal(report.verdict, 'unknown');
+  assert.match(report.findings.map((f) => f.evidence).join(' '), /overlapping-subpaths/);
+});
+
+test('a comparison inside children does not swallow the rest of the file', () => {
+  const tsx = `<>
+  <div className="rounded-xl p-2"><span className="rounded" /></div>
+  <div>{a < b}</div>
+  <div className="flex text-box-trim"><span /></div>
+</>`;
+  const report = checkTsx(tsx, { target: 'compare.tsx' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+  assert.equal(f.verdict, 'off');
+});
+
+test('&& conditions are as conditional as ternary branches', () => {
+  const tsx = `<div className={clsx('flex', enabled && 'text-box-trim')} />`;
+  const report = checkTsx(tsx, { target: 'and.tsx' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+  assert.equal(f.verdict, 'unknown');
+});
+
+test('a string literal containing markup is not an element', () => {
+  const tsx = `<div className="rounded-xl p-2">
+  {'<div className="rounded-none">'}
+  <span className="rounded" />
+</div>`;
+  const report = checkTsx(tsx, { target: 'literal.tsx' });
+  assert.equal(
+    report.findings.filter((f) => f.id === 'rule/non-concentric-radius').length,
+    0,
+    JSON.stringify(report.findings, null, 2),
+  );
+});
+
+test('a question mark inside a static arbitrary value is not a condition', () => {
+  const tsx = `<div className="flex text-box-trim [content:'?']"><span /></div>`;
+  const report = checkTsx(tsx, { target: 'arbitrary.tsx' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+  assert.equal(f.verdict, 'off');
+});
+
+test('an interpolated radius fragment is not rounded-*', () => {
+  const tsx = `<div className="rounded-xl p-1"><span className={'rounded-' + size} /></div>`;
+  const report = checkTsx(tsx, { target: 'interp.tsx' });
+  assert.equal(
+    report.findings.filter((f) => f.id === 'rule/non-concentric-radius').length,
+    0,
+    JSON.stringify(report.findings, null, 2),
+  );
+});
