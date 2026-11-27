@@ -444,14 +444,19 @@ function resolveClipRect(raw, ctx, matrix) {
 }
 
 /** Union bbox of already-collected shape records, strokes included. */
-function bboxOfShapes(shapes, steps) {
+function bboxOfShapes(shapes, steps, ctx) {
   let box = null;
   for (const shape of shapes) {
     const flat = flattenPath(shape.d, steps);
     // A partially parsed path contributes only the fragments svgpath could read,
     // so the box it produces is smaller than the ink it paints. Measuring the
-    // fragments would call ink "inside the viewport" that plainly is not.
-    if (flat.parseError) return null;
+    // fragments would call ink "inside the viewport" that plainly is not — and
+    // returning `null` here drops the shape, so the reason has to be recorded
+    // or the loss would be silent.
+    if (flat.parseError) {
+      if (ctx) ctx.unresolved.add('unparsed-path');
+      return null;
+    }
     const points = flat.flat().map(([x, y]) => applyMatrix(shape.matrix, x, y));
     if (points.length === 0) continue;
     const localBox = bboxOfPoints(points);
@@ -581,10 +586,10 @@ function collect(node, inherited, out, ctx) {
     const inner = { ...ctx, depth: ctx.depth + 1 };
     const local = inheritedFor(attrs, inherited, visible, useMatrix, ctx);
 
-    // `clip-path` on a <use> could be authored before or after its own x/y
-    // translate; both readings have to contain the ink before the clip counts
-    // as a no-op.
-    withClip(attrs, [own, useMatrix], ctx, out, (sink) => {
+    // `clip-path` on a <use> is resolved in the element's own user space, which
+    // is the parent's — `x`/`y` translate the *referenced content*, not the
+    // <use> itself. So `own`, not `useMatrix`.
+    withClip(attrs, [own], ctx, out, (sink) => {
       if (targetTag === 'symbol') {
         // <symbol> is non-rendering on its own but renders when instantiated.
         const vpW = resolveLength(attrs.width, inherited.viewport.w);
@@ -629,8 +634,9 @@ function collect(node, inherited, out, ctx) {
         symbolLocal.matrix = matrix;
         symbolLocal.viewport = { w: vpW, h: vpH };
         // A symbol clips to the viewport the <use> gives it, exactly like a
-        // nested <svg>. Its own clip-path applies on top of that.
-        withClip(symbolAttrs, [matrix, useMatrix], ctx, sink, (clipped) => {
+        // nested <svg>. Its own clip-path is in the symbol's user space, which
+        // is the one its viewBox establishes — `matrix`, not `useMatrix`.
+        withClip(symbolAttrs, [matrix], ctx, sink, (clipped) => {
           withViewport({ x: 0, y: 0, w: vpW, h: vpH }, useMatrix, ctx, clipped, (viewport) => {
             for (const child of target.children || []) collect(child, symbolLocal, viewport, inner);
           });
@@ -738,7 +744,7 @@ function withViewport(rect, outerMatrix, ctx, out, emit) {
   const captured = [];
   emit(captured);
   if (captured.length === 0) return;
-  const box = bboxOfShapes(captured, ctx.steps);
+  const box = bboxOfShapes(captured, ctx.steps, ctx);
   if (!box) return;
   // All four corners: under a rotation the two diagonal ones would both land on
   // the same diagonal of the rotated rect and collapse the viewport to a line,
@@ -782,7 +788,7 @@ function withClip(attrs, matrices, ctx, out, emit) {
   const captured = [];
   emit(captured);
   if (captured.length === 0) return;
-  const box = bboxOfShapes(captured, ctx.steps);
+  const box = bboxOfShapes(captured, ctx.steps, ctx);
   // A viewport-establishing element is clipped in one of two plausible spaces
   // (before or after its own viewBox). Passing only when *both* readings contain
   // the ink keeps the decision conservative.

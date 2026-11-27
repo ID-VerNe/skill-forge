@@ -288,14 +288,21 @@ doubled region and refuses when that exceeds 0.1% of the subpath's own area.
 Below that the outline is measured as if it were simple; the error it introduces
 is smaller than the tolerance the verdict is judged against.
 
-**What is still approximate.** Two things, and they are why `off` on
+**What is still approximate.** Three things, and they are why `off` on
 `geometry/centroid` deserves a second look at the artwork:
 
 1. Partially overlapping outlines. An even-odd XOR needs a boolean polygon
    operation, so the checker reports `overlapping-subpaths` rather than a
    centroid that may land outside the artwork. Under `nonzero` a genuine overlap
    is still summed, which over-counts area.
-2. The stroke model — joins, caps and dashes are approximated as a swept band.
+2. Overlap **between shapes**. Each `<path>` is measured on its own and the areas
+   are added, so two opaque shapes painted over each other count twice while the
+   render paints once. A three-shape shield logo where one path is the same
+   silhouette split in two came out 190% over an independent scanline
+   measurement. The error is in `ink.area` and, when the overlap is asymmetric,
+   in the centroid; `geometry/ink-bbox` is unaffected. Catching it needs the same
+   boolean machinery as case 1.
+3. The stroke model — joins, caps and dashes are approximated as a swept band.
 
 None of these can move `geometry/ink-bbox`, which depends on extreme points only.
 

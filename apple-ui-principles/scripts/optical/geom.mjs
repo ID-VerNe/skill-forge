@@ -272,14 +272,26 @@ export function netShape(subpaths) {
   });
 
   const fill = (winding) => (winding !== 0 ? 1 : 0);
+  // Iterative on purpose: the chain is as deep as the artwork nests, and a
+  // recursive walk turns a legal 6000-ring file into a stack overflow.
   const outsideWinding = new Array(subpaths.length).fill(null);
   const windingAt = (index) => {
     if (outsideWinding[index] !== null) return outsideWinding[index];
-    const parent = parentOf[index];
-    // Containment is strictly by area, so this chain always terminates.
-    const value = parent === -1 ? 0 : windingAt(parent) + Math.sign(signed[parent]);
-    outsideWinding[index] = value;
-    return value;
+    const chain = [];
+    let cursor = index;
+    while (cursor !== -1 && outsideWinding[cursor] === null) {
+      chain.push(cursor);
+      cursor = parentOf[cursor];
+    }
+    let value = cursor === -1 ? 0 : outsideWinding[cursor];
+    for (let i = chain.length - 1; i >= 0; i -= 1) {
+      const node = chain[i];
+      const parent = parentOf[node];
+      // Containment is strictly by area, so this chain always terminates.
+      if (parent !== -1) value += Math.sign(signed[parent]);
+      outsideWinding[node] = value;
+    }
+    return outsideWinding[index];
   };
 
   let area = 0;

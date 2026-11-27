@@ -1550,3 +1550,42 @@ test('a comma-separated transform list is parsed, not rejected', () => {
   assert.deepEqual(shape.unresolved, []);
   near(shape.ink.bbox.minX, 3);
 });
+
+test('a clip is read in the space the element actually lives in', () => {
+  // `clip-path` on a <use> belongs to the parent's user space: x/y translate the
+  // referenced content, not the <use> itself. Trying the post-translate space as
+  // well made a correct canvas-sized clip look like it cut the ink.
+  const use = analyzeSvg(
+    svg(
+      '<clipPath id="c"><rect width="24" height="24"/></clipPath>' +
+        '<defs><g id="g"><rect width="12" height="12"/></g></defs>' +
+        '<use href="#g" x="6" y="6" clip-path="url(#c)"/>',
+    ),
+  );
+  assert.deepEqual(use.unresolved, []);
+
+  // A clip on a <symbol> lives in the space the symbol's viewBox establishes.
+  // Judging it in the outer space refused every symbol that unit-scales.
+  const symbol = analyzeSvg(
+    svg(
+      '<symbol id="s" viewBox="0 0 10 10" clip-path="url(#c2)"><rect width="10" height="10"/></symbol>' +
+        '<clipPath id="c2"><rect width="10" height="10"/></clipPath>' +
+        '<use href="#s" width="24" height="24"/>',
+    ),
+  );
+  assert.deepEqual(symbol.unresolved, []);
+});
+
+test('a half-parsed path inside a viewport is reported, not dropped', () => {
+  // `bboxOfShapes` returns null when a path only partly parsed, and both
+  // viewport checks treat null as "nothing to measure" — the shape disappeared
+  // and the remaining ink kept the report looking fine.
+  const shape = analyzeSvg(
+    svg(
+      '<symbol id="s"><path d="M0 0 L"/><rect x="4" y="4" width="16" height="16"/></symbol>' +
+        '<use href="#s" width="24" height="24"/>',
+    ),
+  );
+  assert.match(shape.unresolved.join(), /unparsed-path/);
+  assert.equal(checkShape(shape, { target: 'sym-path.svg' }).verdict, 'unknown');
+});
