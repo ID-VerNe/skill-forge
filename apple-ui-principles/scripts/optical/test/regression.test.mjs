@@ -2327,3 +2327,208 @@ test('a stray moveto in a clipped group does not claim to be cut', () => {
   assert.deepEqual(shape.unresolved, []);
   near(shape.ink.area, 256, 1e-9);
 });
+
+// --- one number lexer for every numeric attribute --------------------------
+//
+// The CSS `<number-token>` grammar, not SVG 1.1's `<number>`. They disagree in
+// three places that each cost a verdict, and all three were measured in Chrome:
+// `+4` is a number (the element moves), `6-6` is two numbers (it moves by
+// (6,-6)), and `6.` is a number followed by stray junk (the whole attribute is
+// dropped, so the element does not move at all).
+
+test('a transform argument may carry a plus sign, because the engine accepts it', () => {
+  // `translate(+4,+8)` moved the rect 4 right and 8 down in Chrome. Refusing it
+  // measured the untransformed space and reported a 4/8px move as `ok`.
+  const shape = analyzeSvg(svg('<rect x="8" y="8" width="8" height="8" transform="translate(+4,+8)"/>'));
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.bbox.minX, 12, 1e-9);
+  near(shape.ink.bbox.minY, 16, 1e-9);
+});
+
+test('adjacent signed numbers are two arguments, not a syntax error', () => {
+  // `translate(6-6)` is `(6,-6)` to Chrome; `.5.5` is `(0.5,0.5)`.
+  const a = analyzeSvg(svg('<rect x="2" y="10" width="4" height="4" transform="translate(6-6)"/>'));
+  assert.deepEqual(a.unresolved, []);
+  near(a.ink.bbox.minX, 8, 1e-9);
+  near(a.ink.bbox.minY, 4, 1e-9);
+
+  const b = analyzeSvg(svg('<rect x="2" y="10" width="4" height="4" transform="translate(.5.5)"/>'));
+  near(b.ink.bbox.minX, 2.5, 1e-9);
+  near(b.ink.bbox.minY, 10.5, 1e-9);
+});
+
+test('a trailing dot is not a number, so the whole transform is dropped', () => {
+  // Chrome ignores `transform="translate(6.,6.)"`: the rect stays where it was.
+  // The old regex accepted `\d+\.?` and applied it, moving ink 6 units.
+  const shape = analyzeSvg(svg('<rect x="2" y="10" width="4" height="4" transform="translate(6.,6.)"/>'));
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.bbox.minX, 2, 1e-9);
+  near(shape.ink.bbox.minY, 10, 1e-9);
+});
+
+test('a length or a viewBox uses the same lexer as a transform', () => {
+  // `width="16."` is an invalid declaration: Chrome renders nothing at all, and
+  // reading it as 16 put a 256-unit square on a blank canvas and called it `ok`.
+  const rect = analyzeSvg(svg('<rect width="16." height="16"/>'));
+  assert.ok(rect.unresolved.includes('unparsed-length'), JSON.stringify(rect.unresolved));
+  assert.equal(rect.noInk, true);
+
+  // `Number('0x18')` is 24, so the old split-and-`Number` read this as a 24x24
+  // canvas. Chrome ignores the attribute entirely.
+  const hex = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 0x18 0x18"><rect width="24" height="24"/></svg>',
+  );
+  assert.ok(hex.unresolved.includes('invalid-viewBox'), JSON.stringify(hex.unresolved));
+});
+
+test('a <use> offset may carry a plus sign', () => {
+  const shape = analyzeSvg(svg('<defs><rect id="r" width="4" height="4"/></defs><use href="#r" x="+6"/>'));
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.bbox.minX, 6, 1e-9);
+});
+
+// --- <ellipse> rx/ry are `auto`, not zero ----------------------------------
+
+test('an ellipse with only one radius is a circle, not an empty shape', () => {
+  // `rx` and `ry` default to `auto`, which copies the other. Reading the missing
+  // side as 0 removed the shape from the ink with no reason at all: a lone
+  // ellipse came back `no-ink` and, beside a rectangle, the missing piece turned
+  // a real `off` into `ok`.
+  const alone = analyzeSvg(svg('<ellipse cx="12" cy="12" rx="6"/>'));
+  assert.deepEqual(alone.unresolved, []);
+  assert.equal(alone.noInk, false);
+  near(alone.ink.area, 113.048, 0.01);
+  near(alone.ink.bbox.minX, 6, 1e-9);
+  near(alone.ink.bbox.maxX, 18, 1e-9);
+
+  // The 40x32 box Chrome renders: the rect spans 4..20, the ellipse's auto `rx`
+  // makes it span 0..8, so the ink centre is 10 and the report is 2px left.
+  const mixed = analyzeSvg(
+    svg('<rect x="4" y="4" width="16" height="16"/><ellipse cx="4" cy="12" ry="4"/>'),
+  );
+  near(mixed.ink.bbox.minX, 0, 1e-9);
+  near(mixed.ink.bbox.maxX, 20, 1e-9);
+  assert.equal(checkShape(mixed, { target: 'sprite.svg' }).verdict, 'off');
+});
+
+test('an ellipse with neither radius is genuinely empty', () => {
+  // `auto` copies the other one; with neither there is nothing to copy, so the
+  // element draws nothing and this is a zero, not a gap.
+  const shape = analyzeSvg(svg('<ellipse cx="12" cy="12"/>'));
+  assert.deepEqual(shape.unresolved, []);
+  assert.equal(shape.noInk, true);
+});
+
+// --- a lone moveto is not a stroked subpath --------------------------------
+
+test('a lone moveto does not widen a stroked box', () => {
+  // The fill side was fixed earlier; the stroke side still unioned `M0 0` into
+  // the padding box, so a centred 4..20 frame came back as (-1,-1)-(21,21) and
+  // `off` by 2px — with a `viewBox="-2 -2 24 24"` that would have broken it.
+  const shape = analyzeSvg(
+    svg('<path d="M0 0 M4 4H20V20H4Z" fill="none" stroke="#000" stroke-width="2"/>'),
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.bbox.minX, 3, 1e-9);
+  near(shape.ink.bbox.maxX, 21, 1e-9);
+  near(shape.ink.area, 128, 1e-9);
+  assert.equal(checkShape(shape, { target: 'frame.svg' }).verdict, 'ok');
+});
+
+test('a zero-length segment is a cap shape the model cannot size, so it refuses', () => {
+  // Chrome paints a 10x10 dot here (78.42 unit²); `perimeter x width` gives 0 and
+  // the cap style is not tracked. "No ink" would be a claim, so it is a gap.
+  const viaPath = analyzeSvg(
+    svg('<path d="M12 12 L12 12" stroke="#000" stroke-width="10" stroke-linecap="round"/>'),
+  );
+  assert.ok(viaPath.unresolved.includes('zero-length-stroke'), JSON.stringify(viaPath.unresolved));
+
+  // Same shape spelled as a <line>, which is refused one step earlier, where the
+  // primitive is turned into path data.
+  const viaLine = analyzeSvg(
+    svg('<line x1="12" y1="12" x2="12" y2="12" stroke="#000" stroke-width="10" stroke-linecap="round"/>'),
+  );
+  assert.ok(viaLine.unresolved.includes('unparsed-shape'), JSON.stringify(viaLine.unresolved));
+
+  // With a butt cap it really draws nothing, and that is a zero, not a gap.
+  const butt = analyzeSvg(
+    svg('<line x1="12" y1="12" x2="12" y2="12" stroke="#000" stroke-width="10"/>'),
+  );
+  assert.deepEqual(butt.unresolved, []);
+  assert.equal(butt.noInk, true);
+});
+
+// --- non-scaling stroke width is px, not user units ------------------------
+
+test('a non-scaling stroke keeps its px width when the canvas is scaled', () => {
+  // 48px canvas, 24-unit viewBox: `stroke-width="2"` is 2 **px**, i.e. one user
+  // unit. Treating it as two user units doubled the band — 402px² where Chrome
+  // draws 201 — and pushed a stroked box outside its own canvas.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24">'
+      + '<circle cx="12" cy="12" r="8" fill="none" stroke="#000" stroke-width="2" vector-effect="non-scaling-stroke"/>'
+      + '</svg>',
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 50.264, 0.01);
+  near(shape.ink.bbox.minX, 3.5, 1e-9);
+  near(shape.ink.bbox.maxX, 20.5, 1e-9);
+});
+
+test('a non-scaling stroke in a class is carried by the cascade', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24">'
+      + '<style>.nss{vector-effect:non-scaling-stroke}</style>'
+      + '<circle class="nss" cx="12" cy="12" r="8" fill="none" stroke="#000" stroke-width="2"/>'
+      + '</svg>',
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 50.264, 0.01);
+});
+
+test('a non-scaling stroke under a non-uniform canvas is refused', () => {
+  // With two different px-per-unit factors a single band width cannot describe
+  // the stroke, so there is no number to report.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="24" viewBox="0 0 24 24" preserveAspectRatio="none">'
+      + '<circle cx="12" cy="12" r="8" fill="none" stroke="#000" stroke-width="2" vector-effect="non-scaling-stroke"/>'
+      + '</svg>',
+  );
+  assert.ok(shape.unresolved.includes('non-scaling-stroke-scale'), JSON.stringify(shape.unresolved));
+});
+
+// --- a root `slice` crops the user space -----------------------------------
+
+test('a root slice that crops the ink is refused, not measured as if cropped', () => {
+  // In a 48x24 viewport `slice` shows only user y 6..18. The three bands sit at
+  // y 0..4, 6..10 and 20..24, so the screen has one band 8px above centre while
+  // the model — which ignored the crop — said "box centred, mass 2.7px low".
+  const cropped = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="24" viewBox="0 0 24 24" preserveAspectRatio="xMidYMid slice">'
+      + '<rect x="0" y="0" width="24" height="4"/><rect x="0" y="6" width="24" height="4"/><rect x="0" y="20" width="24" height="4"/>'
+      + '</svg>',
+  );
+  assert.ok(cropped.unresolved.includes('root-slice-clip'), JSON.stringify(cropped.unresolved));
+
+  // Ink that sits inside the visible strip is unaffected, and still answers.
+  const inside = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="24" viewBox="0 0 24 24" preserveAspectRatio="xMidYMid slice">'
+      + '<rect x="4" y="8" width="16" height="8"/>'
+      + '</svg>',
+  );
+  assert.deepEqual(inside.unresolved, []);
+  near(inside.ink.area, 128, 1e-9);
+});
+
+test('overflow:visible set through a class still turns the clip off', () => {
+  // The cascade did not carry `overflow`, so a class-based `overflow:visible`
+  // never reached the node and the escaping ink was refused as cut-away ink that
+  // the render shows in full.
+  const shape = analyzeSvg(
+    svg('<style>.open{overflow:visible}</style>'
+      + '<svg class="open" x="0" y="0" width="10" height="10" viewBox="0 0 10 10">'
+      + '<rect width="20" height="20"/></svg>'),
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 400, 1e-6);
+});

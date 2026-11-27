@@ -141,6 +141,8 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | `icon.svg` with `--mode inline` | `inline` | `unknown`: the optical gutter needs a sibling text node, and the CLI has no way to hand one over. Use `standalone` |
 | `icon.svg` painting with `fill="currentColor"` | — | resolved against the `color` this file declares, transparent included. When `color` is **not** in the file, the pass assumes it is opaque — an icon hidden by a class upstream (`text-transparent`) measures as painted |
 | `icon.svg` with `transform="rotate(45deg)"` — a unit in the **attribute** | — | measured untransformed, because that is what browsers do: the `transform` attribute takes bare numbers and the whole attribute is dropped otherwise. Write `rotate(45)` |
+| `icon.svg` with `preserveAspectRatio="…slice"` at the root | — | `unknown` when the crop cuts the ink: `slice` fills the viewport and throws the overflow away, so ink outside the visible strip is not on screen. Ink that fits inside it answers normally |
+| `icon.svg` with `vector-effect="non-scaling-stroke"` | — | the authored width is **px**, not user units: on a 48px canvas over a 24-unit viewBox, `stroke-width="2"` is one user unit |
 | `icons/` (dir) | `keyline` | fill-ratio outliers across the set (needs ≥3 icons of one family) |
 | `styles.css` | rule | `text-box` in flex/grid, hard-coded nudges |
 | `Button.tsx` | rule | same, plus concentric radii from the element tree |
@@ -153,9 +155,10 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | `unknown` | 2 | context missing (display, parent, font, unmeasurable ink, relative units) | report the gap; **never guess** |
 
 `ok` is a claim about *this measurement*, not a certificate that the asset is
-optically perfect. Three deliberate approximations survive inside it — several
-`<path>`s painted over each other, dashes (`stroke-dasharray`), and a stroke under
-a non-uniform scale. On those, read `ok` as "nothing measurable was wrong" and
+optically perfect. Four deliberate approximations survive inside it — several
+`<path>`s painted over each other, dashes (`stroke-dasharray`), a stroke under a
+non-uniform scale, and a stroke on a filled shape (the band is added to the fill,
+not unioned with it). On those, read `ok` as "nothing measurable was wrong" and
 look at the artwork. `optical-model.md` §1 lists the numbers.
 
 Two rules that make the output trustworthy:

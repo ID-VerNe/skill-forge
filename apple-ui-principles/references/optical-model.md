@@ -43,10 +43,17 @@ Two rules keep that pipeline from lying:
   the shape's region as before (a pattern's internal geometry is not modelled, so
   its coverage is taken at the shape's own region). Stops reached through
   `href="#other"` are followed, because that is how export tools deduplicate them.
-- **`vector-effect="non-scaling-stroke"` keeps its width.** The band stays at the
-  authored width while its path is scaled, so the area is computed from the path
-  geometry at scale 1 — under `scale(4)` a 1-unit stroke on a 16-unit perimeter
-  covers 64 units, not 256.
+- **`vector-effect="non-scaling-stroke"` keeps its width — in px.** The band stays
+  at the authored width while its path is scaled, so the area is computed from the
+  path geometry at scale 1 — under `scale(4)` a 1-unit stroke on a 16-unit
+  perimeter covers 64 units, not 256. The authored width is a **px** number, not a
+  user-unit one: a 48px canvas over a 24-unit viewBox makes `stroke-width="2"` one
+  user unit, so the width is divided by the root scale before it is used. Ignoring
+  that doubled the band (402px² where Chrome draws 201) and pushed a stroked box
+  outside its own canvas. Under `preserveAspectRatio="none"` the two axes carry
+  different px-per-unit factors, so a single width cannot describe the band and
+  the file is refused as `non-scaling-stroke-scale`. A stylesheet may set the
+  property too; the cascade carries `vector-effect` like any other paint property.
 - **A paint value that does not parse is not a colour.** `fill`/`stroke` were
   asked one question — *is this the string `none`?* — and everything else became
   paint. CSS drops a declaration it cannot parse and the property keeps its
@@ -67,7 +74,16 @@ Two rules keep that pipeline from lying:
   the box pulled a correct `4..20` square back to the origin: `off` by 2px, with a
   `viewBox="-2 -2 24 24"` suggestion that would have broken the icon. Only
   subpaths that enclose area contribute to a *filled* box; a stroked line is ink
-  and still widens it.
+  and still widens it. The stroke side had the same bug one layer down: its
+  padding box was built from every point, so `M0 0 M4 4H20V20H4Z` with a 2-unit
+  stroke still came back `(-1,-1)-(21,21)`. A subpath contributes to a *stroked*
+  box only if it has a segment.
+- **A zero-length segment is a cap, and the cap is not modelled.** `M12 12 L12 12`
+  under `stroke-linecap="round"` is a 10×10 dot in Chrome (78.42 unit² for
+  `stroke-width="10"`), while `perimeter × width` gives it 0. The same `<line>`
+  with a butt cap draws nothing at all. Cap style is not read, so the two cases
+  are separated by whether a cap is asked for, and the painted one is refused
+  (`zero-length-stroke`) rather than called empty.
 - **A prefixed tag is the same tag.** `xmlns:svg="…/svg"` makes `<svg:rect>` the
   same element as `<rect>`. Keeping the prefix missed the shape test, sent the
   node down the container branch, and deleted its geometry in silence: a
@@ -104,12 +120,17 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | a `clip-path` whose geometry is not a plain rect, or one that cuts the ink | `geometry/unresolved-graphics` |
 | `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
-| a `transform` that is not a bare-number list — a unit (`translate(2px,0)`, `rotate(45deg)`), a percentage, `var()`, an unknown function, wrong argument count, empty argument (`translate(10,)`), trailing junk | measured **untransformed**, with no finding — the engine drops the whole attribute, so the element sits in its parent's space. The parseable prefix is never applied: that would turn `translate(10%,8)` into `translate(8,0)` |
+| a `transform` that is not a bare-number list — a unit (`translate(2px,0)`, `rotate(45deg)`), a percentage, `var()`, an unknown function, wrong argument count, empty argument (`translate(10,)`), trailing junk, a trailing dot (`translate(6.,6.)`) | measured **untransformed**, with no finding — the engine drops the whole attribute, so the element sits in its parent's space. The parseable prefix is never applied: that would turn `translate(10%,8)` into `translate(8,0)`. A sign is a number (`+4`) and adjacent signed numbers are two of them (`6-6`, `.5.5`), both applied |
 | a `stroke-width` in any unit — `10%` (`stroke-width-percentage`), or `2pt` / `1em` / `1in` (`stroke-width-relative`), on the shape **or any ancestor** | `geometry/unresolved-graphics`. The percentage is relative to a viewport the file does not fix, and the absolute units are declined on purpose: `pt`, `pc`, `mm` and `in` would each need a px-per-unit constant, which is a second place to be wrong about the same number. `2px` is accepted — one px *is* one user unit. Write the others in user units |
 | a `stroke-width` that overflows to infinity (`1e999`) | `geometry/unresolved-graphics` (`stroke-width-not-finite`) — one engine clamps it to the largest length and paints over the canvas, another drops the declaration |
 | a `stroke-width` that is finite but whose band area is not (`1e308`) | `geometry/unresolved-graphics` (`non-finite-ink`) — `width × length` overflows to `Infinity` and the centroid comes back `NaN`; `NaN` compares false against every tolerance, so without this check the report reads `off` with a `NaN` displacement instead of admitting it has no measurement |
 | a `d` the path parser rejects or only partially parses | `geometry/unresolved-graphics` (`unparsed-path`) — svgpath reports `M0 0 L` as "missed param" and still returns one point |
 | a geometry length in `%`, `em`, `pt`… | `geometry/unresolved-graphics` (`unparsed-length`) — a percentage is relative to a viewport we cannot see, and `parseFloat("100%")` is `100` |
+| a length or `viewBox` number the CSS lexer rejects — `width="16."`, `viewBox="0 0 0x18 0x18"` | `unresolved-length` / `invalid-viewBox`. A trailing dot is the number `16` followed by junk, so Chrome does not render the element; `Number("0x18")` answering `24` invented a canvas the browser does not have |
+| an `<ellipse>` with neither `rx` nor `ry` | no ink, and no finding. `auto` copies the other radius; with neither there is nothing to copy, so the shape really is empty |
+| a zero-length stroked segment that a cap turns into a dot (`M12 12 L12 12` with `stroke-linecap="round"`) | `geometry/unresolved-graphics` (`zero-length-stroke`) — the dot's area is the cap's, and cap style is not modelled. The same line with a butt cap draws nothing and is a genuine zero |
+| a root `preserveAspectRatio="…slice"` whose crop cuts the ink | `geometry/unresolved-graphics` (`root-slice-clip`) — the model cannot clip a stroked path to a rect, and measuring the cropped-away ink reports a drawing that is not on screen. Ink that fits inside the visible strip is still measured |
+| a non-scaling stroke under `preserveAspectRatio="none"` | `geometry/unresolved-graphics` (`non-scaling-stroke-scale`) — the two axes carry different px-per-unit factors, so no single band width describes the stroke |
 | a `viewBox` attribute that is not four finite numbers with a positive size | `geometry/unresolved-graphics` (`invalid-viewBox`) — the element does not render, so there is no canvas to measure against |
 | no `viewBox` and a relative `width`/`height` | `geometry/unresolved-graphics` (`relative-canvas`) — the canvas is whatever the host gives it |
 | a root `width="0"` or `height="0"` | `geometry/unresolved-graphics` (`zero-canvas`) — SVG 1.1 §7.7: zero disables rendering |
@@ -283,6 +304,18 @@ offset would describe a drawing nobody can see. Under a rotated ancestor the
 viewport rect is taken as its axis-aligned bounding box, which is a superset —
 lenient, and stated here rather than hidden.
 
+The **root** viewport clips too, and `preserveAspectRatio="…slice"` makes that
+crop bite: `slice` scales by the larger of the two ratios so the viewBox covers
+the viewport, then drops the overflow. In a 48×24 viewport over a 24-unit viewBox
+only user `y ∈ [6,18]` is on screen, so three bands at `y` 0, 6 and 20 render as
+one band 8px above centre — while a model that ignores the crop says "box centred,
+mass 2.7px low". The crop can also manufacture a false `ok`: keep only the bands
+outside the visible strip and every number describes ink that was never drawn. Ink
+that fits inside the strip is measured normally; anything crossing it is refused
+(`root-slice-clip`). Cropping a filled polygon to a rect is tractable, but a
+*stroked* one is not expressible as `perimeter × width`, and clipping half the
+file would be worse than saying so.
+
 `overflow="visible"` is the one declaration that turns that clip off, and then
 the escaping ink is measured as authored. `auto` and `scroll` still clip (they
 add scrollbars), so only the literal `visible` opts out.
@@ -306,6 +339,17 @@ argument out would turn `translate(10%,8)` into `translate(8,0)` and
 warning. And the attribute is not the CSS property: `style="transform:rotate(45deg)"`
 *is* valid CSS, and lands in the `stylesheet-geometry` refusal instead, because a
 stylesheet can move ink in ways this pass does not evaluate.
+
+What counts as a number is the **CSS** `<number-token>`, not SVG 1.1's `<number>`,
+and the difference runs both ways. Accepting too little moved nothing that Chrome
+moves: `translate(+4,+8)` is valid (the element really does move 4 right and 8
+down), and adjacent signed numbers are two tokens, so `translate(6-6)` is
+`(6,-6)` and `.5.5` is `(0.5,0.5)`. Accepting too much moved what Chrome leaves
+alone: CSS has no trailing dot, so `translate(6.,6.)` is the number `6`, a stray
+`.` and an invalid list — the whole attribute is dropped. The same lexer reads
+every geometry length, `points` and `viewBox`, which is how `width="16."` (blank
+canvas in Chrome) and `viewBox="0 0 0x18 0x18"` (where `Number()` would answer 24
+for a canvas the browser does not have) stop being confident numbers.
 
 One caveat worth recording: SVG 2 nominally types the `transform` attribute as a
 CSS `<transform-list>`, where units are legal. This pass follows the engine it was
@@ -691,6 +735,13 @@ codes stay distinct so a broken project never looks like an unverifiable one.
 - No rendering. Font fallback, glyph hinting, sub-pixel positioning and
   `letter-spacing` accumulation are out of scope.
 - Stroke joins, caps and dashes are approximated by a constant-width band.
+- A stroke on a **filled** shape is added to the fill rather than unioned with it,
+  so the band's inside half is counted twice. On a concentric shape that cancels
+  in the centroid and only inflates the area; on an off-centre band it pulls the
+  reported mass toward the band — `rect` + a wide vertical stroke at its right
+  edge reads 2.7px right of centre where the union is centred. Splitting a shape
+  into fill and stroke is the fix, and it is deliberate: a boolean union is the
+  one operation this pass does not have.
 - `stroke-width` is only read when it is a bare number or `px`. Absolute units
   (`pt`, `pc`, `mm`, `cm`, `in`) are refused rather than converted: the px-per-unit
   constants are a second place to get the same number wrong, and real icon files

@@ -20,6 +20,15 @@ const PAINT = new Set([
   'fill-opacity',
   'stroke',
   'stroke-width',
+  // `vector-effect: non-scaling-stroke` changes the band's width by the root
+  // scale. A class is how libraries set it, and the cascade did not carry the
+  // declaration at all — so the CSS form was measured as if the stroke scaled
+  // with the artwork, twice the true area at a 2x canvas.
+  'vector-effect',
+  // A nested viewport clips by default and `overflow:visible` is the one
+  // declaration that turns it off. Set through a class, the declaration never
+  // reached the node, so the pass refused ink that the render shows in full.
+  'overflow',
   'stroke-opacity',
   'display',
   'visibility',

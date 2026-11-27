@@ -22,6 +22,8 @@ import {
   multiplyMatrix,
   shapeToPath,
   parseLength,
+  CSS_NUMBER,
+  numberList,
   viewBoxMatrix,
   IDENTITY,
 } from './geom.mjs';
@@ -258,12 +260,12 @@ function parseXml(text) {
  */
 function parseViewBox(attrs) {
   if (attrs.viewBox !== undefined) {
-    const parts = String(attrs.viewBox)
-      .trim()
-      .split(/[\s,]+/)
-      .filter(Boolean)
-      .map(Number);
-    if (parts.length === 4 && parts.every(Number.isFinite) && parts[2] > 0 && parts[3] > 0) {
+    // The same CSS number lexer as everywhere else. `Number('0x18')` is 24, so a
+    // `viewBox="0 0 0x18 0x18"` used to be read as a 24x24 canvas that Chrome
+    // does not have (it ignores the attribute and falls back to user units);
+    // `"0 0 24. 24"` likewise.
+    const parts = numberList(attrs.viewBox);
+    if (parts && parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
       return { x: parts[0], y: parts[1], w: parts[2], h: parts[3] };
     }
     return null;
@@ -290,10 +292,16 @@ function viewBoxFailure(attrs) {
 function resolveLength(value, basis, fallback = basis) {
   if (value === undefined || value === null) return fallback;
   const text = String(value).trim();
-  const pct = /^(-?\d*\.?\d+)%$/.exec(text);
-  if (pct) return (Number.parseFloat(pct[1]) / 100) * basis;
-  if (/^-?\d*\.?\d+(px)?$/.test(text)) return Number.parseFloat(text);
-  return null;
+  const pct = /^(.+)%$/.exec(text);
+  if (pct) {
+    // No trim around the `%`: CSS does not allow `50 %`, and accepting it would
+    // size a `<use>` from a declaration the engine drops.
+    return CSS_NUMBER.test(pct[1]) ? (Number(pct[1]) / 100) * basis : null;
+  }
+  const body = /px$/i.test(text) ? text.slice(0, -2) : text;
+  // `+6` is a number and Chrome honours `<use x="+6">`; refusing it refused a
+  // perfectly readable icon. `16.` is not a number to the CSS lexer.
+  return CSS_NUMBER.test(body) ? Number(body) : null;
 }
 
 /**
@@ -306,9 +314,16 @@ const ABSOLUTE_UNITS = { px: 1, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, pt: 96 / 7
 
 function absolutePx(value) {
   if (value === undefined || value === null) return null;
-  const m = /^\s*(-?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*(px|in|cm|mm|pt|pc)?\s*$/i.exec(String(value));
+  const text = String(value).trim();
+  const m = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([a-z]+)?$/i.exec(text);
   if (!m) return null;
-  return Number.parseFloat(m[1]) * ABSOLUTE_UNITS[(m[2] || 'px').toLowerCase()];
+  const unit = (m[2] || 'px').toLowerCase();
+  const factor = ABSOLUTE_UNITS[unit];
+  // An unknown unit (`2em`, `50vh`) is not "no size declared" — it is a size this
+  // pass cannot read, and returning null for both let `width="2em"` fall through
+  // to the 24px assumption.
+  if (factor === undefined) return null;
+  return Number(m[1]) * factor;
 }
 
 /**
@@ -1201,7 +1216,61 @@ function zeroSided(attrs) {
   return null;
 }
 
-function rootUnitScale(attrs, viewBox) {  const nominal = 24;
+/**
+ * The part of the user space the root viewport actually shows.
+ *
+ * `preserveAspectRatio="…slice"` scales by the **larger** of the two px-per-unit
+ * ratios so the viewBox covers the viewport, then crops the overflow. Nothing in
+ * the ink model knew about that crop: three bands at y=0, 6 and 20 in a 24-unit
+ * viewBox rendered into a 48x24 viewport came back as "box centred, mass 2.7px
+ * low" while the screen showed only the middle band, 8px off centre. The crop is
+ * also how a false `ok` can be manufactured — keep only the bands outside the
+ * visible strip and the model measures ink that was never drawn.
+ *
+ * @returns {null} when nothing is cropped (`meet` fits inside by definition);
+ *   `undefined` when the file does not pin the viewport, which the caller has to
+ *   refuse rather than assume; `{x,y,w,h}` in user units otherwise.
+ */
+function visibleUserRect(attrs, viewBox) {
+  if (!/\bslice\b/i.test(String(attrs.preserveAspectRatio || ''))) return null;
+  const w = absolutePx(attrs.width);
+  const h = absolutePx(attrs.height);
+  // Without both sides the viewport's aspect ratio is not in the file, so which
+  // part gets cropped is not either. The caller refuses; guessing here would be
+  // exactly the "invented canvas" this pass avoids everywhere else.
+  if (w === null || h === null || !(w > 0) || !(h > 0)) return undefined;
+  if (!(viewBox.w > 0) || !(viewBox.h > 0)) return undefined;
+
+  const scale = Math.max(w / viewBox.w, h / viewBox.h);
+  const visibleW = w / scale;
+  const visibleH = h / scale;
+  // Which side the overflow lands on follows the alignment; `xMidYMid` is the
+  // default when the keyword is missing or unreadable.
+  const align = String(attrs.preserveAspectRatio || '').trim().split(/\s+/)[0] || '';
+  const frac = (axis) => {
+    if (!/^x(Min|Mid|Max)Y(Min|Mid|Max)$/.test(align)) return 0.5;
+    const part = axis === 'x' ? align.slice(1, 4) : align.slice(5, 8);
+    return part === 'Min' ? 0 : part === 'Max' ? 1 : 0.5;
+  };
+  return {
+    x: viewBox.x + (viewBox.w - visibleW) * frac('x'),
+    y: viewBox.y + (viewBox.h - visibleH) * frac('y'),
+    w: visibleW,
+    h: visibleH,
+  };
+}
+
+function boxWithin(box, rect, eps = 1e-9) {
+  return (
+    box.minX >= rect.x - eps &&
+    box.minY >= rect.y - eps &&
+    box.maxX <= rect.x + rect.w + eps &&
+    box.maxY <= rect.y + rect.h + eps
+  );
+}
+
+function rootUnitScale(attrs, viewBox) {
+  const nominal = 24;
   const par = String(attrs.preserveAspectRatio || '').trim();
   const stretches = par.toLowerCase().startsWith('none');
   // `preserveAspectRatio="none"` has no single scale, and that is true of the
@@ -1318,14 +1387,21 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
       if (String(shape.d).trim() !== '') ctx.unresolved.add('unparsed-path');
       continue;
     }
-    const points = subpaths.flat();
-    const localBox = bboxOfPoints(points);
     // A stray `M0 0` or a bare line inside an otherwise solid path spans a
     // bounding box and paints nothing. Unioning it into the ink box pulled the box
     // back to the origin: a 4..20 square came back as 0..20, `off` by 2 units, with
     // a suggested `viewBox="-2 -2 24 24"` that would have broken a correct icon.
     const enclosing = subpaths.filter((sub) => enclosesArea(sub));
     const fillBox = enclosing.length > 0 ? bboxOfPoints(enclosing.flat()) : null;
+    // The stroke has its own version of the same problem, and filtering only the
+    // fill side left it in place: `M0 0 M4 4H20V20H4Z` with a 2-unit stroke still
+    // came back as (-1,-1)-(21,21) and `off`, because the box used for padding was
+    // built from *all* points. A lone moveto draws no segment, so there is no band to
+    // pad — not even with a round cap. A zero-length *segment*
+    // (`M12 12 L12 12`) is different: that one does paint a dot, and it survives
+    // the `length > 1` test below.
+    const strokable = subpaths.filter((sub) => sub.length > 1);
+    const strokeLocalBox = strokable.length > 0 ? bboxOfPoints(strokable.flat()) : null;
 
     if (shape.filled) {
       const net = shape.fillRule === 'evenodd' ? netShapeEvenOdd(subpaths) : netShape(subpaths);
@@ -1355,7 +1431,25 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
     }
 
     if (shape.stroked) {
-      const width = shape.strokeWidth;
+      let width = shape.strokeWidth;
+      // `vector-effect="non-scaling-stroke"` keeps the band at its authored width
+      // **in px**, not in user units: under a 48px canvas with a 24-unit viewBox,
+      // `stroke-width="2"` is one user unit, not two. Dividing by the root scale
+      // is the whole correction, and it only exists when the scale is uniform —
+      // under `preserveAspectRatio="none"` the two axes disagree and a scalar
+      // width cannot describe the band.
+      if (shape.nonScalingStroke) {
+        if (!(unitScale > 0)) {
+          ctx.unresolved.add('non-scaling-stroke-scale');
+          width = null;
+        } else {
+          width /= unitScale;
+        }
+      }
+      // Nothing after this point in the loop body, so skipping the rest of the
+      // iteration is the whole refusal: the band stays unmeasured and
+      // `non-scaling-stroke-scale` keeps the report from reading as `ok`.
+      if (width === null) continue;
       // The band area is `perimeter × width`, and a linear map scales area by
       // |det|. The perimeter used here is the **authored** one: the root-space
       // outline is already stretched along the path's own direction, so pairing it
@@ -1367,11 +1461,13 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
       const det = shape.nonScalingStroke
         ? 1
         : Math.abs(shape.matrix[0] * shape.matrix[3] - shape.matrix[1] * shape.matrix[2]);
+      let bandLength = 0;
       for (const sub of perimeter) {
         for (let i = 1; i < sub.length; i += 1) {
           const [x0, y0] = sub[i - 1];
           const [x1, y1] = sub[i];
           const len = Math.hypot(x1 - x0, y1 - y0);
+          bandLength += len;
           const weight = len * width * det;
           strokeArea += weight;
           // The centroid has to be reported in root space, so the local segments
@@ -1386,13 +1482,33 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
           }
         }
       }
+      // A zero-length segment (`M12 12 L12 12`) does paint — a round or square cap
+      // puts a dot there, 78.42 unit² for the 10-unit round one Chrome draws — but
+      // the model's `perimeter × width` gives it 0, and the cap style that decides
+      // the dot's shape is not tracked at all. Saying "no ink" would be a claim;
+      // this is a gap.
+      if (bandLength === 0) ctx.unresolved.add('zero-length-stroke');
       const pad = strokePadding(shape.matrix, width, shape.nonScalingStroke);
-      strokeBox = bboxUnion(strokeBox, bboxExpandBy(localBox, pad.x, pad.y));
+      if (strokeLocalBox) {
+        strokeBox = bboxUnion(strokeBox, bboxExpandBy(strokeLocalBox, pad.x, pad.y));
+      }
     }
   }
 
   const totalArea = filledArea + strokeArea;
   const finalBox = bboxUnion(bbox, strokeBox);
+
+  // The root viewport crops the user space under `slice`. Ink outside the visible
+  // strip was never on screen, so a box or a centroid built from it describes a
+  // drawing that does not exist. Refuse rather than clip: cropping a polygon is
+  // doable, cropping a *stroked* one to a rect is not expressible as
+  // `perimeter × width`, and half-clipping would be worse than saying so.
+  if (finalBox) {
+    const visible = visibleUserRect(svg.attrs || {}, viewBox);
+    if (visible === undefined || (visible && !boxWithin(finalBox, visible))) {
+      ctx.unresolved.add('root-slice-clip');
+    }
+  }
 
   // `stroke-width="1e308"` is a finite number with an infinite consequence: the
   // band area overflows, the centroid becomes NaN, and a NaN compares false

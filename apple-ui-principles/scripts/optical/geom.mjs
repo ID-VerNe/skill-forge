@@ -849,6 +849,59 @@ export function applyMatrix(m, x, y) {
 export const INVALID_TRANSFORM = 'invalid-transform';
 
 /**
+ * One CSS `<number-token>`.
+ *
+ * Every number this file reads — transform arguments, geometry lengths, a
+ * `viewBox`, `points` — is tokenised by the same lexer, and it is the CSS one,
+ * not SVG 1.1's `<number>` grammar. The two disagree in exactly the places that
+ * cost a verdict:
+ *
+ * - CSS has **no trailing dot**: `16.` is the number `16` followed by a stray
+ *   `.`, which invalidates the value. Chrome drops `width="16."` (blank canvas)
+ *   and drops `transform="translate(6.,6.)"` (element stays put), while this pass
+ *   read both as 16 and 6 — a wrong position reported with confidence.
+ * - CSS numbers **may** carry a sign: `+4` is one number, so
+ *   `transform="translate(+4,+8)"` is valid and Chrome moves the element 4 right
+ *   and 8 down. Refusing it measured the untransformed space and reported `ok`.
+ * - Adjacent signed numbers are two tokens, not an error: `translate(6-6)` is
+ *   `(6,-6)`. Requiring a separator refused it.
+ *
+ * Hex (`0x18`), `Infinity` and `NaN` are not css numbers and are refused.
+ */
+const NUMBER_BODY = String.raw`[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?`;
+
+/** A whole string that is one number. */
+export const CSS_NUMBER = new RegExp(`^${NUMBER_BODY}$`);
+
+/** The longest number at the start of a string, for scanning. */
+const NUMBER_AT_START = new RegExp(`^${NUMBER_BODY}`);
+
+/**
+ * Tokenise a whitespace- and/or comma-separated number list.
+ *
+ * Returns `null` when any token is not a number, so `translate(6.,6.)` fails as a
+ * whole rather than yielding the `6` it happens to start with. Separators are
+ * optional between signed numbers — see `NUMBER_BODY`.
+ */
+export function numberList(raw) {
+  const text = String(raw);
+  const out = [];
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === ',') {
+      i += 1;
+      continue;
+    }
+    const m = NUMBER_AT_START.exec(text.slice(i));
+    if (!m) return null;
+    out.push(Number(m[0]));
+    i += m[0].length;
+  }
+  return out;
+}
+
+/**
  * Parse an SVG transform list into a single matrix.
  * @returns {number[]|string} the matrix, or `INVALID_TRANSFORM` when the list is
  *   not a bare-number transform list (the browser drops it, so the caller uses
@@ -874,16 +927,14 @@ export function parseTransform(value) {
   let match = re.exec(value);
   while (match) {
     const name = match[1];
-    const args = [];
     // `translate(10,)` and `translate(,10)` have an empty argument. Splitting
     // silently produced one number, so a malformed list was applied as if it
     // were `translate(10)` — the browser drops the whole attribute instead.
     if (/^\s*,|,\s*$|,\s*,/.test(match[2])) return INVALID_TRANSFORM;
-    for (const raw of match[2].split(/[\s,]+/).filter((part) => part !== '')) {
-      const m = /^(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)$/.exec(raw);
-      if (!m) return INVALID_TRANSFORM;
-      args.push(Number.parseFloat(m[1]));
-    }
+    // One lexer for the whole file: `+4` is a number, `6-6` is two of them, and
+    // `6.` is neither a number nor valid — see `NUMBER_BODY`.
+    const args = numberList(match[2]);
+    if (!args) return INVALID_TRANSFORM;
     let m = IDENTITY;
     switch (name) {
       case 'matrix':
@@ -955,8 +1006,25 @@ export function parseLength(raw) {
   if (raw === undefined || raw === null) return null;
   const s = String(raw).trim();
   if (s === '') return null;
-  const match = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(px)?$/i.exec(s);
-  return match ? Number(match[1]) : null;
+  // `16.` is not a length: the CSS lexer reads `16` and then a stray dot, so
+  // Chrome does not render the element at all. Reading it as 16 put a 256-unit
+  // square on a canvas that is actually blank, and called it `ok`.
+  const body = /px$/i.test(s) ? s.slice(0, -2) : s;
+  if (!CSS_NUMBER.test(body)) return null;
+  return Number(body);
+}
+
+/** Two 180° arcs: an ellipse as path data, with no orientation-dependent split. */
+function ellipsePath(cx, cy, rx, ry) {
+  return {
+    d: [
+      `M${cx - rx} ${cy}`,
+      `A${rx} ${ry} 0 1 0 ${cx + rx} ${cy}`,
+      `A${rx} ${ry} 0 1 0 ${cx - rx} ${cy}`,
+      'Z',
+    ].join(' '),
+    unparsed: false,
+  };
 }
 
 const SHAPE_LENGTH_ATTRS = {
@@ -1020,26 +1088,30 @@ export function shapeToPath(tag, attrs) {
     case 'ellipse': {
       const cx = num('cx');
       const cy = num('cy');
-      const rx = tag === 'circle' ? num('r') : num('rx');
-      const ry = tag === 'circle' ? num('r') : num('ry');
+      if (tag === 'circle') {
+        const r = num('r');
+        return r > 0 ? ellipsePath(cx, cy, r, r) : { d: '', unparsed: false, empty: true };
+      }
+      // `rx` and `ry` default to `auto`, which copies the *other* one. Reading the
+      // missing side as 0 collapsed the ellipse to nothing: `<ellipse cx="4"
+      // cy="12" ry="4">` disappeared from the ink entirely — a lone ellipse became
+      // `no-ink` (a legitimate shape reported as an empty canvas) and, next to a
+      // rectangle, the missing piece flipped `off` to `ok`.
+      const hasRx = attrs.rx !== undefined && parseLength(attrs.rx) !== null;
+      const hasRy = attrs.ry !== undefined && parseLength(attrs.ry) !== null;
+      const rx = hasRx ? num('rx') : hasRy ? num('ry') : 0;
+      const ry = hasRy ? num('ry') : hasRx ? num('rx') : 0;
       if (rx <= 0 || ry <= 0) return { d: '', unparsed: false, empty: true };
-      return {
-        d: [
-          `M${cx - rx} ${cy}`,
-          `A${rx} ${ry} 0 1 0 ${cx + rx} ${cy}`,
-          `A${rx} ${ry} 0 1 0 ${cx - rx} ${cy}`,
-          'Z',
-        ].join(' '),
-        unparsed: false,
-      };
+      return ellipsePath(cx, cy, rx, ry);
     }
     case 'polygon':
     case 'polyline': {
-      const raw = (attrs.points || '').trim();
-      if (!raw) return { d: '', unparsed: false, empty: true };
-      const nums = raw.split(/[\s,]+/).map(Number);
-      if (nums.length < 4) return { d: '', unparsed: false, empty: true };
-      if (!nums.every(Number.isFinite)) return { d: '', unparsed: true };
+      const nums = numberList(attrs.points || '');
+      if (!nums || nums.length < 4) {
+        // Keep "nothing to draw" and "could not read it" apart: an empty
+        // `points` is an empty shape, `0x18,4` is a value this pass cannot read.
+        return { d: '', unparsed: !nums && String(attrs.points || '').trim() !== '', empty: true };
+      }
       const parts = [`M${nums[0]} ${nums[1]}`];
       for (let i = 2; i + 1 < nums.length; i += 2) parts.push(`L${nums[i]} ${nums[i + 1]}`);
       if (tag === 'polygon') parts.push('Z');
@@ -1050,9 +1122,17 @@ export function shapeToPath(tag, attrs) {
       const y1 = num('y1');
       const x2 = num('x2');
       const y2 = num('y2');
-      // A zero-length line paints nothing with butt caps; saying so keeps it out
-      // of the "could not parse" bucket, which would refuse the whole file.
-      if (x1 === x2 && y1 === y2) return { d: '', unparsed: false, empty: true };
+      if (x1 === x2 && y1 === y2) {
+        // A zero-length line paints nothing with butt caps — saying so keeps it
+        // out of the "could not parse" bucket. With a round or square cap it does
+        // paint, and what it paints is the cap: Chrome draws a 10x10 dot (78.42
+        // unit²) for `stroke-width="10" stroke-linecap="round"`. That area is not
+        // the path's, and the model does not read the cap, so it is a shape this
+        // pass cannot measure rather than an empty one.
+        const cap = String(attrs['stroke-linecap'] || '').trim().toLowerCase();
+        const paints = cap === 'round' || cap === 'square';
+        return { d: '', unparsed: false, empty: !paints };
+      }
       return { d: `M${x1} ${y1} L${x2} ${y2}`, unparsed: false };
     }
     default:
