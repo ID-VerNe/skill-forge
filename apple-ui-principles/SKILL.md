@@ -134,6 +134,8 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | `icon.svg` with `fill="var(--x)"` or `@import` | — | `unknown`: the value lives outside the file. Replace it with a literal to measure the icon — a themed colour does not change the area, but `none` does, and the checker cannot tell which you have |
 | `icon.svg` with `%` geometry or a `%` `stroke-width` | — | `unknown`: relative to a viewport the checker cannot see |
 | `icon.svg` that animates, or draws outside its viewport | — | `unknown`: one frame is not the drawing, and the browser clips the rest |
+| `icon.svg` with `mask`/`filter`/`marker-*` (attribute, `style` or class) | — | `unknown`: mask and filter rewrite the painted region, a marker draws a shape of its own outside the path |
+| `icon.svg` with `fill="url(#missing)"` | — | measured as no ink: SVG leaves the element unrendered. A reference to a gradient or pattern is measured normally — colour is not area. Flatten these to shapes if the verdict matters |
 | `icons/` (dir) | `keyline` | fill-ratio outliers across the set (needs ≥3 icons of one family) |
 | `styles.css` | rule | `text-box` in flex/grid, hard-coded nudges |
 | `Button.tsx` | rule | same, plus concentric radii from the element tree |
