@@ -288,3 +288,81 @@ test('fixture round-trip still works', () => {
   const text = readFileSync(fixture('icons/play.svg'), 'utf8');
   assert.match(text, /M8 5/);
 });
+
+// --- round 2: even-odd limits, <use>, JSX syntax ----------------------------
+
+test('evenodd with partially overlapping outlines refuses instead of inventing a centroid', () => {
+  const shape = analyzeSvg(
+    svg('<path fill-rule="evenodd" d="M2 2 H18 V18 H2 Z M10 10 H22 V22 H10 Z"/>'),
+  );
+  const report = checkShape(shape, { mode: 'standalone', target: 'xor.svg' });
+  assert.equal(report.verdict, 'unknown');
+  assert.match(report.findings.map((f) => f.evidence).join(' '), /overlapping-subpaths/);
+});
+
+test('evenodd hole sharing a corner with its container is still a hole', () => {
+  const shape = analyzeSvg(svg('<path fill-rule="evenodd" d="M4 4 H20 V20 H4 Z M4 4 H12 V12 H4 Z"/>'));
+  near(shape.ink.area, 192, 1e-6);
+  near(shape.ink.centroid.cx, 2560 / 192, 1e-6);
+  near(shape.ink.centroid.cy, 2560 / 192, 1e-6);
+});
+
+test('<use> pointing at a <symbol> renders the symbol content', () => {
+  const shape = analyzeSvg(
+    svg('<symbol id="s"><rect x="4" y="4" width="16" height="16"/></symbol><use href="#s"/>'),
+  );
+  near(shape.ink.bbox.minX, 4, 1e-6);
+  near(shape.ink.bbox.maxX, 20, 1e-6);
+  assert.equal(shape.noInk, false);
+});
+
+test('<use> honours its own transform', () => {
+  const shape = analyzeSvg(
+    svg('<defs><rect id="r" x="2" y="2" width="4" height="4"/></defs><use href="#r" transform="translate(10,10)"/>'),
+  );
+  near(shape.ink.bbox.minX, 12, 1e-6);
+  near(shape.ink.bbox.maxX, 16, 1e-6);
+});
+
+test('commented-out JSX does not produce findings', () => {
+  const tsx = `<div className="wrap">
+  {/* <div className="flex text-box-trim">old</div> */}
+  <span className="label" />
+</div>`;
+  const report = checkTsx(tsx, { target: 'comment.tsx' });
+  assert.equal(report.findings.length, 0, JSON.stringify(report.findings, null, 2));
+});
+
+test('mutually exclusive class branches degrade to unknown', () => {
+  const tsx = `<div className={clsx(stack ? 'flex' : 'block', 'text-box-trim')} />`;
+  const report = checkTsx(tsx, { target: 'ternary.tsx' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+  assert.equal(f.verdict, 'unknown');
+});
+
+test('template interpolations keep their literal tokens and stay ambiguous', () => {
+  const tsx = '<div className={`flex ${on ? "text-box-trim" : ""}`} />';
+  const report = checkTsx(tsx, { target: 'template.tsx' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+  assert.equal(f.verdict, 'unknown');
+});
+
+test('a generic component does not re-parent its siblings', () => {
+  const tsx = `<div className="rounded-xl p-2"><List<Item> /></div>
+<div className="rounded-none"><span className="rounded-lg" /></div>`;
+  const report = checkTsx(tsx, { target: 'generic.tsx' });
+  assert.equal(
+    report.findings.filter((f) => f.id === 'rule/non-concentric-radius').length,
+    0,
+    JSON.stringify(report.findings, null, 2),
+  );
+});
+
+test('fragments are transparent in the element tree', () => {
+  const tsx = '<div className="rounded-xl p-2"><><span className="rounded-none" /></></div>';
+  const report = checkTsx(tsx, { target: 'fragment.tsx' });
+  const f = report.findings.find((x) => x.id === 'rule/non-concentric-radius');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+});

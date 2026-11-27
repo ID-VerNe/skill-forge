@@ -152,13 +152,36 @@ function collect(node, inherited, out, ctx) {
       ctx.unresolved.add('use-nested-too-deep');
       return out;
     }
+    if (attrs.width !== undefined || attrs.height !== undefined) {
+      ctx.unresolved.add('use-viewport');
+    }
+
     const x = Number.parseFloat(attrs.x || '0') || 0;
     const y = Number.parseFloat(attrs.y || '0') || 0;
+    let matrix = multiplyMatrix(inherited.matrix, [1, 0, 0, 1, x, y]);
+    if (attrs.transform) matrix = multiplyMatrix(matrix, parseTransform(attrs.transform));
+
+    // A <use> carries its own presentation attributes for the referenced tree.
     const local = {
-      ...inherited,
-      matrix: multiplyMatrix(inherited.matrix, [1, 0, 0, 1, x, y]),
+      matrix,
+      fill: attrs.fill !== undefined ? attrs.fill : inherited.fill,
+      stroke: attrs.stroke !== undefined ? attrs.stroke : inherited.stroke,
+      strokeWidth:
+        attrs['stroke-width'] !== undefined
+          ? Number.parseFloat(attrs['stroke-width'])
+          : inherited.strokeWidth,
+      fillRule: attrs['fill-rule'] || inherited.fillRule,
     };
-    collect(target, local, out, { ...ctx, depth: ctx.depth + 1, unresolved: ctx.unresolved });
+    const inner = { ...ctx, depth: ctx.depth + 1, unresolved: ctx.unresolved };
+
+    if (String(target.tag).toLowerCase() === 'symbol') {
+      // <symbol> is non-rendering on its own but renders when instantiated.
+      for (const child of target.children || []) collect(child, local, out, inner);
+    } else if (NON_RENDERING.has(String(target.tag).toLowerCase())) {
+      ctx.unresolved.add('use-target-not-renderable');
+    } else {
+      collect(target, local, out, inner);
+    }
     return out;
   }
 
@@ -260,7 +283,11 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
 
     if (shape.filled) {
       const net = shape.fillRule === 'evenodd' ? netShapeEvenOdd(subpaths) : netShape(subpaths);
-      if (net.area > 0) {
+      if (net.overlapping) {
+        // Partially overlapping outlines need a boolean XOR; refuse rather than
+        // report a centroid that may sit outside the artwork.
+        ctx.unresolved.add('overlapping-subpaths');
+      } else if (net.area > 0) {
         filledArea += net.area;
         filledCx += net.cx * net.area;
         filledCy += net.cy * net.area;
@@ -298,18 +325,30 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
     };
   }
 
+  const cx = totalArea > 0 ? (filledCx + strokeMx) / totalArea : 0;
+  const cy = totalArea > 0 ? (filledCy + strokeMy) / totalArea : 0;
+
+  // Cheap self-check: a centroid outside its own ink box means the model was fed
+  // something it does not understand.
+  if (
+    finalBox &&
+    (cx < finalBox.minX - 1e-3 ||
+      cx > finalBox.maxX + 1e-3 ||
+      cy < finalBox.minY - 1e-3 ||
+      cy > finalBox.maxY + 1e-3)
+  ) {
+    ctx.unresolved.add('centroid-outside-ink');
+  }
+
   return {
     viewBox,
     ink: {
       bbox: finalBox,
       area: totalArea,
-      centroid: {
-        cx: (filledCx + strokeMx) / totalArea,
-        cy: (filledCy + strokeMy) / totalArea,
-      },
+      centroid: { cx, cy },
     },
     strokeOnly: filledArea === 0 && strokeArea > 0,
-    noInk: false,
+    noInk: totalArea <= 1e-9 || !finalBox,
     unresolved: [...ctx.unresolved],
   };
 }

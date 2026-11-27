@@ -157,11 +157,35 @@ export function pointInPolygon([px, py], polygon) {
   return inside;
 }
 
+/** True when the point lies on the segment within `eps` (perpendicular distance). */
+function pointOnSegment([px, py], [ax, ay], [bx, by], eps = 1e-6) {
+  const len = Math.hypot(bx - ax, by - ay);
+  if (len < eps) return Math.hypot(px - ax, py - ay) <= eps;
+  const cross = Math.abs((bx - ax) * (py - ay) - (by - ay) * (px - ax));
+  if (cross / len > eps) return false;
+  const dot = (px - ax) * (bx - ax) + (py - ay) * (by - ay);
+  return dot >= -eps && dot <= len * len + eps;
+}
+
+/** 'inside' | 'outside' | 'boundary' — boundary is ignored by the classifier. */
+function classifyPoint(point, polygon, eps) {
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+    if (pointOnSegment(point, polygon[j], polygon[i], eps)) return 'boundary';
+  }
+  return pointInPolygon(point, polygon) ? 'inside' : 'outside';
+}
+
 /**
  * Net fill under the even-odd rule. Winding direction is irrelevant: a subpath
  * nested an odd number of levels deep is a hole, two levels deep is solid
  * again. Needed because `fill-rule="evenodd"` icons routinely draw holes with
  * the same winding as their container.
+ *
+ * Containment is only well defined for strictly nested or disjoint subpaths.
+ * Partially overlapping outlines (an XOR shape) need a boolean polygon
+ * operation, which this module does not implement — it reports `overlapping`
+ * so the caller can degrade to `unknown` instead of inventing a centroid that
+ * lands outside the artwork.
  */
 export function netShapeEvenOdd(subpaths) {
   const items = subpaths.map((sub) => ({
@@ -169,24 +193,41 @@ export function netShapeEvenOdd(subpaths) {
     area: Math.abs(subpathSignedArea(sub)),
     centroid: subpathCentroid(sub),
   }));
+  const eps = 1e-6;
+
+  const containers = items.map(() => 0);
+  let overlapping = false;
+  for (let i = 0; i < items.length; i += 1) {
+    for (let j = 0; j < items.length; j += 1) {
+      if (i === j) continue;
+      let inside = 0;
+      let outside = 0;
+      for (const vertex of items[i].sub) {
+        const where = classifyPoint(vertex, items[j].sub, eps);
+        if (where === 'inside') inside += 1;
+        else if (where === 'outside') outside += 1;
+      }
+      if (inside > 0 && outside > 0) overlapping = true;
+      if (inside > 0 && outside === 0) containers[i] += 1;
+    }
+  }
+
+  if (overlapping) {
+    return { area: 0, cx: 0, cy: 0, overlapping: true };
+  }
 
   let area = 0;
   let mx = 0;
   let my = 0;
   for (let i = 0; i < items.length; i += 1) {
-    let depth = 0;
-    const probe = items[i].sub[0];
-    for (let j = 0; j < items.length; j += 1) {
-      if (i !== j && pointInPolygon(probe, items[j].sub)) depth += 1;
-    }
-    const weight = depth % 2 === 0 ? 1 : -1;
+    const weight = containers[i] % 2 === 0 ? 1 : -1;
     area += weight * items[i].area;
     mx += weight * items[i].area * items[i].centroid.cx;
     my += weight * items[i].area * items[i].centroid.cy;
   }
 
-  if (Math.abs(area) < 1e-12) return { area: 0, cx: 0, cy: 0 };
-  return { area: Math.abs(area), cx: mx / area, cy: my / area };
+  if (Math.abs(area) < 1e-12) return { area: 0, cx: 0, cy: 0, overlapping: false };
+  return { area: Math.abs(area), cx: mx / area, cy: my / area, overlapping: false };
 }
 
 export function bboxOfPoints(points) {

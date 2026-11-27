@@ -35,12 +35,16 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 |---|---|
 | empty canvas, no shapes, all shapes `fill:none` without stroke | `geometry/no-ink` |
 | `clip-path`, `mask`, `filter` present | `geometry/unresolved-graphics` |
-| `<use>` pointing at a missing id, or nested deeper than 3 | `geometry/unresolved-graphics` |
+| `<use>` pointing at a missing id, nested deeper than 3, carrying `width`/`height`, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a shape whose `d` failed to parse | `geometry/unresolved-graphics` |
+| even-odd outlines that partially overlap | `geometry/unresolved-graphics` (`overlapping-subpaths`) |
+| a computed centroid outside its own ink box | `geometry/unresolved-graphics` (`centroid-outside-ink`) |
 
 `<use>` is resolved when the target exists: the referenced node is re-walked
-with the `x`/`y` offset folded into the matrix. Anything more dynamic is a gap,
-not a guess.
+with `x`/`y` and its own `transform` folded into the matrix, and `<symbol>`
+targets contribute their children (a symbol only renders when instantiated).
+Anything more dynamic — a viewport, a nested sprite reference — is a gap, not a
+guess.
 
 ### Fill rule
 
@@ -49,6 +53,13 @@ add (holes must be wound opposite). Under `evenodd`, winding is irrelevant: a
 subpath nested an odd number of containment levels is a hole, two levels is
 solid again. Icons routinely draw even-odd holes with the same winding as their
 container, and treating those as additive flips both the area and the centroid.
+
+Containment is classified per vertex: a subpath is *inside* another only when
+none of its vertices fall outside, and vertices lying on the boundary are
+ignored so an L-shaped icon whose hole shares a corner still measures correctly.
+**Partially overlapping outlines are out of scope** — an even-odd XOR needs a
+boolean polygon operation, so the checker reports `overlapping-subpaths` rather
+than a centroid that may land outside the artwork.
 
 ## 2. `#1` ink bbox vs viewBox
 
@@ -204,12 +215,14 @@ codes stay distinct so a broken project never looks like an unverifiable one.
 - Stroke joins, caps and dashes are approximated by a constant-width band.
 - CSS is tokenised, not parsed. Unbalanced braces, unterminated strings and
   declaration-less preludes degrade to `unknown` rather than a best guess.
-- `<use>` resolution is single-target and single-pass; nested or computed
-  references degrade to `unknown`.
+- `<use>` resolution is single-target and single-pass; viewport-carrying or
+  nested sprite references degrade to `unknown`.
 - JSX class names are read as *literal sets*: `clsx('flex', 'text-box-trim')`
-  is understood, `${dynamic}` segments are dropped. A class name assembled
-  entirely at runtime produces no finding — absence of evidence, not evidence
-  of absence.
+  is understood. A conditional expression (`a ? 'flex' : 'block'`) describes
+  two mutually exclusive worlds, so any finding it would produce is downgraded
+  to `unknown`; a class name assembled entirely at runtime produces no finding
+  at all. `{/* … */}` comments are skipped, fragments and `<React.Fragment>` are
+  transparent in the element tree.
 - Perceptual rules (Mach bands, dark-mode weight compensation) are never
   computed. They stay human judgement, marked `[不可校验]` in `SKILL.md`.
 

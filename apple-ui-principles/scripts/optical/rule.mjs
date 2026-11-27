@@ -219,27 +219,88 @@ function extractClassName(attrText) {
   return null;
 }
 
-/**
- * Pull class tokens out of a className expression. Static strings, template
- * literals and `clsx('a', 'b')` wrappers are all just quoted literals, so
- * extracting every literal covers the common dynamic forms without pretending
- * to evaluate them. Template interpolations are dropped.
- */
-export function classNames(expr) {
-  if (!expr) return [];
-  const literals = [];
-  const re = /"([^"]*)"|'([^']*)'|`([^`]*)`/g;
-  let m = re.exec(expr);
-  while (m) {
-    const raw = m[1] ?? m[2] ?? m[3] ?? '';
-    literals.push(raw.replace(/\$\{[^}]*\}/g, ' '));
-    m = re.exec(expr);
+/** Collect every string literal, including literals nested inside `${...}`. */
+function extractLiterals(expr, out = []) {
+  let i = 0;
+  while (i < expr.length) {
+    const ch = expr[i];
+    if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      let s = '';
+      while (j < expr.length && expr[j] !== ch) {
+        if (expr[j] === '\\') {
+          s += expr[j + 1] ?? '';
+          j += 2;
+          continue;
+        }
+        s += expr[j];
+        j += 1;
+      }
+      out.push(s);
+      i = j + 1;
+      continue;
+    }
+    if (ch === '`') {
+      let j = i + 1;
+      let s = '';
+      while (j < expr.length && expr[j] !== '`') {
+        if (expr[j] === '\\') {
+          s += expr[j + 1] ?? '';
+          j += 2;
+          continue;
+        }
+        if (expr[j] === '$' && expr[j + 1] === '{') {
+          out.push(s);
+          s = '';
+          let depth = 1;
+          let k = j + 2;
+          while (k < expr.length && depth > 0) {
+            if (expr[k] === '{') depth += 1;
+            else if (expr[k] === '}') depth -= 1;
+            k += 1;
+          }
+          extractLiterals(expr.slice(j + 2, k - 1), out);
+          j = k;
+          continue;
+        }
+        s += expr[j];
+        j += 1;
+      }
+      out.push(s);
+      i = j + 1;
+      continue;
+    }
+    i += 1;
   }
-  return literals
+  return out;
+}
+
+/**
+ * Class tokens plus whether the set is conditional. `clsx(a ? 'flex' : 'block')`
+ * describes two mutually exclusive worlds; asserting one of them would be a
+ * guess, so callers degrade such findings to `unknown`.
+ */
+export function classInfo(expr) {
+  if (!expr) return { tokens: [], ambiguous: false };
+  const tokens = extractLiterals(expr)
     .join(' ')
     .split(/\s+/)
     .map((t) => t.trim())
     .filter(Boolean);
+  const ambiguous = /[?]|(\|\|)|(\?\?)|(\$\{)/.test(expr);
+  return { tokens, ambiguous };
+}
+
+/** Back-compat helper for callers that only need the token list. */
+export function classNames(expr) {
+  return classInfo(expr).tokens;
+}
+
+function nearestParent(stack) {
+  for (let k = stack.length - 1; k >= 0; k -= 1) {
+    if (!stack[k].fragment) return stack[k];
+  }
+  return null;
 }
 
 export function parseJsx(text) {
@@ -248,7 +309,14 @@ export function parseJsx(text) {
   let i = 0;
 
   while (i < text.length) {
+    // JSX comments contain markup that must not be treated as live code.
+    const comment = text.indexOf('{/*', i);
     const lt = text.indexOf('<', i);
+    if (comment !== -1 && (lt === -1 || comment < lt)) {
+      const end = text.indexOf('*/}', comment);
+      i = end === -1 ? text.length : end + 3;
+      continue;
+    }
     if (lt === -1) break;
 
     const next = text[lt + 1];
@@ -265,9 +333,11 @@ export function parseJsx(text) {
       continue;
     }
 
-    // opening tag: find the '>' that is not inside an expression or a string
+    // opening tag: find the '>' that is not inside an expression, a string or
+    // a generic parameter list such as `<List<Item>>`
     let j = lt + 1;
     let braceDepth = 0;
+    let angle = 0;
     let quote = null;
     while (j < text.length) {
       const ch = text[j];
@@ -287,7 +357,11 @@ export function parseJsx(text) {
       }
       if (ch === '{') braceDepth += 1;
       else if (ch === '}') braceDepth = Math.max(0, braceDepth - 1);
-      else if (ch === '>' && braceDepth === 0) break;
+      else if (ch === '<' && braceDepth === 0) angle += 1;
+      else if (ch === '>' && braceDepth === 0) {
+        if (angle > 0) angle -= 1;
+        else break;
+      }
       j += 1;
     }
     if (j >= text.length) break;
@@ -298,20 +372,22 @@ export function parseJsx(text) {
     const tagMatch = /^([A-Za-z][\w.:-]*)/.exec(body.trimStart());
 
     if (!tagMatch) {
-      // fragment: keep depth for parent bookkeeping, emit nothing
-      if (!selfClosing) stack.push({ tag: '<>', className: null, parent: stack.at(-1) ?? null });
+      // fragment: transparent in the DOM tree, keep depth for pop bookkeeping
+      if (!selfClosing) stack.push({ fragment: true });
       i = j + 1;
       continue;
     }
 
     const tag = tagMatch[1];
     const attrText = body.trimStart().slice(tag.length);
+    const isFragmentTag = tag === 'React.Fragment' || tag === 'Fragment';
     const node = {
       tag,
-      className: extractClassName(attrText),
-      parent: stack.at(-1) ?? null,
+      className: isFragmentTag ? null : extractClassName(attrText),
+      parent: nearestParent(stack),
+      fragment: isFragmentTag,
     };
-    elements.push(node);
+    if (!isFragmentTag) elements.push(node);
     if (!selfClosing) stack.push(node);
     i = j + 1;
   }
@@ -344,34 +420,50 @@ function firstRadius(tokens) {
   return undefined;
 }
 
+/** A conditional class list describes several worlds; never assert one of them. */
+function degradeIfConditional(info, finding) {
+  if (!info.ambiguous) return finding;
+  return {
+    ...finding,
+    forcedVerdict: 'unknown',
+    pixel: false,
+    offset: 0,
+    offsetY: 0,
+    evidence: `${finding.evidence} — the class list is conditional, so the container type depends on runtime state`,
+    suggested: { kind: 'inspect', value: 'make the class list static, or verify both branches' },
+  };
+}
+
 export function checkTsx(text, { target = '<tsx>' } = {}) {
   const elements = parseJsx(text);
   const findings = [];
 
   for (const el of elements) {
-    const tokens = classNames(el.className);
-    const hasBoxTrim = tokens.some(isBoxTrim);
-    const flexy = tokens.find((t) => FLEXY.test(t));
+    const info = classInfo(el.className);
+    const hasBoxTrim = info.tokens.some(isBoxTrim);
+    const flexy = info.tokens.find((t) => FLEXY.test(t));
     if (hasBoxTrim && flexy) {
-      findings.push({
-        id: 'rule/text-box-in-flex',
-        layer: 'exact',
-        forcedVerdict: 'off',
-        pixel: false,
-        evidence: `<${el.tag} className="${tokens.join(' ')}">: ${flexy} + text-box — trimming is a no-op inside a flex/grid container`,
-        suggested: { kind: 'hoist', value: `move text-box to the text child of <${el.tag}>` },
-      });
+      findings.push(
+        degradeIfConditional(info, {
+          id: 'rule/text-box-in-flex',
+          layer: 'exact',
+          forcedVerdict: 'off',
+          pixel: false,
+          evidence: `<${el.tag} className="${info.tokens.join(' ')}">: ${flexy} + text-box — trimming is a no-op inside a flex/grid container`,
+          suggested: { kind: 'hoist', value: `move text-box to the text child of <${el.tag}>` },
+        }),
+      );
     }
   }
 
   for (const el of elements) {
-    const tokens = classNames(el.className);
-    const outerRadius = firstRadius(tokens);
+    const info = classInfo(el.className);
+    const outerRadius = firstRadius(info.tokens);
     if (outerRadius === undefined) continue;
 
-    const uniform = tokens.map((t) => tailwindPadding(t)).find((p) => p !== null && p !== undefined);
-    const padX = tokens.map((t) => tailwindPadding(t, 'x')).find((p) => p !== null && p !== undefined);
-    const padY = tokens.map((t) => tailwindPadding(t, 'y')).find((p) => p !== null && p !== undefined);
+    const uniform = info.tokens.map((t) => tailwindPadding(t)).find((p) => p !== null && p !== undefined);
+    const padX = info.tokens.map((t) => tailwindPadding(t, 'x')).find((p) => p !== null && p !== undefined);
+    const padY = info.tokens.map((t) => tailwindPadding(t, 'y')).find((p) => p !== null && p !== undefined);
 
     let padding;
     if (uniform !== undefined) {
@@ -395,22 +487,30 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
 
     for (const child of elements) {
       if (child.parent !== el) continue;
-      const childRadius = firstRadius(classNames(child.className));
+      const childInfo = classInfo(child.className);
+      const childRadius = firstRadius(childInfo.tokens);
       if (childRadius === undefined) continue;
 
+      const conditional = info.ambiguous || childInfo.ambiguous;
+
       if (padding >= outerRadius) {
-        findings.push({
-          id: 'rule/non-concentric-radius',
-          layer: 'heuristic',
-          forcedVerdict: 'nudge',
-          radius: 'exceeds',
-          pixel: false,
-          evidence: `<${el.tag}> has ${px(outerRadius)} radius inside ${px(padding)} padding; the inner radius resolves to 0 and the outer curve is lost — the outer radius is too small for its padding`,
-          suggested: {
-            kind: 'outer-radius',
-            value: `raise the outer radius above ${px(padding)} or reduce the padding`,
-          },
-        });
+        findings.push(
+          degradeIfConditional(
+            conditional ? { ambiguous: true } : { ambiguous: false },
+            {
+              id: 'rule/non-concentric-radius',
+              layer: 'heuristic',
+              forcedVerdict: 'nudge',
+              radius: 'exceeds',
+              pixel: false,
+              evidence: `<${el.tag}> has ${px(outerRadius)} radius inside ${px(padding)} padding; the inner radius resolves to 0 and the outer curve is lost — the outer radius is too small for its padding`,
+              suggested: {
+                kind: 'outer-radius',
+                value: `raise the outer radius above ${px(padding)} or reduce the padding`,
+              },
+            },
+          ),
+        );
         continue;
       }
 
@@ -418,19 +518,24 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
       const delta = childRadius - expected;
       if (Math.abs(delta) <= 0.5) continue;
 
-      findings.push({
-        id: 'rule/non-concentric-radius',
-        layer: 'heuristic',
-        offset: delta,
-        basis: Math.max(outerRadius, 1),
-        evidence:
-          `<${el.tag}> radius ${px(outerRadius)} with padding ${px(padding)} expects an inner radius of ` +
-          `${px(expected)}, found ${px(childRadius)} on <${child.tag}>`,
-        suggested: {
-          kind: 'radius',
-          value: `calc(${px(outerRadius)} - ${px(padding)})`,
-        },
-      });
+      findings.push(
+        degradeIfConditional(
+          conditional ? { ambiguous: true } : { ambiguous: false },
+          {
+            id: 'rule/non-concentric-radius',
+            layer: 'heuristic',
+            offset: delta,
+            basis: Math.max(outerRadius, 1),
+            evidence:
+              `<${el.tag}> radius ${px(outerRadius)} with padding ${px(padding)} expects an inner radius of ` +
+              `${px(expected)}, found ${px(childRadius)} on <${child.tag}>`,
+            suggested: {
+              kind: 'radius',
+              value: `calc(${px(outerRadius)} - ${px(padding)})`,
+            },
+          },
+        ),
+      );
     }
   }
 
