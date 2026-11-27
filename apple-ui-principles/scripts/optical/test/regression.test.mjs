@@ -1608,14 +1608,16 @@ test('a paint server that does not exist paints nothing', () => {
   const fallback = analyzeSvg(svg('<rect x="2" y="2" width="20" height="20" fill="url(#nope) red"/>'));
   near(fallback.ink.area, 400, 1e-6);
 
-  // A reference to a non-paint-server is invalid too.
+  // A reference to something that is not a paint server is markup no engine
+  // honours — but calling it "no ink" would silently delete ink if the tag were
+  // one this pass has not heard of, so it is refused.
   const clip = analyzeSvg(
     svg(
       '<defs><clipPath id="c"><rect width="4" height="4"/></clipPath></defs>' +
         '<rect x="2" y="2" width="20" height="20" fill="url(#c)"/>',
     ),
   );
-  assert.equal(clip.noInk, true);
+  assert.ok(clip.unresolved.includes('paint-server'), JSON.stringify(clip.unresolved));
 });
 
 test('overflow="visible" lets a nested viewport draw outside itself', () => {

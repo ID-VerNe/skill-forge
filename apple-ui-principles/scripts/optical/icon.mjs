@@ -437,21 +437,26 @@ const PAINT_SERVER = new Set([
 ]);
 
 /**
- * True when a paint value references a paint server that does not exist.
+ * What a `fill="url(#…)"` reference actually paints.
  *
- * `url(#missing)` is not "a colour we cannot read": SVG says the element is not
- * rendered, so the shape has no ink at all. Counting it as painted invented a
- * 20×20 region out of nothing — and any verdict built on it was about ink the
- * browser never drew. `url(#g) red` carries a fallback colour and does paint.
+ * Three answers, because there are three situations. A **missing** id paints
+ * nothing — SVG leaves the element unrendered, so counting the shape as painted
+ * invented a region nobody drew. A reference to a real paint server paints the
+ * shape's own region; only the colour or pattern changes, and colour is not
+ * measured. Anything else (`url(#someClipPath)`) is markup no engine honours,
+ * but guessing "nothing" would silently delete ink if the tag is one of the
+ * renderers this list does not know — so it is refused instead.
+ *
+ * `url(#g) red` carries a fallback paint and is treated as painted.
  */
-function paintAbsent(paint, ctx) {
-  if (paint === undefined || paint === null) return false;
+function paintReference(paint, ctx) {
+  if (paint === undefined || paint === null) return 'paint';
   const match = /^url\(\s*['"]?#([^)'"\s]+)['"]?\s*\)([\s\S]*)$/i.exec(String(paint).trim());
-  if (!match) return false;
-  if (match[2].trim() !== '') return false;
+  if (!match) return 'paint';
+  if (match[2].trim() !== '') return 'paint';
   const target = ctx.ids.get(match[1]);
-  if (!target) return true;
-  return !PAINT_SERVER.has(String(target.tag).toLowerCase());
+  if (!target) return 'absent';
+  return PAINT_SERVER.has(String(target.tag).toLowerCase()) ? 'paint' : 'unknown';
 }
 
 /**
@@ -576,8 +581,12 @@ function bboxOfShapes(shapes, steps, ctx) {
     const localBox = bboxOfPoints(points);
     let pad = 0;
     // Under a non-uniform transform the stroke is elliptical; padding by the
-    // larger axis keeps the containment test conservative.
-    if (shape.stroked) pad = (shape.strokeWidth * maxScale(shape.matrix)) / 2;
+    // larger axis keeps the containment test conservative. A non-scaling stroke
+    // keeps its authored width no matter what the ancestors do.
+    if (shape.stroked) {
+      const strokeScale = shape.nonScalingStroke ? 1 : maxScale(shape.matrix);
+      pad = (shape.strokeWidth * strokeScale) / 2;
+    }
     box = bboxUnion(box, bboxExpand(localBox, pad));
   }
   return box;
@@ -813,6 +822,13 @@ function collect(node, inherited, out, ctx) {
         if (isRuntimePaint(fillPaint) || isRuntimePaint(strokePaint)) {
           ctx.unresolved.add('runtime-paint');
         }
+        // A paint reference decides whether there is ink at all, so resolve it
+        // before the shape is recorded.
+        const fillRef = paintReference(fillPaint, ctx);
+        const strokeRef = paintReference(strokePaint, ctx);
+        for (const which of [fillRef, strokeRef]) {
+          if (which === 'unknown') ctx.unresolved.add('paint-server');
+        }
         out.push({
           d: shape.d,
           matrix: own,
@@ -822,7 +838,7 @@ function collect(node, inherited, out, ctx) {
             !keywordIs(fillPaint, 'none') &&
             !isInvisiblePaint(fillPaint) &&
             fillOpacityOf(attrs, inherited) !== 0 &&
-            !paintAbsent(fillPaint, ctx),
+            fillRef !== 'absent',
           // `stroke-width: 0` and `stroke-opacity: 0` both draw nothing; the
           // band would otherwise be invented from a stroke the render omits.
           stroked:
@@ -831,7 +847,7 @@ function collect(node, inherited, out, ctx) {
             !isInvisiblePaint(strokePaint) &&
             strokeOpacityOf(attrs, inherited) !== 0 &&
             strokeUnits !== 0 &&
-            !paintAbsent(strokePaint, ctx),
+            strokeRef !== 'absent',
           strokeWidth: strokeUnits,
           // `vector-effect="non-scaling-stroke"` keeps the band at its authored
           // width however the ancestors scale the shape — the area loop below

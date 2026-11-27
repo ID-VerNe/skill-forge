@@ -33,7 +33,10 @@ Two rules keep that pipeline from lying:
   a region out of nothing, and every verdict built on it described ink the browser
   never drew. `url(#g) red` carries a fallback colour and does paint; a reference
   to a real gradient or pattern paints the same region, since only the colour
-  changes and colour is not measured.
+  changes and colour is not measured. A reference to something that is **not** a
+  paint server (`url(#someClipPath)`) is refused as `paint-server` rather than
+  read as "nothing" — if the tag is one this pass has not heard of, guessing
+  would delete ink silently, which is the one failure that costs a verdict.
 - **`vector-effect="non-scaling-stroke"` keeps its width.** The band stays at the
   authored width while its path is scaled, so the area is computed from the path
   geometry at scale 1 — under `scale(4)` a 1-unit stroke on a 16-unit perimeter
