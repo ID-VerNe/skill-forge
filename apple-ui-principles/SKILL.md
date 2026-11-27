@@ -156,7 +156,7 @@ The two geometry findings have **different** fixes, and the report says which:
 
 | Finding | Fix | `suggested.value` |
 |---|---|---|
-| `geometry/ink-bbox` | move the viewBox origin | delta to add to the origin (paste `suggested.viewBox`) |
+| `geometry/ink-bbox` | move the viewBox origin | size of the correction in px (paste `suggested.viewBox`) |
 | `geometry/centroid` | redraw the mass — translating cannot fix it | how far to move the visual mass |
 
 A centroid offset survives any translation because the centroid and the ink box
@@ -168,7 +168,13 @@ move together. If the number is inside tolerance, leave the shape alone.
 { "kind": "viewBox-origin", "value": "-4px / 0px", "viewBox": "-4 0 24 24" }
 ```
 
-`value` is the delta **added to the viewBox origin** (moving the origin by `d` moves the artwork by `−d`), and `viewBox` is the resulting attribute. Prefer `viewBox` — pasting it cannot flip a sign.
+`viewBox` is the corrected attribute — paste it. `value` is the size of that
+correction in rendered px, the same units as `measured`, and it is **not**
+always the number to add to the origin: the origin is in user units, so on a
+512-unit grid `value` says `-0.57px` while the origin moves by `-12.19`. When a
+user unit is not a pixel and the offset is non-zero, `suggested.delta` carries
+the figure that goes into the origin; it is absent when it would just repeat
+`value`. Sign: moving the origin by `d` moves the artwork by `−d`.
 
 All reported offsets are in rendered px, not viewBox units. `meta.unitScale` says how they were derived: a root `width="48"` on a 24-unit viewBox yields `2`, and the evidence string appends `[user units ×2 = px]`. With no absolute `width`/`height` the icon is assumed to render at **24px on its short side**, so a 480-unit grid scales by `0.05`. That keeps the verdict a property of the drawing rather than of the canvas size — a 512-unit Font Awesome glyph and a 24-unit icon with the same 8% imbalance now agree.
 

@@ -181,7 +181,7 @@ why the kind is part of the contract rather than decoration:
 
 | `kind` | `value` means | `measured.dx` relation |
 |---|---|---|
-| `viewBox-origin` | delta to **add to the viewBox origin** | equal to `measured.dx` |
+| `viewBox-origin` | the correction sized in px; add `delta` to the origin | equal to `measured.dx` |
 | `redraw` | how far to move the **visual mass inside the artwork** | `−measured.dx` |
 
 ```json
@@ -192,6 +192,14 @@ Moving the origin by `d` moves the artwork by `−d`, so `viewBox-origin` equals
 the measured offset itself. The `viewBox` string is the unambiguous form — an
 agent that pastes it gets the centred result, whereas a signed number invites a
 sign flip.
+
+`value` is px, but the origin is in user units, so the two only line up on a
+1:1 icon. On a 512-unit grid the same finding reads `value: "-0.57px"` with
+`viewBox "-12.19 -12.19 512 512"`; adding `-0.57` to the origin would move the
+artwork by half a unit and change nothing visible. Whenever the scale is not 1
+the finding therefore also carries `delta`, the user-unit form that actually
+goes into the attribute. `delta` is omitted when it would merely repeat `value`
+— that is, on a 1:1 icon, or when the offset is already zero.
 
 `redraw` is the `#2` case, and it is a different fix: **translating the artwork
 cannot change a centroid offset**, because the centroid and the ink box move

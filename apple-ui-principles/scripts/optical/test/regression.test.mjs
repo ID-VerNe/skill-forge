@@ -933,3 +933,34 @@ test('verdicts are comparable across icon grids', () => {
   assert.equal(a.verdict, b.verdict, `${a.verdict} vs ${b.verdict}`);
   near(a.relative.dx_pct, b.relative.dx_pct, 1e-9);
 });
+
+test('a px suggestion is not the number to add to the origin', () => {
+  // The viewBox origin is in user units; `value` is in px. On a non-1:1 grid the
+  // two differ, so `delta` has to be published or the advice is unusable.
+  const report = checkShape(
+    analyzeSvg(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480">' +
+        '<rect x="0" y="0" width="440" height="480"/></svg>',
+    ),
+    { target: 'wide.svg' },
+  );
+  const bbox = report.findings.find((f) => f.id === 'geometry/ink-bbox');
+  near(bbox.measured.dx, -20 * 0.05, 1e-6); // 20 user units left of centre, at 0.05 px/unit
+  assert.ok(bbox.suggested.delta, `missing delta: ${JSON.stringify(bbox.suggested)}`);
+  const [dx] = bbox.suggested.delta.split('/').map((s) => Number(s));
+  near(dx, -20, 1e-6);
+  const originX = Number(bbox.suggested.viewBox.split(' ')[0]);
+  near(originX, -20, 1e-6);
+  // The attribute and the delta agree; `value` deliberately does not.
+  assert.match(bbox.suggested.value, /^-1px \/ 0px$/);
+});
+
+test('a 1:1 icon gets no delta field, because value already is the delta', () => {
+  const report = checkShape(analyzeSvg(svg('<rect x="0" y="0" width="20" height="24"/>')), {
+    target: 'square.svg',
+  });
+  const bbox = report.findings.find((f) => f.id === 'geometry/ink-bbox');
+  assert.equal(bbox.suggested.delta, undefined);
+  assert.match(bbox.suggested.value, /^-2px \/ 0px$/);
+  assert.match(bbox.suggested.viewBox, /^-2 0 24 24$/);
+});

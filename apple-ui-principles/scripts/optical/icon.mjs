@@ -760,6 +760,11 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
   const dInkX = inkCenter.x - vbCenter.x;
   const dInkY = inkCenter.y - vbCenter.y;
 
+  // `value` is px, but a viewBox origin is in user units. Publish the user-unit
+  // figure whenever the two differ and there is something to add.
+  const deltaInUserUnits =
+    (sx !== 1 || sy !== 1) && (Math.abs(dInkX) > 1e-9 || Math.abs(dInkY) > 1e-9);
+
   findings.push({
     id: 'geometry/ink-bbox',
     layer: 'exact',
@@ -771,10 +776,14 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
       `(${round(ink.bbox.maxX)},${round(ink.bbox.maxY)}) centre=(${round(inkCenter.x)},${round(inkCenter.y)}) ` +
       `viewBox centre=(${round(vbCenter.x)},${round(vbCenter.y)})${scaleNote}`,
     suggested: {
-      // Delta to add to the viewBox origin: moving the origin by +delta moves the
-      // artwork by -delta, so this is the measured offset itself.
+      // The viewBox attribute below is the corrected one; `value` is the same
+      // correction sized in px, matching every other reported number. The two only
+      // coincide when a user unit happens to be a pixel, so `delta` carries the
+      // user-unit figure that actually goes into the origin whenever they differ —
+      // adding `value` to a 512-unit origin would move the artwork by half a unit.
       kind: 'viewBox-origin',
       value: `${round(dInkX * sx, 2)}px / ${round(dInkY * sy, 2)}px`,
+      ...(deltaInUserUnits ? { delta: `${round(dInkX, 3)} / ${round(dInkY, 3)}` } : {}),
       viewBox: `${round(viewBox.x + dInkX, 3)} ${round(viewBox.y + dInkY, 3)} ${round(viewBox.w, 3)} ${round(viewBox.h, 3)}`,
     },
   });
