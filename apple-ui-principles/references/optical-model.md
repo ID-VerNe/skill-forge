@@ -75,6 +75,7 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | `<style>` containing `@import` | `geometry/unresolved-graphics` (`stylesheet-unparsed`) — the imported sheet may paint any element, and it is not in the file |
 | a matching rule that declares `animation` / `animation-name` (other than `none`) | `geometry/unresolved-graphics` (`css-animation`) — the paint comes from a `@keyframes` block this pass does not evaluate |
 | `fill` / `stroke` set to `var()` or `env()` | `geometry/unresolved-graphics` (`runtime-paint`) — the value is defined outside the file |
+| `fill` / `stroke` set to `url(#id)` where `#id` is not a paint server | `geometry/unresolved-graphics` (`paint-server`) — no engine paints it, but calling it "no ink" would delete real ink if the tag were one this pass has not heard of |
 | `<?xml-stylesheet?>` pointing at an external sheet | `geometry/unresolved-graphics` (`external-stylesheet`) |
 | animation that moves ink (`animateTransform`, `animateMotion`, `animate` on a geometry attribute, or on `fill`/`stroke`/an opacity reaching zero paint) | `geometry/unresolved-graphics` (`animated-ink`) — one frame is not the drawing |
 | ink that leaves its viewport | `geometry/unresolved-graphics` (`ink-outside-viewport`) — the browser clips it |
