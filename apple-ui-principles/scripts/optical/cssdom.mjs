@@ -16,6 +16,9 @@ const GROUPING_AT_RULES = new Set([
 
 class Unresolved extends Error {}
 
+/** Grouping and nesting deeper than this is refused, not recursed into. */
+const MAX_DEPTH = 64;
+
 function skipString(src, i) {
   const quote = src[i];
   let j = i + 1;
@@ -92,6 +95,7 @@ export function parseCss(src) {
 }
 
 function walk(src, from, to, context, blocks) {
+  if (context.length > MAX_DEPTH) throw new Unresolved('css-nesting-too-deep');
   let i = from;
   while (i < to) {
     // skip whitespace and comments
@@ -134,8 +138,12 @@ function walk(src, from, to, context, blocks) {
     }
 
     if (src[i] === '}') {
+      // A stray `}` at the top of the sheet is a CSS parse error the browser
+      // consumes and recovers from. Returning here instead would silently drop
+      // every rule after it — fewer rules, no warning, different verdict.
       if (prelude) throw new Unresolved('declaration outside a block');
-      return i;
+      i += 1;
+      continue;
     }
 
     // src[i] === '{'
@@ -217,7 +225,8 @@ function findMatchingBrace(src, openIndex, limit) {  let depth = 0;
 }
 
 /** Separate own declarations from nested rules inside a single block body. */
-function splitBlock(body) {
+function splitBlock(body, depth = 0) {
+  if (depth > MAX_DEPTH) throw new Unresolved('css-nesting-too-deep');
   const decls = {};
   // Source order is kept separately: `decls` is a map, so `text-box` followed by
   // `text-box-trim` and the reverse collapse to the same two keys with different
@@ -252,7 +261,7 @@ function splitBlock(body) {
         }
       }
       if (selector) {
-        const sub = splitBlock(body.slice(i + 1, close));
+        const sub = splitBlock(body.slice(i + 1, close), depth + 1);
         nested.push({ selector, decls: sub.decls, order: sub.order, nested: sub.nested });
       }
       i = close + 1;

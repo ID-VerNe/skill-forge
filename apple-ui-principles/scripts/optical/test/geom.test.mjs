@@ -41,16 +41,21 @@ test('signed area is negative for counter-clockwise subpath', () => {
 
 test('holes subtract from net area but keep centroid', () => {
   const subs = flattenPath('M0 0 H20 V20 H0 Z M8 8 H12 V12 H8 Z');
-  const shape = netShape(subs);
-  // Same winding -> both positive -> subtraction requires opposite winding.
-  // Instead assert the helper reports the summed signed area faithfully.
-  near(shape.area, 400 + 16, 1e-6);
+  // Same winding inside a container means winding 2, which the renderer still
+  // paints once. Adding the inner area would over-count every "solid shape with
+  // a decorative inner square" export.
+  near(netShape(subs).area, 400, 1e-6);
 
   const holed = flattenPath('M0 0 H20 V20 H0 Z M8 8 V12 H12 V8 Z');
   const netted = netShape(holed);
   near(netted.area, 400 - 16, 1e-6);
   near(netted.cx, 10);
   near(netted.cy, 10);
+
+  // Disjoint regions never cancel, whatever their winding: each one has winding
+  // 1 on its own.
+  const disjoint = flattenPath('M0 0 H10 V10 H0 Z M20 0 V10 H30 V0 Z');
+  near(netShape(disjoint).area, 100 + 100, 1e-6);
 });
 
 test('circle approximated by arcs: area within 0.6 of PI r^2', () => {

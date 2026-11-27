@@ -36,8 +36,9 @@ test('fill-rule="evenodd" subtracts a same-winding hole', () => {
   const nonzero = analyzeSvg(svg(`<path d="${path}"/>`));
   const evenodd = analyzeSvg(svg(`<path fill-rule="evenodd" d="${path}"/>`));
 
-  // non-zero: both subpaths wind the same way, so they add up
-  near(nonzero.ink.area, 256 + 88, 1e-6);
+  // non-zero: same winding inside a container means winding 2, which is still
+  // one fill — the inner square adds nothing, it does not double the area.
+  near(nonzero.ink.area, 256, 1e-6);
   // even-odd: 256 - 88 = 168, centroid pulled towards the light corner
   near(evenodd.ink.area, 168, 1e-6);
   const expectedCx = (256 * 12 - 88 * 13.5) / 168;
@@ -1201,4 +1202,192 @@ test('one unreadable path does not take the batch down', () => {
   assert.equal(reports[1].verdict, 'unknown');
   assert.match(reports[1].findings[0].id, /keyline-empty/);
   assert.equal(out.status, 2);
+});
+
+// --- cascade, continued ----------------------------------------------------
+
+test('!important attaches to a declaration, not to its block', () => {
+  // `.bg` marks only `fill` important; `stroke:#000` stays normal, so `#bg`'s
+  // `stroke:none` still wins. Treating the block as one unit silently painted a
+  // 24x24 background and turned a certain `off` into `ok`.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><style>' +
+      '.bg{fill:none !important; stroke:#000} #bg{stroke:none}' +
+      '</style><rect id="bg" class="bg" width="24" height="24"/>' +
+      '<rect x="2" y="2" width="2" height="2"/></svg>',
+  );
+  near(shape.ink.area, 4, 1e-6);
+  assert.equal(checkShape(shape, { target: 'leak.svg' }).verdict, 'off');
+});
+
+test('inline !important outranks a stylesheet rule', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>.x{fill:#000}</style>' +
+      '<rect class="x" style="fill:none !important" width="24" height="24"/>' +
+      '<rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  near(shape.ink.bbox.minX, 14);
+});
+
+test('a stylesheet !important outranks plain inline style', () => {
+  // The order is sheet-normal < inline-normal < sheet-important <
+  // inline-important. Applying inline last unconditionally gets this wrong.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>.x{fill:none !important}</style>' +
+      '<rect class="x" style="fill:#000" width="24" height="24"/>' +
+      '<rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  near(shape.ink.bbox.minX, 14);
+});
+
+test('a commented-out <style> is documentation, not paint', () => {
+  const commented = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<!-- <style>.bg{fill:none}</style> -->' +
+      '<rect class="bg" width="24" height="24"/>' +
+      '<rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  const absent = analyzeSvg(
+    svg('<rect class="bg" width="24" height="24"/><rect x="14" y="8" width="8" height="8"/>'),
+  );
+  near(commented.ink.area, absent.ink.area, 1e-6);
+  near(commented.ink.centroid.cx, absent.ink.centroid.cx, 1e-6);
+});
+
+test('a stray brace does not truncate the rest of the sheet', () => {
+  const clean = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>.a{fill:#000} .a{fill:none}</style>' +
+      '<rect class="a" width="24" height="24"/><rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  const stray = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>.a{fill:#000}} .a{fill:none}</style>' +
+      '<rect class="a" width="24" height="24"/><rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  near(stray.ink.area, clean.ink.area, 1e-6);
+  assert.deepEqual(stray.unresolved, []);
+});
+
+test('a compound selector of tag and id is evaluated, not refused', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>rect#bg{fill:none}</style>' +
+      '<rect id="bg" width="24" height="24"/><rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.bbox.minX, 14);
+});
+
+// --- more ways a canvas can be unknown --------------------------------------
+
+test('a percentage root width leaves the canvas unknown', () => {
+  // `width="100%"` is sized by the host. Falling back to 24x24 invented a canvas
+  // and reported an offset against it.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">' +
+      '<rect x="0" y="0" width="20" height="20"/></svg>',
+  );
+  assert.match(shape.unresolved.join(), /relative-canvas/);
+  assert.equal(checkShape(shape, { target: 'pct.svg' }).verdict, 'unknown');
+});
+
+test('an animated icon is not measured from one frame', () => {
+  const spinner = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<g><path d="M12 3 A9 9 0 0 1 21 12" fill="none" stroke="#000" stroke-width="2"/>' +
+      '<animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="1s" repeatCount="indefinite"/>' +
+      '</g></svg>',
+  );
+  assert.match(spinner.unresolved.join(), /animated-ink/);
+
+  // A colour cycle moves no ink, so the geometry still stands.
+  const pulse = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<rect x="2" y="0" width="20" height="24" fill="#000">' +
+      '<animate attributeName="fill" from="#000" to="#f00" dur="1s"/></rect></svg>',
+  );
+  assert.deepEqual(pulse.unresolved, []);
+});
+
+test('ink the viewport would clip is refused', () => {
+  const symbol = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<symbol id="s"><rect x="-40" y="-40" width="100" height="100"/></symbol>' +
+      '<use href="#s"/></svg>',
+  );
+  assert.match(symbol.unresolved.join(), /ink-outside-viewport/);
+
+  const inside = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<symbol id="s"><rect x="4" y="4" width="16" height="16"/></symbol>' +
+      '<use href="#s"/></svg>',
+  );
+  assert.deepEqual(inside.unresolved, []);
+});
+
+test('a hidden symbol contributes no ink', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<symbol id="s" visibility="hidden"><rect width="24" height="24"/></symbol>' +
+      '<use href="#s"/><rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  near(shape.ink.bbox.minX, 14);
+});
+
+// --- smaller corrections ----------------------------------------------------
+
+test('disjoint subpaths never cancel, whatever their winding', () => {
+  // Both regions have winding 1 on their own, so an opposite direction is not a
+  // hole. The signed sum removed one of them and dragged the centroid.
+  const shape = analyzeSvg(
+    svg('<path d="M0 0 H10 V10 H0 Z M20 0 V10 H30 V0 Z"/>'),
+  );
+  near(shape.ink.area, 200, 1e-6);
+  near(shape.ink.centroid.cx, 15, 1e-6);
+});
+
+test('an empty path is empty, not unparseable', () => {
+  const shape = analyzeSvg(svg('<path d="" /><rect x="2" y="0" width="20" height="24"/>'));
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 480, 1e-6);
+});
+
+test('CSS keywords are case-insensitive', () => {
+  const shape = analyzeSvg(
+    svg('<rect fill="None" width="24" height="24"/><rect x="14" y="8" width="8" height="8"/>'),
+  );
+  near(shape.ink.bbox.minX, 14);
+});
+
+test('trailing junk invalidates the whole transform list', () => {
+  // `translate(10,10) garbage` is not a translation. Splicing it out moved the
+  // artwork 10 units and said nothing.
+  const shape = analyzeSvg(
+    svg('<g transform="translate(10,10) garbage"><rect x="0" y="0" width="2" height="2"/></g>'),
+  );
+  assert.match(shape.unresolved.join(), /unparsed-transform/);
+});
+
+test('a directory with an unreadable icon reports unknown, never ok', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optical-'));
+  writeFileSync(join(dir, 'a.svg'), svg('<rect x="2" y="0" width="20" height="24"/>'));
+  // A directory whose name ends in .svg makes readFile fail inside the set.
+  mkdirSync(join(dir, 'b.svg'));
+  const out = run('check', dir, '--json');
+  const report = JSON.parse(out.stdout);
+  assert.equal(report.verdict, 'unknown');
+  assert.equal(out.status, 2);
+});
+
+test('a partially parsed path is refused, not measured in halves', () => {
+  // svgpath reports `M0 0 L` as "missed param" and still hands back one point.
+  // Measuring that fragment would move the ink box to a place the drawing is not.
+  for (const d of ['M0 0 L', 'garbage']) {
+    const shape = analyzeSvg(svg(`<path d="${d}"/><rect x="2" y="0" width="20" height="24"/>`));
+    assert.match(shape.unresolved.join(), /unparsed-path/, d);
+    assert.equal(checkShape(shape, { target: 'p.svg' }).verdict, 'unknown', d);
+  }
 });

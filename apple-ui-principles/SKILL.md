@@ -130,8 +130,9 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 |---|---|---|
 | `icon.svg` | `standalone` | ink box vs viewBox, centroid vs ink box |
 | `icon.svg` with `<text>`/`<image>` | — | `unknown`: visible ink that is not geometry |
-| `icon.svg` painting through `<style>`/`class` | — | paint is resolved, not ignored: attribute < rule < inline `style` |
+| `icon.svg` painting through `<style>`/`class` | — | paint is resolved: sheet normal < inline normal < sheet `!important` < inline `!important` |
 | `icon.svg` with `%` geometry or a `%` `stroke-width` | — | `unknown`: relative to a viewport the checker cannot see |
+| `icon.svg` that animates, or draws outside its viewport | — | `unknown`: one frame is not the drawing, and the browser clips the rest |
 | `icons/` (dir) | `keyline` | fill-ratio outliers across the set (needs ≥3 icons of one family) |
 | `styles.css` | rule | `text-box` in flex/grid, hard-coded nudges |
 | `Button.tsx` | rule | same, plus concentric radii from the element tree |

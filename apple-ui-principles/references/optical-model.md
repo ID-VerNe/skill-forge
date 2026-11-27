@@ -42,16 +42,21 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | a `clip-path` whose geometry is not a plain rect, or one that cuts the ink | `geometry/unresolved-graphics` |
 | `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
-| a `transform` with a percentage or unit argument | `geometry/unresolved-graphics` (`unparsed-transform`) |
+| a `transform` with a percentage or unit argument, or with trailing junk | `geometry/unresolved-graphics` (`unparsed-transform`) |
 | a percentage or relative `stroke-width`, on the shape **or any ancestor** | `geometry/unresolved-graphics` (`stroke-width-percentage`, `stroke-width-relative`) |
-| a shape whose `d` failed to parse | `geometry/unresolved-graphics` |
+| a `d` the path parser rejects or only partially parses | `geometry/unresolved-graphics` (`unparsed-path`) — svgpath reports `M0 0 L` as "missed param" and still returns one point |
 | a geometry length in `%`, `em`, `pt`… | `geometry/unresolved-graphics` (`unparsed-length`) — a percentage is relative to a viewport we cannot see, and `parseFloat("100%")` is `100` |
 | a `viewBox` attribute that is not four finite numbers with a positive size | `geometry/unresolved-graphics` (`invalid-viewBox`) — the element does not render, so there is no canvas to measure against |
+| no `viewBox` and a relative `width`/`height` | `geometry/unresolved-graphics` (`relative-canvas`) — the canvas is whatever the host gives it |
 | `<style>` rules this pass cannot evaluate (combinators, pseudo-classes, `@media`, geometry properties) | `geometry/unresolved-graphics` (`stylesheet-selector`, `stylesheet-conditional`, `stylesheet-geometry`) |
+| `<?xml-stylesheet?>` pointing at an external sheet | `geometry/unresolved-graphics` (`external-stylesheet`) |
+| animation that moves ink (`animateTransform`, `animateMotion`, `animate` on a geometry attribute) | `geometry/unresolved-graphics` (`animated-ink`) — one frame is not the drawing |
+| ink that leaves its viewport | `geometry/unresolved-graphics` (`ink-outside-viewport`) — the browser clips it |
 | groups nested more than 200 deep | `geometry/unresolved-graphics` (`nesting-too-deep`) |
 | two subpaths with the same outline | `geometry/unresolved-graphics` (`overlapping-subpaths`) — they cancel under even-odd and render once under nonzero, so the sum is wrong either way |
 | even-odd outlines that partially overlap | `geometry/unresolved-graphics` (`overlapping-subpaths`) |
 | a computed centroid outside its own ink box | `geometry/unresolved-graphics` (`centroid-outside-ink`) |
+| a file the CLI could not read or parse in a batch | `geometry/input-error` |
 | an empty directory passed to keyline mode | `geometry/keyline-empty` |
 
 `<use>` is resolved when the target exists: the referenced node is re-walked
@@ -71,15 +76,31 @@ Exported icons often paint through a class rather than a presentation attribute:
 Ignoring that block does not leave the file ambiguous — it makes the checker
 wrong, because the element it measures as a solid background is in fact
 invisible. So `<style>` bodies are parsed and applied, in cascade order:
-presentation attribute < stylesheet rule < inline `style`, with `!important`
-outranking all of them and specificity (`#id` > `.class` > `tag`) breaking ties
-before source order.
+
+```
+sheet normal  <  inline normal  <  sheet !important  <  inline !important
+```
+
+then specificity (`#id` > `.class` > `tag`) breaking ties before source order.
+Importance belongs to a *declaration*, not to its block: in
+`.bg{fill:none !important; stroke:#000}` only `fill` is important, so a later
+`#bg{stroke:none}` still wins on `stroke`. Marking the whole block important
+painted a background and turned a certain `off` into `ok`.
 
 The supported selector grammar is deliberately small: a compound of one tag,
-one `#id` and any number of `.classes`, plus `*`, and comma lists of those.
-Anything else — descendant combinators, `:hover`, `[attr=…]`, `@media` — that
-would change a paint property becomes `unresolved`. A rule we might have to
-apply and did not is exactly the case where a guess turns into a wrong verdict.
+one `#id` and any number of `.classes`, in any order, plus `*`, and comma lists
+of those. Anything else — descendant combinators, `:hover`, `[attr=…]`, `@media`
+— that would change a paint property becomes `unresolved`. A rule we might have
+to apply and did not is exactly the case where a guess turns into a wrong
+verdict.
+
+Two details that are easy to get wrong and were:
+
+- Comments are stripped first. `<!-- <style>.a{fill:none}</style> -->` is
+  documentation; scanning raw text made a commented-out rule paint.
+- A stray `}` is a CSS parse error the browser consumes and recovers from.
+  Returning there dropped every later rule silently, so the sheet lost rules and
+  nothing said so.
 
 ### Clips
 
@@ -131,22 +152,27 @@ offset = viewport.origin + (viewport.size − vb.size·scale)·align − vb.orig
 `preserveAspectRatio="none"` switches to independent `sx`/`sy`. A `<use>` of a
 `<symbol>` gets a viewport of `(x, y, width ?? 100%, height ?? 100%)`; a nested
 `<svg>` gets its own `x`/`y`/`width`/`height`. Percentages resolve against the
-root viewBox; `em`/`ch`/viewport units cannot be resolved statically and become
+**nearest enclosing** viewport, not the root one — that is what a nested viewport
+means. `em`/`ch`/viewport units cannot be resolved statically and become
 `unknown` rather than `0`.
 
-The nested viewport's **clip** is not modelled: ink drawn outside it is measured
-as if visible. This only matters for artwork that overflows its own viewport,
-which is a defect worth seeing.
+The viewport **clips** its content: `overflow: hidden` is the default for a
+nested `<svg>` and for `<symbol>`. Ink that leaves the viewport is refused
+(`ink-outside-viewport`) rather than measured as if visible, because the reported
+offset would describe a drawing nobody can see. Under a rotated ancestor the
+viewport rect is taken as its axis-aligned bounding box, which is a superset —
+lenient, and stated here rather than hidden.
 
 A `transform` on the **root** `<svg>` is ignored on purpose. That transform
 belongs to the host page's placement of the canvas, not to the artwork's
 internal coordinate system, so letting it through would report a `104px` offset
 for an icon that is perfectly centred.
 
-`transform` parsing is strict: an argument that is not a plain number (`10%`,
-`2em`, `var(--x)`) invalidates the *whole* list. Dropping the bad argument would
-shift the rest left — `translate(10%,8)` would silently become `translate(8,0)`,
-a wrong answer with no warning.
+`transform` parsing is strict: anything that is not a function call — a `%`
+argument, `2em`, `var(--x)`, or trailing junk after the last `)` — invalidates
+the *whole* list. Dropping the bad part would shift the rest left: `translate(10%,8)`
+would silently become `translate(8,0)`, and `translate(10,10) garbage` would keep
+the translation.
 
 ### Units
 
@@ -174,31 +200,53 @@ the tolerance basis is the smaller rendered dimension. `slice` uses the larger
 ratio, `meet` the smaller. That holds on the assumed branch too — with no
 `width`, each axis is given 24px rather than sharing one factor.
 
-Absolute physical units are converted, not ignored: `width="1in"` is 96px by
-definition, so it takes the declared branch instead of falling through to the
-nominal 24px.
+Absolute physical units are converted on the root, not ignored: `width="1in"` is
+96px by definition, so it takes the declared branch instead of falling through to
+the nominal 24px. A nested viewport sized in `in` is not converted; it goes
+through the relative-length path and is refused.
 
 ### Fill rule
 
-`fill-rule` is inherited and honoured. Under `nonzero`, same-winding subpaths
-add (holes must be wound opposite). Under `evenodd`, winding is irrelevant: a
-subpath nested an odd number of containment levels is a hole, two levels is
-solid again. Icons routinely draw even-odd holes with the same winding as their
-container, and treating those as additive flips both the area and the centroid.
+`fill-rule` is inherited and honoured, and the two rules are not the same
+arithmetic.
+
+**even-odd** ignores winding: a subpath nested an odd number of containment
+levels is a hole, two levels is solid again. Icons routinely draw even-odd holes
+with the same winding as their container, so anything that used the signed area
+here would flip both the area and the centroid.
+
+**nonzero** is decided per subpath, because winding only carries meaning
+*inside* another outline:
+
+| Position | Contribution |
+|---|---|
+| no container | `+|A|` — two disjoint regions each have winding 1, so an opposite direction is not a hole |
+| inside a container, opposite direction | `−|A|` — a hole |
+| inside a container, same direction | `0` — winding 2 still paints once |
+
+Summing signed areas looks like it handles all three and handles two of them
+wrong. `M0 0 H10 V10 H0 Z M20 0 V10 H30 V0 Z` — two squares, the second drawn the
+other way — summed to **zero**, so the whole icon read as "no ink".
 
 Containment is classified per vertex: a subpath is *inside* another only when
-none of its vertices fall outside, and vertices lying on the boundary are
-ignored so an L-shaped icon whose hole shares a corner still measures correctly.
-Two subpaths with the same bounding box and the same absolute area are treated as
-one outline drawn twice — under even-odd they cancel to nothing, under nonzero
-they render once, and in both cases summing them is wrong.
+none of its vertices fall outside, and vertices lying on the boundary are ignored
+so an L-shaped icon whose hole shares a corner still measures correctly. Two
+subpaths with the same bounding box and the same absolute area are treated as one
+outline drawn twice — under even-odd they cancel to nothing, under nonzero they
+render once, and in both cases summing them is wrong.
 
-**Partially overlapping outlines are out of scope** — an even-odd XOR needs a
-boolean polygon operation, so the checker reports `overlapping-subpaths` rather
-than a centroid that may land outside the artwork. Under `nonzero` a genuine
-overlap is still summed, which over-counts area; that is the one approximation
-left in the area model and it is why `off` on `geometry/centroid` deserves a
-second look at the artwork before it is trusted.
+**What is still approximate.** Three things, and they are why `off` on
+`geometry/centroid` deserves a second look at the artwork:
+
+1. Partially overlapping outlines. An even-odd XOR needs a boolean polygon
+   operation, so the checker reports `overlapping-subpaths` rather than a
+   centroid that may land outside the artwork. Under `nonzero` a genuine overlap
+   is still summed, which over-counts area.
+2. Nesting deeper than two levels under `nonzero` (an island inside a hole inside
+   an island). The rule above is pairwise.
+3. The stroke model — joins, caps and dashes are approximated as a swept band.
+
+None of these can move `geometry/ink-bbox`, which depends on extreme points only.
 
 ## 2. `#1` ink bbox vs viewBox
 

@@ -263,14 +263,26 @@ async function main() {
         // A path the user typed wrong is a usage error, not a verdict.
         if (err && err.code === 'ENOENT') throw usage(`no such file: ${path}`);
         // One unreadable file must not take the rest of the batch down with it,
-        // and `--json` callers need an object for every path they passed.
+        // and `--json` callers need an object for every path they passed. The
+        // finding is what keeps the report from reading as `ok`: an empty
+        // findings list aggregates to `ok`, which would turn "could not read
+        // this" into "nothing wrong here".
         reports.push(
           buildReport({
             target: basename(resolved),
             mode: opts.mode,
-            findings: [],
+            findings: [
+              {
+                id: 'geometry/input-error',
+                layer: 'exact',
+                forcedVerdict: 'unknown',
+                pixel: false,
+                evidence: String(err && err.message),
+                suggested: { kind: 'inspect', value: 'the file could not be read or parsed' },
+              },
+            ],
             policy,
-            meta: { error: String(err && err.message), unresolved: ['input-error'] },
+            meta: { error: String(err && err.message) },
           }),
         );
       }

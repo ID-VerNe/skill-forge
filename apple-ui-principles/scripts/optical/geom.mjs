@@ -56,6 +56,10 @@ export function flattenPath(d, steps = DEFAULT_STEPS) {
   } catch {
     return subpaths;
   }
+  // svgpath reports a lossy parse instead of throwing: `M0 0 L` yields one point
+  // and an error message. Keeping that fragment would measure part of a path,
+  // so the caller needs to know.
+  const parseError = path.err || null;
 
   path.iterate((segment, index, x, y) => {
     switch (segment[0]) {
@@ -90,7 +94,10 @@ export function flattenPath(d, steps = DEFAULT_STEPS) {
     }
   });
 
-  return subpaths.filter((sub) => sub.length > 0);
+  const kept = subpaths.filter((sub) => sub.length > 0);
+  // `filter` returns a fresh array, so the flag has to move to it.
+  if (parseError) Object.defineProperty(kept, 'parseError', { value: parseError, enumerable: false });
+  return kept;
 }
 
 /** Signed shoelace area. Positive for clockwise-in-screen-space paths. */
@@ -142,14 +149,40 @@ export function netShape(subpaths) {
     }
   }
 
+  // Winding only carries meaning *inside* another outline. Two disjoint regions
+  // each have winding 1 whatever their direction, so subtracting one from the
+  // other is arithmetic on a sign the renderer ignores. Inside a container the
+  // rule is the opposite: the same direction means winding 2 (still one fill, so
+  // the inner adds nothing) and the opposite direction means a hole.
+  const signed = subpaths.map((sub) => subpathSignedArea(sub));
+  const parentOf = subpaths.map((sub, i) => {
+    let nearest = -1;
+    for (let j = 0; j < subpaths.length; j += 1) {
+      if (i === j) continue;
+      if (!boxContainsBox(boxes[j], boxes[i], 1e-6)) continue;
+      if (!sub.every((vertex) => classifyPoint(vertex, subpaths[j], 1e-6) !== 'outside')) continue;
+      if (nearest === -1 || areas[j] < areas[nearest]) nearest = j;
+    }
+    return nearest;
+  });
+
   let area = 0;
   let mx = 0;
   let my = 0;
-  for (const sub of subpaths) {
-    const { cx, cy, signedArea } = subpathCentroid(sub);
-    area += signedArea;
-    mx += cx * signedArea;
-    my += cy * signedArea;
+  for (const [index, sub] of subpaths.entries()) {
+    const { cx, cy } = subpathCentroid(sub);
+    const parent = parentOf[index];
+    let weight;
+    if (parent === -1) {
+      weight = areas[index];
+    } else if (Math.sign(signed[index]) === Math.sign(signed[parent])) {
+      weight = 0;
+    } else {
+      weight = -areas[index];
+    }
+    area += weight;
+    mx += cx * weight;
+    my += cy * weight;
   }
   if (Math.abs(area) < 1e-12) {
     return { area: 0, cx: 0, cy: 0 };
@@ -364,6 +397,11 @@ export function parseTransform(value) {
   if (!value) return IDENTITY;
   let result = IDENTITY;
   const re = /([a-zA-Z]+)\s*\(([^)]*)\)/g;
+  // Anything the function list does not consume is not a transform. Splicing
+  // it out silently kept `translate(10,10) garbage` looking like a clean
+  // translation, which is a wrong position with no warning.
+  if (String(value).replace(re, '').trim() !== '') return null;
+  re.lastIndex = 0;
   let match = re.exec(value);
   while (match) {
     const name = match[1];
@@ -533,11 +571,16 @@ export function shapeToPath(tag, attrs) {
       if (tag === 'polygon') parts.push('Z');
       return { d: parts.join(' '), unparsed: false };
     }
-    case 'line':
-      return {
-        d: `M${num('x1')} ${num('y1')} L${num('x2')} ${num('y2')}`,
-        unparsed: false,
-      };
+    case 'line': {
+      const x1 = num('x1');
+      const y1 = num('y1');
+      const x2 = num('x2');
+      const y2 = num('y2');
+      // A zero-length line paints nothing with butt caps; saying so keeps it out
+      // of the "could not parse" bucket, which would refuse the whole file.
+      if (x1 === x2 && y1 === y2) return { d: '', unparsed: false, empty: true };
+      return { d: `M${x1} ${y1} L${x2} ${y2}`, unparsed: false };
+    }
     default:
       return { d: '', unparsed: false, empty: true };
   }

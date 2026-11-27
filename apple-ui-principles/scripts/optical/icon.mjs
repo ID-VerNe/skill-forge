@@ -27,6 +27,11 @@ import { buildReport, tolFor } from './report.mjs';
 import { cascade, parseStyle } from './stylesheet.mjs';
 
 const round = (n, d = 3) => Math.round(n * 10 ** d) / 10 ** d;
+
+/** CSS keywords are case-insensitive; `fill="None"` is not a paint. */
+const keywordIs = (value, keyword) =>
+  value !== undefined && value !== null && String(value).trim().toLowerCase() === keyword;
+
 const SHAPES = new Set(['path', 'rect', 'circle', 'ellipse', 'polygon', 'polyline', 'line']);
 const NON_RENDERING = new Set([
   'defs',
@@ -58,6 +63,40 @@ const UNMEASURABLE_INK = new Set([
 const MAX_USE_DEPTH = 3;
 /** Group nesting beyond this is a refusal, not a stack overflow. */
 const MAX_NESTING = 200;
+/** Elements whose presence means the drawing is not one fixed shape. */
+const ANIMATION = new Set([
+  'animate',
+  'animatetransform',
+  'animatemotion',
+  'animatecolor',
+  'set',
+  'mpath',
+]);
+/** Attributes whose animation changes what the ink is or where it sits. */
+const GEOMETRY_ANIMATION = new Set([
+  'transform',
+  'x',
+  'y',
+  'width',
+  'height',
+  'cx',
+  'cy',
+  'r',
+  'rx',
+  'ry',
+  'd',
+  'points',
+  'stroke-width',
+  'stroke-dasharray',
+  'stroke-dashoffset',
+  'visibility',
+  'display',
+  'clip-path',
+  'filter',
+  'mask',
+  'offset',
+  'path',
+]);
 
 /** Minimal XML scanner: enough for icon markup, strict enough to fail loudly. */
 function parseXml(text) {
@@ -134,7 +173,16 @@ function parseViewBox(attrs) {
   }
   const w = absolutePx(attrs.width);
   const h = absolutePx(attrs.height);
+  // `width="100%"` sizes the canvas against a host we cannot see. Defaulting to
+  // 24x24 there is not a convention, it is an invented canvas.
+  if (attrs.width !== undefined && w === null) return null;
+  if (attrs.height !== undefined && h === null) return null;
   return { x: 0, y: 0, w: w !== null && w > 0 ? w : 24, h: h !== null && h > 0 ? h : 24 };
+}
+
+/** Which part of the canvas was unusable, for the unresolved reason. */
+function viewBoxFailure(attrs) {
+  return attrs.viewBox !== undefined ? 'invalid-viewBox' : 'relative-canvas';
 }
 
 /**
@@ -173,7 +221,7 @@ function absolutePx(value) {
  */
 function effectiveAttrs(node) {
   if (node.effective) return node.effective;
-  return { ...node.attrs, ...parseStyle(node.attrs.style) };
+  return { ...node.attrs, ...parseStyle(node.attrs.style).decls };
 }
 
 function indexIds(node, map) {
@@ -190,9 +238,12 @@ function indexIds(node, map) {
 /** `<style>` bodies, with the attributes of the element that carried them. */
 function extractSheets(text) {
   const out = [];
+  // `<!-- <style>.a{fill:none}</style> -->` is documentation, not a rule. Strip
+  // comments before scanning, or a commented-out stylesheet still paints.
+  const visible = String(text).replace(/<!--[\s\S]*?-->/g, '');
   const re = /<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi;
   const attrRe = /([\w:.-]+)\s*=\s*("([^"]*)"|'([^']*)')/g;
-  let m = re.exec(text);
+  let m = re.exec(visible);
   while (m) {
     const attrs = {};
     let a = attrRe.exec(m[1]);
@@ -201,13 +252,57 @@ function extractSheets(text) {
       a = attrRe.exec(m[1]);
     }
     attrRe.lastIndex = 0;
-    out.push({ css: m[2], type: attrs.type || 'text/css' });
-    m = re.exec(text);
+    // A CDATA wrapper is transport, not CSS.
+    const css = m[2].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '');
+    out.push({ css, type: attrs.type || 'text/css' });
+    m = re.exec(visible);
   }
   return out;
 }
 
+/**
+ * An animated icon has no single ink box: a spinner's centroid depends on the
+ * frame. Reporting the first frame as if it were the drawing is a number that
+ * cannot be re-derived, which is exactly what `off` promises it can be.
+ *
+ * Only animations that move ink (or turn it off) disqualify a file. A colour
+ * cycle leaves every measurement intact, and refusing those would cost coverage
+ * for nothing.
+ */
+function noteAnimation(root, ctx) {
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    const tag = String(node.tag).toLowerCase();
+    if (ANIMATION.has(tag)) {
+      const attrs = node.attrs || {};
+      const target = String(attrs.attributeName || '').trim().toLowerCase();
+      const values = `${attrs.from || ''} ${attrs.to || ''} ${attrs.values || ''}`.toLowerCase();
+      const movesInk =
+        tag !== 'animate' && tag !== 'set'
+          ? true
+          : target === ''
+            ? true
+            : GEOMETRY_ANIMATION.has(target)
+              ? true
+              : target === 'fill' || target === 'stroke'
+                ? /\bnone\b|\btransparent\b/.test(values)
+                : target === 'opacity' || target === 'fill-opacity'
+                  ? /\b0\b|\b0\.0*\b/.test(values)
+                  : false;
+      if (movesInk) {
+        ctx.unresolved.add('animated-ink');
+        return;
+      }
+    }
+    for (const child of node.children || []) stack.push(child);
+  }
+}
+
 function applyStylesheets(text, root, ctx) {
+  // An external sheet can repaint anything; there is nothing to resolve it
+  // against, so say so instead of measuring the file as if it were unpainted.
+  if (/<\?xml-stylesheet\b/i.test(String(text))) ctx.unresolved.add('external-stylesheet');
   const sheets = extractSheets(text);
   if (sheets.length === 0) return;
   const { effective, unresolved } = cascade(sheets, root);
@@ -369,13 +464,13 @@ function collect(node, inherited, out, ctx) {
   const attrs = effectiveAttrs(node);
   // `display:none` removes the subtree outright; `visibility:hidden` does not —
   // a descendant may set `visibility:visible` and reappear.
-  if (attrs.display === 'none') return out;
-  if (attrs.opacity !== undefined && Number.parseFloat(attrs.opacity) === 0) return out;
+  if (keywordIs(attrs.display, 'none')) return out;
+  if (resolveOpacity(attrs.opacity, 1) === 0) return out;
 
   const visible =
     attrs.visibility === undefined
       ? inherited.visible
-      : attrs.visibility !== 'hidden' && attrs.visibility !== 'collapse';
+      : !keywordIs(attrs.visibility, 'hidden') && !keywordIs(attrs.visibility, 'collapse');
 
   // Ink we can see but cannot measure. Silently treating these as empty would
   // report "the canvas has nothing in it", which is a different — and false —
@@ -407,10 +502,12 @@ function collect(node, inherited, out, ctx) {
       return out;
     }
     let matrix = multiplyMatrix(own, [1, 0, 0, 1, vx, vy]);
+    // Space of the viewport rect itself, before its own viewBox map.
+    const outerMatrix = matrix;
     if (attrs.viewBox !== undefined) {
       const vb = parseViewBox(attrs);
       if (!vb) {
-        ctx.unresolved.add('invalid-viewBox');
+        ctx.unresolved.add(viewBoxFailure(attrs));
         return out;
       }
       matrix = multiplyMatrix(
@@ -422,7 +519,9 @@ function collect(node, inherited, out, ctx) {
     local.viewport = { w: vpW, h: vpH };
     // The clip applies in the *inner* coordinate system, after the viewBox map.
     withClip(attrs, [own, matrix], ctx, out, (sink) => {
-      for (const child of node.children || []) collect(child, local, sink, ctx);
+      withViewport({ x: 0, y: 0, w: vpW, h: vpH }, outerMatrix, ctx, sink, (inner) => {
+        for (const child of node.children || []) collect(child, local, inner, ctx);
+      });
     });
     return out;
   }
@@ -459,7 +558,10 @@ function collect(node, inherited, out, ctx) {
     const inner = { ...ctx, depth: ctx.depth + 1 };
     const local = inheritedFor(attrs, inherited, visible, useMatrix, ctx);
 
-    withClip(attrs, [useMatrix], ctx, out, (sink) => {
+    // `clip-path` on a <use> could be authored before or after its own x/y
+    // translate; both readings have to contain the ink before the clip counts
+    // as a no-op.
+    withClip(attrs, [own, useMatrix], ctx, out, (sink) => {
       if (targetTag === 'symbol') {
         // <symbol> is non-rendering on its own but renders when instantiated.
         const vpW = resolveLength(attrs.width, inherited.viewport.w);
@@ -469,7 +571,14 @@ function collect(node, inherited, out, ctx) {
           return;
         }
         const symbolAttrs = effectiveAttrs(target);
-        if (symbolAttrs.display === 'none' || resolveOpacity(symbolAttrs.opacity, 1) === 0) return;
+        if (
+          keywordIs(symbolAttrs.display, 'none') ||
+          keywordIs(symbolAttrs.visibility, 'hidden') ||
+          keywordIs(symbolAttrs.visibility, 'collapse') ||
+          resolveOpacity(symbolAttrs.opacity, 1) === 0
+        ) {
+          return;
+        }
         // A symbol carries presentation attributes of its own — sprite sets put
         // `fill`, `stroke` and `fill-rule` there precisely so the children can
         // omit them. Dropping them changed the area of every referenced path.
@@ -478,7 +587,7 @@ function collect(node, inherited, out, ctx) {
         if (symbolAttrs.viewBox !== undefined) {
           const vb = parseViewBox(symbolAttrs);
           if (!vb) {
-            ctx.unresolved.add('invalid-viewBox');
+            ctx.unresolved.add(viewBoxFailure(symbolAttrs));
             return;
           }
           matrix = multiplyMatrix(
@@ -488,7 +597,11 @@ function collect(node, inherited, out, ctx) {
         }
         symbolLocal.matrix = matrix;
         symbolLocal.viewport = { w: vpW, h: vpH };
-        for (const child of target.children || []) collect(child, symbolLocal, sink, inner);
+        // A symbol clips to the viewport the <use> gives it, exactly like a
+        // nested <svg>.
+        withViewport({ x: 0, y: 0, w: vpW, h: vpH }, useMatrix, ctx, sink, (clipped) => {
+          for (const child of target.children || []) collect(child, symbolLocal, clipped, inner);
+        });
         return;
       }
       if (targetTag === 'svg') {
@@ -520,7 +633,10 @@ function collect(node, inherited, out, ctx) {
         ctx.unresolved.add('clip-path');
         return out;
       }
-      const shape = tag === 'path' ? { d: attrs.d || '', unparsed: false } : shapeToPath(tag, attrs);
+      const shape =
+        tag === 'path'
+          ? { d: attrs.d || '', unparsed: false, empty: !attrs.d }
+          : shapeToPath(tag, attrs);
       if (shape.unparsed) {
         // A percentage geometry is not a shape at the origin — it is a shape we
         // cannot place. Dropping it silently would shrink the ink box.
@@ -532,8 +648,10 @@ function collect(node, inherited, out, ctx) {
         out.push({
           d: shape.d,
           matrix: own,
-          filled: (attrs.fill ?? inherited.fill) !== 'none' && (fillOpacityOf(attrs, inherited) !== 0),
-          stroked: (attrs.stroke ?? inherited.stroke) !== undefined && (attrs.stroke ?? inherited.stroke) !== 'none',
+          filled: !keywordIs(attrs.fill ?? inherited.fill, 'none') && fillOpacityOf(attrs, inherited) !== 0,
+          stroked:
+            (attrs.stroke ?? inherited.stroke) !== undefined &&
+            !keywordIs(attrs.stroke ?? inherited.stroke, 'none'),
           strokeWidth: Number.isFinite(strokeWidth) ? strokeWidth : 1,
           // Even `fill-rule` is inherited, and an inherited `evenodd` changes the
           // area of every child path.
@@ -550,6 +668,38 @@ function collect(node, inherited, out, ctx) {
     for (const child of node.children || []) collect(child, bound, sink, ctx);
   });
   return out;
+}
+
+/**
+ * A viewport clips what it contains — `overflow: hidden` is the default for a
+ * nested `<svg>` and for `<symbol>`. Measuring ink the browser would cut off
+ * produces an `off` nobody can reproduce by looking at the render, so refuse
+ * when the drawing leaves the viewport.
+ *
+ * `outerMatrix` maps the viewport's own space to root space; the rect is that
+ * viewport. Under a rotated ancestor the rect becomes its AABB, which is a
+ * superset — lenient in the direction that matters least, but stated in
+ * `optical-model.md` rather than hidden.
+ */
+function withViewport(rect, outerMatrix, ctx, out, emit) {
+  const captured = [];
+  emit(captured);
+  if (captured.length === 0) return;
+  const box = bboxOfShapes(captured, ctx.steps);
+  if (!box) return;
+  const a = applyMatrix(outerMatrix, rect.x, rect.y);
+  const b = applyMatrix(outerMatrix, rect.x + rect.w, rect.y + rect.h);
+  const viewRect = {
+    minX: Math.min(a[0], b[0]),
+    minY: Math.min(a[1], b[1]),
+    maxX: Math.max(a[0], b[0]),
+    maxY: Math.max(a[1], b[1]),
+  };
+  if (!rectContains(viewRect, box)) {
+    ctx.unresolved.add('ink-outside-viewport');
+    return;
+  }
+  out.push(...captured);
 }
 
 /**
@@ -688,7 +838,7 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
       ink: { bbox: null, area: 0, centroid: { cx: 0, cy: 0 } },
       strokeOnly: false,
       noInk: true,
-      unresolved: ['invalid-viewBox'],
+      unresolved: [svg.attrs && svg.attrs.viewBox !== undefined ? 'invalid-viewBox' : 'relative-canvas'],
       unitScale: null,
       unitScaleX: null,
       unitScaleY: null,
@@ -705,6 +855,7 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
   // Paint may live in an internal stylesheet, so resolve the cascade before
   // anything reads an attribute.
   applyStylesheets(text, svg, ctx);
+  noteAnimation(svg, ctx);
   const shapes = collect(
     svg,
     {
@@ -732,10 +883,20 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
   let strokeBox = null;
 
   for (const shape of shapes) {
-    const subpaths = flattenPath(shape.d, steps).map((sub) =>
-      sub.map(([x, y]) => applyMatrix(shape.matrix, x, y)),
-    );
-    if (subpaths.length === 0) continue;
+    const raw = flattenPath(shape.d, steps);
+    // svgpath reports a lossy parse on the instance; a `.map()` here would drop
+    // that signal along with the array identity.
+    if (raw.parseError) {
+      ctx.unresolved.add('unparsed-path');
+      continue;
+    }
+    const subpaths = raw.map((sub) => sub.map(([x, y]) => applyMatrix(shape.matrix, x, y)));
+    if (subpaths.length === 0) {
+      // `d` held something, yet nothing came back: the parser gave up part-way.
+      // Keeping the fragments it did emit would measure half a path.
+      if (String(shape.d).trim() !== '') ctx.unresolved.add('unparsed-path');
+      continue;
+    }
     const points = subpaths.flat();
     const localBox = bboxOfPoints(points);
 
@@ -842,7 +1003,9 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
 
   // A canvas that failed to parse has no ink for a reason already reported;
   // adding "the canvas may be empty" would point the reader at the wrong thing.
-  const canvasInvalid = (shape.unresolved || []).includes('invalid-viewBox');
+  const canvasInvalid = (shape.unresolved || []).some(
+    (id) => id === 'invalid-viewBox' || id === 'relative-canvas',
+  );
   if (shape.noInk && !canvasInvalid) {
     findings.push({
       id: 'geometry/no-ink',
@@ -864,7 +1027,7 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
       suggested: {
         kind: 'inspect',
         value: canvasInvalid
-          ? 'fix the viewBox; the element does not render as written'
+          ? 'give the root an absolute width/height or a valid viewBox; the canvas is unknown'
           : 'flatten the artwork (expand clip paths / masks) and re-run',
       },
     });
