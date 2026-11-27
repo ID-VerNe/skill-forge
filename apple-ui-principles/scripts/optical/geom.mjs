@@ -125,8 +125,9 @@ export function subpathCentroid(points) {
 }
 
 /**
- * Net fill of a set of subpaths. Holes (opposite winding) subtract, which is
- * what non-zero fill rule icons rely on.
+ * Net fill of a set of subpaths under the non-zero winding rule. Holes must be
+ * wound opposite to their container to subtract, which is what non-zero fill
+ * relies on.
  */
 export function netShape(subpaths) {
   let area = 0;
@@ -141,6 +142,50 @@ export function netShape(subpaths) {
   if (Math.abs(area) < 1e-12) {
     return { area: 0, cx: 0, cy: 0 };
   }
+  return { area: Math.abs(area), cx: mx / area, cy: my / area };
+}
+
+/** Ray-casting containment test for a single point. */
+export function pointInPolygon([px, py], polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+    const [xi, yi] = polygon[i];
+    const [xj, yj] = polygon[j];
+    const straddles = yi > py !== yj > py;
+    if (straddles && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+/**
+ * Net fill under the even-odd rule. Winding direction is irrelevant: a subpath
+ * nested an odd number of levels deep is a hole, two levels deep is solid
+ * again. Needed because `fill-rule="evenodd"` icons routinely draw holes with
+ * the same winding as their container.
+ */
+export function netShapeEvenOdd(subpaths) {
+  const items = subpaths.map((sub) => ({
+    sub,
+    area: Math.abs(subpathSignedArea(sub)),
+    centroid: subpathCentroid(sub),
+  }));
+
+  let area = 0;
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < items.length; i += 1) {
+    let depth = 0;
+    const probe = items[i].sub[0];
+    for (let j = 0; j < items.length; j += 1) {
+      if (i !== j && pointInPolygon(probe, items[j].sub)) depth += 1;
+    }
+    const weight = depth % 2 === 0 ? 1 : -1;
+    area += weight * items[i].area;
+    mx += weight * items[i].area * items[i].centroid.cx;
+    my += weight * items[i].area * items[i].centroid.cy;
+  }
+
+  if (Math.abs(area) < 1e-12) return { area: 0, cx: 0, cy: 0 };
   return { area: Math.abs(area), cx: mx / area, cy: my / area };
 }
 

@@ -122,6 +122,7 @@ The checker answers one question: *is this within tolerance, or is it a defect?*
 
 ```bash
 node scripts/optical/cli.mjs check <path...> [--json] [--explain] [--mode <mode>]
+node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 ```
 
 | Input | Mode | What is measured |
@@ -140,8 +141,10 @@ node scripts/optical/cli.mjs check <path...> [--json] [--explain] [--mode <mode>
 
 Two rules that make the output trustworthy:
 
-1. **Tolerances are not a flag.** There is no `--tolerance`. If a project truly needs a different curve, pass `--policy` and the report will carry `policy_source: "custom"`.
+1. **Tolerances are not a flag.** There is no `--tolerance`. If a project truly needs a different curve, pass `--policy` and the report will carry `policy_source: "custom"`. A policy can only rescale pixel comparisons — it cannot turn an `unknown` into `ok`.
 2. **Heuristic findings cap at `nudge`.** Only exact geometry can produce `off`, so `off` always means "a number you can re-derive by hand".
+
+When a report holds both `off` and `unknown`, the exit code is `1` (the defect is certain and must be fixed) while the `unknown` stays listed on every run. Never read a `2` as "clean" — it means *unmeasured*.
 
 ### Baking the correction
 

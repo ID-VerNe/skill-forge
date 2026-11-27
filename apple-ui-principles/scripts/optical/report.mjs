@@ -72,29 +72,40 @@ function normaliseFinding(raw, policyScale) {
       },
       relative: raw.relative || null,
       verdict: raw.verdict || OK,
+      forced: Boolean(raw.forced),
+      categorical: Boolean(raw.categorical),
     };
   }
 
-  const dx = raw.offset ?? 0;
-  const dy = raw.offsetY ?? 0;
+  const categorical = raw.pixel === false;
+  const dx = categorical ? 0 : raw.offset ?? 0;
+  const dy = categorical ? 0 : raw.offsetY ?? 0;
   const basis = raw.basis && raw.basis > 0 ? raw.basis : 24;
   const tol = tolFor(basis) * policyScale;
   const primary = Math.max(Math.abs(dx), Math.abs(dy));
   const layer = raw.layer || 'exact';
+  const { offset, offsetY, basis: _basis, forcedVerdict, pixel, meta, ...rest } = raw;
 
   return {
+    ...rest,
     id: raw.id,
     layer,
-    verdict: raw.forcedVerdict || verdictFor(primary, tol, layer),
+    // A forced verdict is a categorical statement, not a pixel comparison; it
+    // must survive any tolerance policy intact.
+    verdict: forcedVerdict || verdictFor(primary, tol, layer),
+    forced: Boolean(forcedVerdict),
+    categorical,
     measured: { dx: round(dx), dy: round(dy), unit: 'px' },
-    relative: {
-      dx_pct: round((dx / basis) * 100, 2),
-      dy_pct: round((dy / basis) * 100, 2),
-      basis,
-    },
+    relative: categorical
+      ? null
+      : {
+          dx_pct: round((dx / basis) * 100, 2),
+          dy_pct: round((dy / basis) * 100, 2),
+          basis,
+        },
     suggested: raw.suggested || { kind: 'nudge', value: `${round(-dx, 2)}px` },
     evidence: raw.evidence || '',
-    ...(raw.meta || {}),
+    ...(meta || {}),
   };
 }
 

@@ -15,6 +15,41 @@ are sampled (`24` segments), `rect`/`circle`/`ellipse`/`polygon`/`polyline`/`lin
 are converted to path data first, transforms are composed down the `<g>` tree,
 and all measurements happen on the resulting point sets.
 
+Two rules keep that pipeline from lying:
+
+- **Non-rendering nodes are not ink.** `defs`, `clipPath`, `mask`, `symbol`,
+  `pattern`, `marker`, `linearGradient`, `radialGradient`, `filter`, `style`,
+  `title`, `desc`, `metadata` are skipped entirely, as are subtrees carrying
+  `display:none`, `visibility:hidden` or `opacity:0`.
+- **Presentation attributes live in `style` too.** `style="fill:none;stroke:…;
+  stroke-width:2"` is merged over the XML attributes before anything is
+  measured, so a stroke-only icon is not silently treated as an empty fill.
+
+### What makes ink *unverifiable* rather than zero
+
+A missing measurement is never zero. If the drawing cannot be resolved, the
+report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
+`unknown` (exit `2`) and emits no geometric numbers at all:
+
+| Cause | Reported as |
+|---|---|
+| empty canvas, no shapes, all shapes `fill:none` without stroke | `geometry/no-ink` |
+| `clip-path`, `mask`, `filter` present | `geometry/unresolved-graphics` |
+| `<use>` pointing at a missing id, or nested deeper than 3 | `geometry/unresolved-graphics` |
+| a shape whose `d` failed to parse | `geometry/unresolved-graphics` |
+
+`<use>` is resolved when the target exists: the referenced node is re-walked
+with the `x`/`y` offset folded into the matrix. Anything more dynamic is a gap,
+not a guess.
+
+### Fill rule
+
+`fill-rule` is inherited and honoured. Under `nonzero`, same-winding subpaths
+add (holes must be wound opposite). Under `evenodd`, winding is irrelevant: a
+subpath nested an odd number of containment levels is a hole, two levels is
+solid again. Icons routinely draw even-odd holes with the same winding as their
+container, and treating those as additive flips both the area and the centroid.
+
 ## 2. `#1` ink bbox vs viewBox
 
 ```
@@ -98,10 +133,13 @@ continuous is
 R_inner = R_outer − P
 ```
 
-With unequal insets it becomes elliptical: `rx = R − Px`, `ry = R − Py`. When
-`P > R` the subtraction goes negative — the real defect is that the outer radius
-is too large for the padding, and clamping the inner radius to `0` merely hides
-it.
+Three situations are handled explicitly:
+
+| Case | Behaviour |
+|---|---|
+| uniform `p-*` | expected inner radius `R − P`, reported as `calc(Rpx - Ppx)` |
+| unequal `px-*` / `py-*` | `unknown` — the correct radius is elliptical (`rx = R − Px`, `ry = R − Py`) and a single `calc()` would be wrong |
+| `P ≥ R` | reported as an **outer radius defect**: the inner radius resolves to `0` and the outer curve is lost. The fix is a larger outer radius or less padding, not a negative `calc()` |
 
 Only the JSX element tree closes the parent-child relation. CSS alone cannot, so
 no finding is emitted for CSS input (`unknown` would be noise here — there is no
@@ -145,8 +183,19 @@ tol = clamp(0.02 × size, 0.5px, 1.5px)
 Verdicts: `≤ tol` → `ok`, `≤ 3·tol` → `nudge`, beyond → `off`.
 Heuristic-layer findings cap at `nudge`, so `off` is always backed by exact math.
 
-Exit codes: `0` ok/nudge, `1` off, `2` unknown, `64` usage error. `unknown` is
-kept separate so an unverifiable project does not look identical to a broken one.
+Categorical findings — `no-ink`, `unresolved-graphics`, `text-box-in-flex`,
+`unparsed-css`, and the keyline refusals — carry a *forced* verdict and never a
+pixel number. They print as `—`, because inventing `+1px` for a rule that is not
+about pixels invites an agent to "compensate" by one pixel.
+
+`--policy` may only rescale comparisons that are actually pixel measurements.
+Forced and categorical verdicts pass through untouched: a policy must not be
+able to launder an unverifiable file into `ok`.
+
+Exit codes: `0` ok/nudge, `1` off, `2` unknown, `64` usage error. When a report
+contains both `off` and `unknown`, `off` wins the exit code — the fix is
+mandatory either way, and the gap stays visible in every run's findings. The two
+codes stay distinct so a broken project never looks like an unverifiable one.
 
 ## 10. Known limits
 
@@ -155,6 +204,12 @@ kept separate so an unverifiable project does not look identical to a broken one
 - Stroke joins, caps and dashes are approximated by a constant-width band.
 - CSS is tokenised, not parsed. Unbalanced braces, unterminated strings and
   declaration-less preludes degrade to `unknown` rather than a best guess.
+- `<use>` resolution is single-target and single-pass; nested or computed
+  references degrade to `unknown`.
+- JSX class names are read as *literal sets*: `clsx('flex', 'text-box-trim')`
+  is understood, `${dynamic}` segments are dropped. A class name assembled
+  entirely at runtime produces no finding — absence of evidence, not evidence
+  of absence.
 - Perceptual rules (Mach bands, dark-mode weight compensation) are never
   computed. They stay human judgement, marked `[不可校验]` in `SKILL.md`.
 

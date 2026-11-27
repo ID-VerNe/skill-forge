@@ -210,14 +210,22 @@ function splitBlock(body) {
     }
     if (ch === '{') {
       const close = findMatchingBrace(body, i, body.length);
-      const selector = body.slice(cursor, i).trim();
-      const { decls: childDecls, nested: childNested } = splitBlock(body.slice(i + 1, close));
-      nested.push({ selector, decls: childDecls });
-      for (const grand of childNested) {
-        nested.push({
-          selector: grand.selector,
-          decls: grand.decls,
-        });
+      const chunk = body.slice(cursor, i);
+      // CSS nesting puts declarations *before* a nested rule. Split at the last
+      // semicolon so those declarations are not swallowed into the selector.
+      const lastSemi = chunk.lastIndexOf(';');
+      const declPart = lastSemi === -1 ? '' : chunk.slice(0, lastSemi + 1);
+      const selector = (lastSemi === -1 ? chunk : chunk.slice(lastSemi + 1)).trim();
+      for (const piece of splitDeclarations(declPart)) {
+        const entry = toDecls(piece);
+        if (entry) decls[entry[0]] = entry[1];
+      }
+      if (selector) {
+        const { decls: childDecls, nested: childNested } = splitBlock(body.slice(i + 1, close));
+        nested.push({ selector, decls: childDecls });
+        for (const grand of childNested) {
+          nested.push({ selector: grand.selector, decls: grand.decls });
+        }
       }
       i = close + 1;
       cursor = i;

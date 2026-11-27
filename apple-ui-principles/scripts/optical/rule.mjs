@@ -39,6 +39,13 @@ const PADDING_SCALE = {
 
 const px = (n) => `${Math.round(n * 100) / 100}px`;
 
+/** `text-box` / `text-box-trim` actually trim. `text-box-edge-cap` does not. */
+function isBoxTrim(token) {
+  if (!token.includes('text-box')) return false;
+  if (token === 'text-box') return true;
+  return token.includes('trim');
+}
+
 function mergeBySelector(blocks) {
   const merged = new Map();
   for (const block of blocks) {
@@ -62,14 +69,16 @@ function textBoxFindings(blocks) {
     const raw = block.decls['text-box'] ?? block.decls['text-box-trim'];
     if (!raw || /^none\b/i.test(raw.trim())) continue;
     const display = (block.decls.display || '').trim().toLowerCase();
-    const where = block.context.length ? `${block.selector} (in ${block.context.join(' > ')})` : block.selector;
+    const where = block.context.length
+      ? `${block.selector} (in ${block.context.join(' > ')})`
+      : block.selector;
 
     if (!display) {
       findings.push({
         id: 'rule/text-box-in-flex',
         layer: 'exact',
         forcedVerdict: 'unknown',
-        offset: 0,
+        pixel: false,
         evidence: `${where} sets text-box but never declares display; container context is not in this file`,
         suggested: { kind: 'inspect', value: 'check the parent container for display:flex/grid' },
       });
@@ -81,8 +90,7 @@ function textBoxFindings(blocks) {
         id: 'rule/text-box-in-flex',
         layer: 'exact',
         forcedVerdict: 'off',
-        offset: 1,
-        basis: 24,
+        pixel: false,
         evidence: `${where}: display:${display} + text-box:${raw} — trimming has no effect on flex/grid containers`,
         suggested: {
           kind: 'hoist',
@@ -136,7 +144,7 @@ export function checkCss(text, { target = '<css>' } = {}) {
           id: 'rule/unparsed-css',
           layer: 'exact',
           forcedVerdict: 'unknown',
-          offset: 0,
+          pixel: false,
           evidence: `cannot tokenise this stylesheet: ${unresolved}`,
           suggested: { kind: 'inspect', value: 'fix the syntax or pass the compiled output instead' },
         },
@@ -154,69 +162,186 @@ export function checkCss(text, { target = '<css>' } = {}) {
 
 // ---------------------------------------------------------------------------
 // JSX / TSX
+//
+// A real JSX parser is out of scope, but a regex is not enough: attribute
+// values may contain `=>`, nested objects and generic-looking angle brackets.
+// The scanner below tracks brace depth and string state so those cases do not
+// silently re-parent elements.
 // ---------------------------------------------------------------------------
 
-function classTokens(raw) {
-  if (!raw) return [];
-  return raw
+function readBalanced(text, start, open, close) {
+  let depth = 0;
+  let quote = null;
+  let i = start;
+  while (i < text.length) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\') {
+        i += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      i += 1;
+      continue;
+    }
+    if (ch === open) depth += 1;
+    else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) return { body: text.slice(start + 1, i), end: i };
+    }
+    i += 1;
+  }
+  return null;
+}
+
+function extractClassName(attrText) {
+  const at = attrText.indexOf('className');
+  if (at === -1) return null;
+  let i = at + 'className'.length;
+  while (i < attrText.length && /\s/.test(attrText[i])) i += 1;
+  if (attrText[i] !== '=') return null;
+  i += 1;
+  while (i < attrText.length && /\s/.test(attrText[i])) i += 1;
+  const ch = attrText[i];
+  if (ch === '"' || ch === "'") {
+    const end = attrText.indexOf(ch, i + 1);
+    return end === -1 ? null : attrText.slice(i, end + 1);
+  }
+  if (ch === '{') {
+    const balanced = readBalanced(attrText, i, '{', '}');
+    return balanced ? attrText.slice(i, balanced.end + 1) : null;
+  }
+  return null;
+}
+
+/**
+ * Pull class tokens out of a className expression. Static strings, template
+ * literals and `clsx('a', 'b')` wrappers are all just quoted literals, so
+ * extracting every literal covers the common dynamic forms without pretending
+ * to evaluate them. Template interpolations are dropped.
+ */
+export function classNames(expr) {
+  if (!expr) return [];
+  const literals = [];
+  const re = /"([^"]*)"|'([^']*)'|`([^`]*)`/g;
+  let m = re.exec(expr);
+  while (m) {
+    const raw = m[1] ?? m[2] ?? m[3] ?? '';
+    literals.push(raw.replace(/\$\{[^}]*\}/g, ' '));
+    m = re.exec(expr);
+  }
+  return literals
+    .join(' ')
     .split(/\s+/)
     .map((t) => t.trim())
     .filter(Boolean);
 }
 
-function extractClassName(attrText) {
-  const quoted = /className\s*=\s*"([^"]*)"/.exec(attrText);
-  if (quoted) return quoted[1];
-  const single = /className\s*=\s*'([^']*)'/.exec(attrText);
-  if (single) return single[1];
-  const template = /className\s*=\s*\{`([^`]*)`\}/.exec(attrText);
-  if (template) return template[1];
-  const braced = /className\s*=\s*\{'([^']*)'\}/.exec(attrText);
-  if (braced) return braced[1];
-  return null;
-}
-
-/**
- * Recover the element tree. Not a JSX parser: it only keeps tags that carry a
- * static className, which is all the checks need.
- */
 export function parseJsx(text) {
   const elements = [];
   const stack = [];
-  const tagRe = /<(\/?)([A-Za-z][\w.:-]*)((?:"[^"]*"|'[^']*'|[^>"'])*?)(\/?)>/g;
-  let m = tagRe.exec(text);
-  while (m) {
-    const [, closing, tag, attrText, selfClosing] = m;
-    if (closing) {
-      stack.pop();
-    } else {
-      const className = extractClassName(attrText);
-      const node = {
-        tag,
-        className,
-        parent: stack.length ? stack[stack.length - 1] : null,
-      };
-      if (className) elements.push(node);
-      if (!selfClosing) stack.push(node);
+  let i = 0;
+
+  while (i < text.length) {
+    const lt = text.indexOf('<', i);
+    if (lt === -1) break;
+
+    const next = text[lt + 1];
+    if (next === '!') {
+      const gt = text.indexOf('>', lt);
+      i = gt === -1 ? text.length : gt + 1;
+      continue;
     }
-    m = tagRe.exec(text);
+    if (next === '/') {
+      const gt = text.indexOf('>', lt);
+      if (gt === -1) break;
+      stack.pop();
+      i = gt + 1;
+      continue;
+    }
+
+    // opening tag: find the '>' that is not inside an expression or a string
+    let j = lt + 1;
+    let braceDepth = 0;
+    let quote = null;
+    while (j < text.length) {
+      const ch = text[j];
+      if (quote) {
+        if (ch === '\\') {
+          j += 2;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        j += 1;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        quote = ch;
+        j += 1;
+        continue;
+      }
+      if (ch === '{') braceDepth += 1;
+      else if (ch === '}') braceDepth = Math.max(0, braceDepth - 1);
+      else if (ch === '>' && braceDepth === 0) break;
+      j += 1;
+    }
+    if (j >= text.length) break;
+
+    const raw = text.slice(lt + 1, j);
+    const selfClosing = raw.trimEnd().endsWith('/');
+    const body = selfClosing ? raw.trimEnd().slice(0, -1) : raw;
+    const tagMatch = /^([A-Za-z][\w.:-]*)/.exec(body.trimStart());
+
+    if (!tagMatch) {
+      // fragment: keep depth for parent bookkeeping, emit nothing
+      if (!selfClosing) stack.push({ tag: '<>', className: null, parent: stack.at(-1) ?? null });
+      i = j + 1;
+      continue;
+    }
+
+    const tag = tagMatch[1];
+    const attrText = body.trimStart().slice(tag.length);
+    const node = {
+      tag,
+      className: extractClassName(attrText),
+      parent: stack.at(-1) ?? null,
+    };
+    elements.push(node);
+    if (!selfClosing) stack.push(node);
+    i = j + 1;
   }
+
   return elements;
 }
 
 function tailwindRadius(token) {
   if (!token.startsWith('rounded')) return null;
-  const suffix = token.slice('rounded'.length).replace(/^-/, '');
-  const key = suffix.replace(/^-(?:t|r|b|l|s|e|tl|tr|br|bl)-/, '');
-  if (suffix !== key) return null; // side-specific radii are out of scope
+  const suffix = token.slice('rounded'.length);
+  if (suffix !== '' && !suffix.startsWith('-')) return null;
+  const key = suffix.replace(/^-/, '');
+  if (key.includes('-')) return null; // side-specific radii are out of scope
   if (!(key in RADIUS_SCALE)) return null;
   return RADIUS_SCALE[key];
 }
 
-function tailwindPadding(token) {
-  const m = /^p-(.+)$/.exec(token);
+function tailwindPadding(token, axis = '') {
+  const re = new RegExp(`^p${axis}-([\\w.]+)$`);
+  const m = re.exec(token);
   if (!m) return null;
   return m[1] in PADDING_SCALE ? PADDING_SCALE[m[1]] : null;
+}
+
+function firstRadius(tokens) {
+  for (const token of tokens) {
+    const value = tailwindRadius(token);
+    if (value !== null) return value;
+  }
+  return undefined;
 }
 
 export function checkTsx(text, { target = '<tsx>' } = {}) {
@@ -224,36 +349,72 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
   const findings = [];
 
   for (const el of elements) {
-    const tokens = classTokens(el.className);
-    const hasBoxTrim = tokens.some((t) => t === 'text-box' || t.startsWith('text-box-'));
+    const tokens = classNames(el.className);
+    const hasBoxTrim = tokens.some(isBoxTrim);
     const flexy = tokens.find((t) => FLEXY.test(t));
     if (hasBoxTrim && flexy) {
       findings.push({
         id: 'rule/text-box-in-flex',
         layer: 'exact',
         forcedVerdict: 'off',
-        offset: 1,
-        basis: 24,
-        evidence: `<${el.tag} className="${el.className}">: ${flexy} + text-box — trimming is a no-op inside a flex/grid container`,
+        pixel: false,
+        evidence: `<${el.tag} className="${tokens.join(' ')}">: ${flexy} + text-box — trimming is a no-op inside a flex/grid container`,
         suggested: { kind: 'hoist', value: `move text-box to the text child of <${el.tag}>` },
       });
     }
   }
 
   for (const el of elements) {
-    const tokens = classTokens(el.className);
-    const outerRadius = tokens.map(tailwindRadius).find((r) => r !== null && r !== undefined);
-    const padding = tokens.map(tailwindPadding).find((p) => p !== null && p !== undefined);
-    if (outerRadius === undefined || padding === undefined) continue;
+    const tokens = classNames(el.className);
+    const outerRadius = firstRadius(tokens);
+    if (outerRadius === undefined) continue;
+
+    const uniform = tokens.map((t) => tailwindPadding(t)).find((p) => p !== null && p !== undefined);
+    const padX = tokens.map((t) => tailwindPadding(t, 'x')).find((p) => p !== null && p !== undefined);
+    const padY = tokens.map((t) => tailwindPadding(t, 'y')).find((p) => p !== null && p !== undefined);
+
+    let padding;
+    if (uniform !== undefined) {
+      padding = uniform;
+    } else if (padX !== undefined && padY !== undefined) {
+      if (padX !== padY) {
+        findings.push({
+          id: 'rule/non-concentric-radius',
+          layer: 'heuristic',
+          forcedVerdict: 'unknown',
+          pixel: false,
+          evidence: `<${el.tag}> has unequal insets (padding-inline ${px(padX)}, padding-block ${px(padY)}); the concentric radius is elliptical and cannot be expressed as a single calc()`,
+          suggested: { kind: 'inspect', value: `rx = ${px(outerRadius)} − ${px(padX)}, ry = ${px(outerRadius)} − ${px(padY)}` },
+        });
+        continue;
+      }
+      padding = padX;
+    } else {
+      continue;
+    }
 
     for (const child of elements) {
       if (child.parent !== el) continue;
-      const childRadius = classTokens(child.className)
-        .map(tailwindRadius)
-        .find((r) => r !== null && r !== undefined);
+      const childRadius = firstRadius(classNames(child.className));
       if (childRadius === undefined) continue;
 
-      const expected = Math.max(outerRadius - padding, 0);
+      if (padding >= outerRadius) {
+        findings.push({
+          id: 'rule/non-concentric-radius',
+          layer: 'heuristic',
+          forcedVerdict: 'nudge',
+          radius: 'exceeds',
+          pixel: false,
+          evidence: `<${el.tag}> has ${px(outerRadius)} radius inside ${px(padding)} padding; the inner radius resolves to 0 and the outer curve is lost — the outer radius is too small for its padding`,
+          suggested: {
+            kind: 'outer-radius',
+            value: `raise the outer radius above ${px(padding)} or reduce the padding`,
+          },
+        });
+        continue;
+      }
+
+      const expected = outerRadius - padding;
       const delta = childRadius - expected;
       if (Math.abs(delta) <= 0.5) continue;
 
@@ -267,10 +428,7 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
           `${px(expected)}, found ${px(childRadius)} on <${child.tag}>`,
         suggested: {
           kind: 'radius',
-          value:
-            padding === 0
-              ? `${px(outerRadius)}`
-              : `calc(${px(outerRadius)} - ${px(padding)})`,
+          value: `calc(${px(outerRadius)} - ${px(padding)})`,
         },
       });
     }

@@ -3,12 +3,17 @@
 // The model is deliberately literal: we measure ink, not layout boxes. A path
 // that renders outside its own viewBox is a real defect and must not be
 // normalised away.
+//
+// The governing rule is that a missing measurement is never a zero. If any part
+// of the drawing cannot be resolved (clip paths, masks, dangling <use>, empty
+// canvases), the report says `unknown` instead of producing a number.
 
 import { readFile, readdir } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import {
   flattenPath,
   netShape,
+  netShapeEvenOdd,
   bboxOfPoints,
   parseTransform,
   applyMatrix,
@@ -20,6 +25,23 @@ import { buildReport, tolFor } from './report.mjs';
 
 const round = (n, d = 3) => Math.round(n * 10 ** d) / 10 ** d;
 const SHAPES = new Set(['path', 'rect', 'circle', 'ellipse', 'polygon', 'polyline', 'line']);
+const NON_RENDERING = new Set([
+  'defs',
+  'clippath',
+  'mask',
+  'symbol',
+  'pattern',
+  'marker',
+  'lineargradient',
+  'radialgradient',
+  'filter',
+  'style',
+  'title',
+  'desc',
+  'metadata',
+]);
+const UNRESOLVABLE = ['clip-path', 'mask', 'filter'];
+const MAX_USE_DEPTH = 3;
 
 /** Minimal XML scanner: enough for icon markup, strict enough to fail loudly. */
 function parseXml(text) {
@@ -84,36 +106,91 @@ function parseViewBox(attrs) {
   return { x: 0, y: 0, w: Number.isFinite(w) ? w : 24, h: Number.isFinite(h) ? h : 24 };
 }
 
-function strokeWidthOf(value, fallback) {
-  if (value === undefined) return fallback;
-  const n = Number.parseFloat(value);
-  return Number.isFinite(n) ? n : fallback;
+/** `style="fill:none;stroke:#000"` is presentation attributes by another name. */
+function parseStyle(value) {
+  if (!value) return {};
+  const out = {};
+  for (const part of value.split(';')) {
+    const colon = part.indexOf(':');
+    if (colon === -1) continue;
+    const prop = part.slice(0, colon).trim().toLowerCase();
+    const val = part.slice(colon + 1).trim();
+    if (prop && val) out[prop] = val;
+  }
+  return out;
 }
 
-function collect(node, inherited, out) {
-  const attrs = node.attrs || {};
+function effectiveAttrs(node) {
+  return { ...node.attrs, ...parseStyle(node.attrs.style) };
+}
+
+function indexIds(node, map) {
+  if (node.attrs && node.attrs.id) map.set(node.attrs.id, node);
+  for (const child of node.children || []) indexIds(child, map);
+}
+
+function collect(node, inherited, out, ctx) {
+  if (NON_RENDERING.has(String(node.tag).toLowerCase())) return out;
+
+  const attrs = effectiveAttrs(node);
+  if (attrs.display === 'none' || attrs.visibility === 'hidden') return out;
+  if (attrs.opacity !== undefined && Number.parseFloat(attrs.opacity) === 0) return out;
+
+  for (const attr of UNRESOLVABLE) {
+    if (attrs[attr] && !/^none$/i.test(attrs[attr])) ctx.unresolved.add(attr);
+  }
+
+  if (node.tag === 'use') {
+    const href = attrs.href || attrs['xlink:href'] || '';
+    const id = href.startsWith('#') ? href.slice(1) : '';
+    const target = id ? ctx.ids.get(id) : null;
+    if (!target) {
+      ctx.unresolved.add('use-without-target');
+      return out;
+    }
+    if (ctx.depth >= MAX_USE_DEPTH) {
+      ctx.unresolved.add('use-nested-too-deep');
+      return out;
+    }
+    const x = Number.parseFloat(attrs.x || '0') || 0;
+    const y = Number.parseFloat(attrs.y || '0') || 0;
+    const local = {
+      ...inherited,
+      matrix: multiplyMatrix(inherited.matrix, [1, 0, 0, 1, x, y]),
+    };
+    collect(target, local, out, { ...ctx, depth: ctx.depth + 1, unresolved: ctx.unresolved });
+    return out;
+  }
+
   const matrix = attrs.transform
     ? multiplyMatrix(inherited.matrix, parseTransform(attrs.transform))
     : inherited.matrix;
   const fill = attrs.fill !== undefined ? attrs.fill : inherited.fill;
   const stroke = attrs.stroke !== undefined ? attrs.stroke : inherited.stroke;
-  const strokeWidth = strokeWidthOf(attrs['stroke-width'], inherited.strokeWidth);
+  const strokeWidth = attrs['stroke-width'] !== undefined
+    ? Number.parseFloat(attrs['stroke-width'])
+    : inherited.strokeWidth;
+  const fillRule = (attrs['fill-rule'] || inherited.fillRule || 'nonzero').toLowerCase();
+  const fillOpacity = attrs['fill-opacity'] !== undefined ? Number.parseFloat(attrs['fill-opacity']) : 1;
 
   if (SHAPES.has(node.tag)) {
     const d = node.tag === 'path' ? attrs.d || '' : shapeToPath(node.tag, attrs);
-    if (d) {
+    if (!d) {
+      ctx.unresolved.add('unparsed-shape');
+    } else {
       out.push({
         d,
         matrix,
-        filled: fill !== 'none',
-        stroked: stroke !== 'none' && stroke !== undefined,
-        strokeWidth,
+        filled: fill !== 'none' && fillOpacity !== 0,
+        stroked: stroke !== undefined && stroke !== 'none',
+        strokeWidth: Number.isFinite(strokeWidth) ? strokeWidth : 1,
+        fillRule,
       });
     }
   }
 
   for (const child of node.children || []) {
-    collect(child, { matrix, fill, stroke, strokeWidth }, out);
+    collect(child, { matrix, fill, stroke, strokeWidth, fillRule }, out, ctx);
   }
   return out;
 }
@@ -139,14 +216,29 @@ function bboxExpand(box, by) {
   };
 }
 
+function uniformScale(matrix) {
+  const sx = Math.hypot(matrix[0], matrix[1]);
+  const sy = Math.hypot(matrix[2], matrix[3]);
+  return (sx + sy) / 2 || 1;
+}
+
 /**
- * @returns {{viewBox: object, ink: {bbox: object, area: number, centroid: {cx:number,cy:number}}, strokeOnly: boolean}}
+ * @returns {{viewBox: object, ink: object, strokeOnly: boolean, noInk: boolean, unresolved: string[]}}
  */
 export function analyzeSvg(text, { steps = 24 } = {}) {
   const doc = parseXml(text);
-  const svg = doc.children.find((c) => c.tag === 'svg') || doc.children[0] || { attrs: {} };
+  const svg = doc.children.find((c) => c.tag === 'svg') || doc.children[0] || { attrs: {}, children: [] };
   const viewBox = parseViewBox(svg.attrs || {});
-  const shapes = collect(svg, { matrix: IDENTITY, fill: 'black', stroke: undefined, strokeWidth: 1 }, []);
+  const ids = new Map();
+  indexIds(svg, ids);
+
+  const ctx = { ids, unresolved: new Set(), depth: 0 };
+  const shapes = collect(
+    svg,
+    { matrix: IDENTITY, fill: 'black', stroke: undefined, strokeWidth: 1, fillRule: 'nonzero' },
+    [],
+    ctx,
+  );
 
   let filledArea = 0;
   let filledCx = 0;
@@ -167,7 +259,7 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
     const localBox = bboxOfPoints(points);
 
     if (shape.filled) {
-      const net = netShape(subpaths);
+      const net = shape.fillRule === 'evenodd' ? netShapeEvenOdd(subpaths) : netShape(subpaths);
       if (net.area > 0) {
         filledArea += net.area;
         filledCx += net.cx * net.area;
@@ -194,36 +286,32 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
   }
 
   const totalArea = filledArea + strokeArea;
+  const finalBox = bboxUnion(bbox, strokeBox);
 
-  let cx = 0;
-  let cy = 0;
-  if (totalArea > 0) {
-    cx = (filledCx + strokeMx) / totalArea;
-    cy = (filledCy + strokeMy) / totalArea;
+  if (totalArea <= 1e-9 || !finalBox) {
+    return {
+      viewBox,
+      ink: { bbox: null, area: 0, centroid: { cx: 0, cy: 0 } },
+      strokeOnly: false,
+      noInk: true,
+      unresolved: [...ctx.unresolved],
+    };
   }
-
-  const finalBox = bboxUnion(bbox, strokeBox) || {
-    minX: viewBox.x,
-    minY: viewBox.y,
-    maxX: viewBox.x + viewBox.w,
-    maxY: viewBox.y + viewBox.h,
-  };
 
   return {
     viewBox,
     ink: {
       bbox: finalBox,
       area: totalArea,
-      centroid: { cx, cy },
+      centroid: {
+        cx: (filledCx + strokeMx) / totalArea,
+        cy: (filledCy + strokeMy) / totalArea,
+      },
     },
     strokeOnly: filledArea === 0 && strokeArea > 0,
+    noInk: false,
+    unresolved: [...ctx.unresolved],
   };
-}
-
-function uniformScale(matrix) {
-  const sx = Math.hypot(matrix[0], matrix[1]);
-  const sy = Math.hypot(matrix[2], matrix[3]);
-  return (sx + sy) / 2 || 1;
 }
 
 function boxCenter(box) {
@@ -236,10 +324,38 @@ function boxCenter(box) {
  */
 export function checkShape(shape, { mode = 'standalone', target = '<inline>' } = {}) {
   const { viewBox, ink } = shape;
+  const findings = [];
+  const meta = { strokeOnly: shape.strokeOnly, ink: shape.ink, viewBox: shape.viewBox };
+
+  if (shape.noInk) {
+    findings.push({
+      id: 'geometry/no-ink',
+      layer: 'exact',
+      forcedVerdict: 'unknown',
+      pixel: false,
+      evidence: 'no renderable ink was found (empty canvas, unresolved shapes, or only non-rendering nodes)',
+      suggested: { kind: 'inspect', value: 'check the source; the canvas may be empty or use unsupported syntax' },
+    });
+  }
+
+  if (shape.unresolved?.length) {
+    findings.push({
+      id: 'geometry/unresolved-graphics',
+      layer: 'exact',
+      forcedVerdict: 'unknown',
+      pixel: false,
+      evidence: `ink cannot be measured while these features are present: ${shape.unresolved.join(', ')}`,
+      suggested: { kind: 'inspect', value: 'flatten the artwork (expand clip paths / masks) and re-run' },
+    });
+  }
+
+  if (shape.noInk || shape.unresolved?.length) {
+    return buildReport({ target, mode, findings, meta: { ...meta, blocked: true } });
+  }
+
   const vbCenter = { x: viewBox.x + viewBox.w / 2, y: viewBox.y + viewBox.h / 2 };
   const inkCenter = boxCenter(ink.bbox);
   const basis = Math.min(viewBox.w, viewBox.h) || 24;
-  const findings = [];
 
   findings.push({
     id: 'geometry/ink-bbox',
@@ -277,19 +393,13 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
       id: 'geometry/inline-context',
       layer: 'exact',
       forcedVerdict: 'unknown',
-      offset: 0,
-      basis,
+      pixel: false,
       evidence: 'inline mode needs a sibling text node to measure the optical gutter; none provided',
       suggested: { kind: 'rerun', value: '--mode standalone' },
     });
   }
 
-  return buildReport({
-    target,
-    mode,
-    findings,
-    meta: { strokeOnly: shape.strokeOnly, ink: shape.ink, viewBox: shape.viewBox },
-  });
+  return buildReport({ target, mode, findings, meta });
 }
 
 export async function checkIconFile(path, { mode = 'auto' } = {}) {
@@ -318,11 +428,34 @@ export async function checkIconSet(dir, { threshold = 0.2 } = {}) {
       linear: Math.sqrt(Math.max(ratio, 0)),
       size: Math.min(shape.viewBox.w, shape.viewBox.h),
       strokeOnly: shape.strokeOnly,
+      noInk: shape.noInk,
+      unresolved: shape.unresolved.length > 0,
     });
   }
 
   if (rows.length === 0) {
     return buildReport({ target: basename(dir), mode: 'keyline', findings: [] });
+  }
+
+  const blind = rows.filter((r) => r.noInk || r.unresolved);
+  if (blind.length > 0) {
+    return buildReport({
+      target: basename(dir),
+      mode: 'keyline',
+      findings: [
+        {
+          id: 'geometry/keyline-incomplete',
+          layer: 'heuristic',
+          forcedVerdict: 'unknown',
+          pixel: false,
+          evidence: `${blind.length}/${rows.length} icons could not be measured (${blind
+            .map((r) => r.file)
+            .join(', ')}); a norm computed without them would be fiction`,
+          suggested: { kind: 'inspect', value: 'fix or flatten the flagged icons first' },
+        },
+      ],
+      meta: { set: rows.map((r) => r.file) },
+    });
   }
 
   // A stroke-only icon's fill ratio is dominated by its line width; comparing it
@@ -337,6 +470,7 @@ export async function checkIconSet(dir, { threshold = 0.2 } = {}) {
           id: 'geometry/keyline-mixed-set',
           layer: 'heuristic',
           forcedVerdict: 'unknown',
+          pixel: false,
           offset: 0,
           evidence:
             `${stroked}/${rows.length} icons are stroke-only and the rest are filled; ` +
@@ -357,6 +491,7 @@ export async function checkIconSet(dir, { threshold = 0.2 } = {}) {
           id: 'geometry/keyline-small-set',
           layer: 'heuristic',
           forcedVerdict: 'unknown',
+          pixel: false,
           offset: 0,
           evidence: `${rows.length} icons is not enough to establish a norm (need at least 3)`,
           suggested: { kind: 'extend', value: 'add more icons from the same family' },
@@ -386,12 +521,17 @@ export async function checkIconSet(dir, { threshold = 0.2 } = {}) {
         ? { kind: 'none', value: 'within set norm' }
         : {
             kind: 'scale',
-            value: `${round(((median / (row.linear || 1)) - 1) * 100, 1)}%`,
+            value: `${round((median / (row.linear || 1) - 1) * 100, 1)}%`,
           },
     };
   });
 
-  return buildReport({ target: basename(dir), mode: 'keyline', findings, meta: { set: rows.map((r) => r.file) } });
+  return buildReport({
+    target: basename(dir),
+    mode: 'keyline',
+    findings,
+    meta: { set: rows.map((r) => r.file) },
+  });
 }
 
 export { tolFor };
