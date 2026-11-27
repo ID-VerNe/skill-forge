@@ -1639,3 +1639,22 @@ test('an animation that reaches zero paint is caught in every spelling', () => {
   );
   assert.deepEqual(cycle.unresolved, []);
 });
+
+test('a > inside an attribute value does not cut the tag', () => {
+  // `data-name="a>b"` is legal XML. Scanning to the first `>` dropped every
+  // attribute after it, so a path lost its `d` (a shape with no `d` is not ink)
+  // and the file measured as if that glyph had never been drawn.
+  const withGt = analyzeSvg(
+    svg('<path data-name="a>b" d="M0 0H8V8H0Z"/><rect x="10" y="10" width="4" height="4"/>'),
+  );
+  const control = analyzeSvg(svg('<path d="M0 0H8V8H0Z"/><rect x="10" y="10" width="4" height="4"/>'));
+  assert.deepEqual(withGt.unresolved, []);
+  near(withGt.ink.area, control.ink.area, 1e-9);
+  near(withGt.ink.area, 80, 1e-9);
+
+  // Single quotes are attribute delimiters too.
+  const single = analyzeSvg(
+    svg("<path data-name='a>b' d='M0 0H8V8H0Z'/><rect x='10' y='10' width='4' height='4'/>"),
+  );
+  near(single.ink.area, 80, 1e-9);
+});

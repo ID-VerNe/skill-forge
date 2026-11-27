@@ -155,6 +155,29 @@ function movesInk(target, values) {
   return GEOMETRY_ANIMATION.has(target);
 }
 
+/**
+ * Index of the `>` that closes a tag, ignoring any that sit inside a quoted
+ * attribute value.
+ *
+ * `data-name="a>b"` is legal XML. Scanning to the first `>` cut the tag there,
+ * so `d` and `class` after it vanished — and a shape with no `d` is not ink, so
+ * the file measured as if that glyph had never been drawn.
+ */
+function findTagEnd(text, from) {
+  let quote = null;
+  for (let i = from; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '>') {
+      return i;
+    }
+  }
+  return -1;
+}
+
 /** Minimal XML scanner: enough for icon markup, strict enough to fail loudly. */
 function parseXml(text) {
   const root = { tag: '#root', attrs: {}, children: [] };
@@ -178,7 +201,7 @@ function parseXml(text) {
       i = end === -1 ? text.length : end + 1;
       continue;
     }
-    const gt = text.indexOf('>', lt);
+    const gt = findTagEnd(text, lt + 1);
     if (gt === -1) break;
     const raw = text.slice(lt + 1, gt).trim();
     if (raw.startsWith('/')) {
