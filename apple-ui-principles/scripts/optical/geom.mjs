@@ -211,11 +211,37 @@ function selfCrossingMatters(poly, area) {
   return disturbed > SELF_CROSSING_TOLERANCE * Math.max(area, 0);
 }
 
+/**
+ * A subpath whose shoelace area cancels to zero while it still spans an area.
+ *
+ * `M12 12 L4 2 L2 12 L12 12 L20 2 L22 12 Z` is a figure-eight: two triangles
+ * joined at (12,12) with opposite windings, so the shoelace sum is exactly zero
+ * while both paint. Treating that as "no area" dropped a whole glyph and left
+ * the report saying `ok` about whatever else was on the canvas.
+ *
+ * A truly empty fragment (`M4 4z`) also has zero area, but it spans nothing, so
+ * the bounding box separates the two. Splitting the outline into loops at the
+ * shared vertex would be exact, but arcs flatten to polylines that revisit their
+ * own start, and telling a genuine pinch from ordinary curve noise needs more
+ * than a vertex-position check. Refusing is the cheap honest answer.
+ */
+function cancelsToNothing(poly) {
+  if (Math.abs(subpathSignedArea(poly)) >= 1e-12) return false;
+  const box = bboxOfPoints(poly);
+  if (!box) return false;
+  return (box.maxX - box.minX) * (box.maxY - box.minY) > 1e-9;
+}
+
 export function netShape(subpaths) {
   // Two subpaths with the same outline are one region, not two. Summing them
   // doubles the area and drags the centroid towards it, so refuse instead.
   const boxes = subpaths.map((sub) => bboxOfPoints(sub));
   const areas = subpaths.map((sub) => Math.abs(subpathSignedArea(sub)));
+  for (let i = 0; i < subpaths.length; i += 1) {
+    if (cancelsToNothing(subpaths[i])) {
+      return { area: 0, cx: 0, cy: 0, selfIntersecting: true };
+    }
+  }
   // A subpath crossing itself has no shoelace area at all. The formula returns
   // the integral of the winding number, not the painted area, so a pentagram
   // comes back 2×its centre pentagon too large and a bowtie comes back zero
@@ -311,6 +337,9 @@ export function netShape(subpaths) {
     my += cy * weight * areas[index];
   }
   if (Math.abs(area) < 1e-12) {
+    // Outlines that cancel each other exactly — a container and a hole the same
+    // size — paint nothing, which is a real (and reported) `no-ink` case. Reach
+    // here only after every subpath was individually representable.
     return { area: 0, cx: 0, cy: 0 };
   }
   return { area: Math.abs(area), cx: mx / area, cy: my / area };
@@ -429,7 +458,7 @@ export function netShapeEvenOdd(subpaths) {
   // subpath that crosses itself produces crossings the containment test never
   // sees. A bowtie is the cheap case (zero shoelace area, non-zero paint).
   for (const item of items) {
-    if (selfCrossingMatters(item.sub, item.area)) {
+    if (selfCrossingMatters(item.sub, item.area) || cancelsToNothing(item.sub)) {
       return { area: 0, cx: 0, cy: 0, overlapping: false, selfIntersecting: true };
     }
   }
@@ -487,8 +516,8 @@ export function netShapeEvenOdd(subpaths) {
     my += weight * items[i].area * items[i].centroid.cy;
   }
 
-  if (Math.abs(area) < 1e-12) return { area: 0, cx: 0, cy: 0, overlapping: false };
-  return { area: Math.abs(area), cx: mx / area, cy: my / area, overlapping: false };
+  // Exact cancellation here is the container-and-hole case, same as nonzero.
+  if (Math.abs(area) < 1e-12) return { area: 0, cx: 0, cy: 0, overlapping: false };  return { area: Math.abs(area), cx: mx / area, cy: my / area, overlapping: false };
 }
 
 export function bboxOfPoints(points) {

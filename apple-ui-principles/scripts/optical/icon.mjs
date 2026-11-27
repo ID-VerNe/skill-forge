@@ -108,20 +108,49 @@ const GEOMETRY_ANIMATION = new Set([
   'path',
 ]);
 
+/** Split a value list on separators that are *outside* parentheses. */
+function splitValues(raw) {
+  const s = String(raw);
+  const out = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0 && /[\s;,]/.test(ch)) {
+      if (i > start) out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (s.length > start) out.push(s.slice(start));
+  return out.filter(Boolean);
+}
+
 /**
  * Does animating this attribute change what the ink *is*?
  *
  * The set above says "this attribute matters"; not every value does. A colour
  * cycle from `#000` to `#f00` repaints without moving or resizing anything, so
  * the geometry still stands and refusing it would make the checker useless on
- * the most common SVG animation there is. `none` / `transparent` / zero alpha
- * switch the ink off, and `evenodd` turns holes into solid — those do.
+ * the most common SVG animation there is. Anything that reaches zero paint does
+ * change the ink, and so does `evenodd` turning holes into solid.
+ *
+ * The endpoint list is split into individual values rather than pattern-matched:
+ * `#00000000` and `rgba(0,0,0,0)` say "transparent" without using the word, and
+ * `.0` / `0%` are zero opacity just as much as `0`.
  */
 function movesInk(target, values) {
-  if (target === 'fill' || target === 'stroke') return /\bnone\b|\btransparent\b/.test(values);
+  const tokens = splitValues(values);
+  if (target === 'fill' || target === 'stroke') {
+    return tokens.some((token) => keywordIs(token, 'none') || isInvisiblePaint(token));
+  }
   if (target === 'fill-rule') return /\bevenodd\b/.test(values);
   if (target === 'opacity' || target === 'fill-opacity' || target === 'stroke-opacity') {
-    return /(^|[\s;,])0(\.0*)?($|[\s;,])/.test(values);
+    return tokens.some((token) => {
+      const n = token.endsWith('%') ? Number(token.slice(0, -1)) / 100 : Number(token);
+      return Number.isFinite(n) && n <= 0;
+    });
   }
   return GEOMETRY_ANIMATION.has(target);
 }

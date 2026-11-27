@@ -1605,3 +1605,37 @@ test('empty moveto fragments are not duplicate outlines', () => {
   );
   assert.match(duplicate.unresolved.join(), /overlapping-subpaths/);
 });
+
+test('a subpath whose area cancels to nothing is refused, never dropped', () => {
+  // A figure-eight is two triangles joined at (12,12) with opposite windings:
+  // the shoelace sum is exactly zero while both paint. Dropping it as "no area"
+  // left the rest of the canvas reporting `ok` as if the glyph did not exist.
+  const only = analyzeSvg(svg('<path d="M12 12 L4 2 L2 12 L12 12 L20 2 L22 12 Z"/>'));
+  assert.match(only.unresolved.join(), /self-intersecting/);
+
+  const beside = analyzeSvg(
+    svg('<path d="M12 12 L4 2 L2 12 L12 12 L20 2 L22 12 Z"/><rect x="10" y="10" width="4" height="4"/>'),
+  );
+  assert.match(beside.unresolved.join(), /self-intersecting/);
+  assert.equal(checkShape(beside, { target: 'fig8.svg' }).verdict, 'unknown');
+});
+
+test('an animation that reaches zero paint is caught in every spelling', () => {
+  // `#00000000` and `rgba(0,0,0,0)` say "transparent" without the word, and `.0`
+  // / `0%` are zero opacity just as much as `0`. A colour cycle is the control:
+  // it repaints without moving anything, so it must stay measurable.
+  const cases = [
+    '<animate attributeName="fill" from="#000" to="#00000000" dur="1s"/>',
+    '<animate attributeName="fill" from="#000" to="rgba(0,0,0,0)" dur="1s"/>',
+    '<animate attributeName="opacity" from="1" to=".0" dur="1s"/>',
+    '<animate attributeName="opacity" from="1" to="0%" dur="1s"/>',
+  ];
+  for (const animation of cases) {
+    const shape = analyzeSvg(svg(`<rect width="24" height="24">${animation}</rect>`));
+    assert.match(shape.unresolved.join(), /animated-ink/, animation);
+  }
+  const cycle = analyzeSvg(
+    svg('<rect width="24" height="24"><animate attributeName="fill" from="#000" to="#f00" dur="1s"/></rect>'),
+  );
+  assert.deepEqual(cycle.unresolved, []);
+});
