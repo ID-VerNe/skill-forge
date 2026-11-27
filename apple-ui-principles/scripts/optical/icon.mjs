@@ -338,7 +338,7 @@ function collect(node, inherited, out, ctx) {
     const local = inheritedFor(attrs, inherited, visible, matrix);
     local.viewport = { w: vpW, h: vpH };
     // The clip applies in the *inner* coordinate system, after the viewBox map.
-    withClip(attrs, matrix, ctx, out, (sink) => {
+    withClip(attrs, [own, matrix], ctx, out, (sink) => {
       for (const child of node.children || []) collect(child, local, sink, ctx);
     });
     return out;
@@ -376,7 +376,7 @@ function collect(node, inherited, out, ctx) {
     const inner = { ...ctx, depth: ctx.depth + 1 };
     const local = inheritedFor(attrs, inherited, visible, useMatrix);
 
-    withClip(attrs, useMatrix, ctx, out, (sink) => {
+    withClip(attrs, [useMatrix], ctx, out, (sink) => {
       if (targetTag === 'symbol') {
         // <symbol> is non-rendering on its own but renders when instantiated.
         const vpW = resolveLength(attrs.width, inherited.viewport.w);
@@ -399,7 +399,7 @@ function collect(node, inherited, out, ctx) {
           );
         }
         const childLocal = { ...local, matrix, viewport: { w: vpW, h: vpH } };
-        for (const child of target.children || []) collect(child, childLocal, sink, ctx);
+        for (const child of target.children || []) collect(child, childLocal, sink, inner);
         return;
       }
       if (targetTag === 'svg') {
@@ -451,7 +451,7 @@ function collect(node, inherited, out, ctx) {
 
   // --- anything else with children is a container --------------------------
   const bound = inheritedFor(attrs, inherited, visible, own);
-  withClip(attrs, own, ctx, out, (sink) => {
+  withClip(attrs, [own], ctx, out, (sink) => {
     for (const child of node.children || []) collect(child, bound, sink, ctx);
   });
   return out;
@@ -465,22 +465,29 @@ function collect(node, inherited, out, ctx) {
  * that would actually cut the drawing still becomes `unknown`: the remainder
  * needs a boolean intersection of arbitrary outlines.
  */
-function withClip(attrs, matrix, ctx, out, emit) {
+function withClip(attrs, matrices, ctx, out, emit) {
   const clipRaw = attrs['clip-path'];
   if (!clipRaw || /^none$/i.test(String(clipRaw).trim())) {
     emit(out);
     return;
   }
-  const rect = resolveClipRect(clipRaw, ctx, matrix);
-  if (!rect) {
-    ctx.unresolved.add('clip-path');
-    return;
+  const rects = [];
+  for (const matrix of matrices) {
+    const rect = resolveClipRect(clipRaw, ctx, matrix);
+    if (!rect) {
+      ctx.unresolved.add('clip-path');
+      return;
+    }
+    rects.push(rect);
   }
   const captured = [];
   emit(captured);
   if (captured.length === 0) return;
   const box = bboxOfShapes(captured, ctx.steps);
-  if (box && !rectContains(rect, box)) {
+  // A viewport-establishing element is clipped in one of two plausible spaces
+  // (before or after its own viewBox). Passing only when *both* readings contain
+  // the ink keeps the decision conservative.
+  if (box && !rects.every((rect) => rectContains(rect, box))) {
     ctx.unresolved.add('clip-path-cuts-ink');
     return;
   }

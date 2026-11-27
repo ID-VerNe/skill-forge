@@ -112,12 +112,20 @@ function mergeBySelector(blocks) {
     const key = block.selector;
     let entry = merged.get(key);
     if (!entry) {
-      entry = { selector: block.selector, decls: {}, order: [], seen: {}, conflicts: new Set() };
+      entry = {
+        selector: block.selector,
+        decls: {},
+        order: [],
+        seen: {},
+        conflicts: new Set(),
+        values: {},
+      };
       merged.set(key, entry);
     }
     for (const [prop, value] of Object.entries(block.decls)) {
       if (prop in entry.decls && entry.decls[prop] !== value) entry.conflicts.add(prop);
       if (!(prop in entry.decls)) entry.seen[prop] = block.context;
+      (entry.values[prop] ||= new Set()).add(value);
       entry.decls[prop] = value;
     }
     entry.order.push(...(block.order || Object.entries(block.decls)));
@@ -126,9 +134,16 @@ function mergeBySelector(blocks) {
 }
 
 /** `display: flex !important` still lays out as a flex container. */
+function normaliseDisplayValue(raw) {
+  return String(raw || '')
+    .replace(/!\s*important\s*$/i, '')
+    .trim()
+    .toLowerCase();
+}
+
 function displayKind(raw) {
   if (!raw) return { kind: 'absent' };
-  const value = raw.replace(/!\s*important\s*$/i, '').trim().toLowerCase();
+  const value = normaliseDisplayValue(raw);
   if (!value) return { kind: 'absent' };
   if (value.includes('var(') || value.includes('env(')) return { kind: 'dynamic' };
   return { kind: 'static', value };
@@ -174,6 +189,20 @@ function textBoxFindings(blocks) {
     }
 
     if (block.conflicts.has('display')) {
+      // `flex` in one branch and `inline-flex` in another is a conflict in form
+      // but not in meaning: the container is flex either way.
+      const variants = [...(block.values.display || [])].map(normaliseDisplayValue);
+      if (variants.length > 0 && variants.every((v) => FLEXY.test(v))) {
+        findings.push({
+          id: 'rule/text-box-in-flex',
+          layer: 'exact',
+          forcedVerdict: 'off',
+          pixel: false,
+          evidence: `${where}: display is ${variants.join(' / ')} across contexts + text-box:${trim} — every branch is a flex/grid container, so trimming never applies`,
+          suggested: { kind: 'hoist', value: `apply text-box on the inline child of ${block.selector}` },
+        });
+        continue;
+      }
       findings.push({
         id: 'rule/text-box-in-flex',
         layer: 'exact',

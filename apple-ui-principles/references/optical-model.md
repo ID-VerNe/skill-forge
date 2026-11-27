@@ -74,6 +74,12 @@ refuse*, never approximate:
 | any other geometry (circles, paths, rounded rects, multiple children, `objectBoundingBox`) | `clip-path`, `unknown` |
 | a shape clipping itself | `clip-path`, `unknown` — the container walk would drop the shape |
 
+On a viewport-establishing element (`<use>` of a `<symbol>`, nested `<svg>`) the
+clip's coordinate space is ambiguous — authored in the outer space or the inner
+one? The checker resolves the clip in **both** readings and passes only when both
+contain the ink, so an ambiguous clip can only produce a refusal, never a wrong
+pass.
+
 A `clip-path` on a shape that clips **itself** needs the intersection of two
 outlines, so it is refused. A `clip-path` on a `transform`ed clip rect is refused
 too: the rect would have to be rotated, and the containment test only knows about
@@ -248,7 +254,8 @@ Two escape hatches keep that merge honest:
 |---|---|
 | `display: flex !important` | `off` — `!important` changes priority, not layout |
 | `display: var(--d)` / `env()` | `unknown` — the value is not in this file |
-| two contexts disagree about `display` | `unknown` — the merge is not a fact |
+| two contexts disagree about `display` | `unknown` — unless every branch is flexy (`flex` / `inline-flex`), which is a conflict in form but not in meaning: then `off` |
+| `display` never declared but `text-box` is present | `unknown` |
 | no `display` anywhere for that selector | `unknown` |
 
 ### What counts as a trim request

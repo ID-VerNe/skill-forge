@@ -6,7 +6,7 @@ import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { analyzeSvg, checkShape, checkIconSet } from '../icon.mjs';
-import { checkCss } from '../rule.mjs';
+import { checkCss, classInfo } from '../rule.mjs';
 import { checkTsx } from '../rule.mjs';
 import { buildReport } from '../report.mjs';
 
@@ -876,4 +876,45 @@ test('a directory does not silently answer a standalone question', () => {
   const r = run('check', fixture('icons/set'), '--mode', 'standalone');
   assert.equal(r.status, 64, r.stderr);
   assert.match(r.stderr, /directory/);
+});
+
+test('a self-referencing <symbol> terminates instead of overflowing the stack', () => {
+  const shape = analyzeSvg(
+    svg('<symbol id="a"><use href="#a"/></symbol><use href="#a"/>'),
+  );
+  assert.ok(shape.unresolved.includes('use-nested-too-deep'), JSON.stringify(shape.unresolved));
+});
+
+test('a clip on a viewport element must contain the ink under both readings', () => {
+  // The clip rect is authored in the outer space (0..24). Read in the inner
+  // space of a 10-unit viewBox scaled 2.4x it would cover 0..57.6, so a naive
+  // single-reading check could pass a clip that actually cuts.
+  const body =
+    '<defs><clipPath id="c"><rect x="0" y="0" width="10" height="10"/></clipPath></defs>' +
+    '<svg clip-path="url(#c)" width="24" height="24" viewBox="0 0 10 10">' +
+    '<rect x="0" y="0" width="10" height="10"/></svg>';
+  const shape = analyzeSvg(svg(body));
+  assert.ok(shape.unresolved.includes('clip-path-cuts-ink'), JSON.stringify(shape.unresolved));
+});
+
+test('a display conflict that stays flexy is still a defect', () => {
+  const css =
+    '.c{display:flex;text-box:trim-both}@media (min-width:600px){.c{display:inline-flex}}';
+  const report = checkCss(css, { target: 'flexy.css' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  // Both branches are flex containers, so there is no ambiguity to report.
+  assert.equal(f.verdict, 'off');
+});
+
+test('variant stripping survives nested brackets', () => {
+  const cases = [
+    ['supports-[display:grid]:flex', 'flex'],
+    ['[&>*]:flex', 'flex'],
+    ['data-[state=open]:grid', 'grid'],
+    ['dark:hover:md:flex', 'flex'],
+    ['md:[@media(min-width:900px)]:flex', 'flex'],
+  ];
+  for (const [token, stem] of cases) {
+    assert.deepEqual(classInfo(`"${token}"`).stems, [stem], token);
+  }
 });
