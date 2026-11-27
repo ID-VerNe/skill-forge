@@ -100,13 +100,26 @@ export function flattenPath(d, steps = DEFAULT_STEPS) {
   return kept;
 }
 
-/** Signed shoelace area. Positive for clockwise-in-screen-space paths. */
+/**
+ * Signed shoelace area. Positive for clockwise-in-screen-space paths.
+ *
+ * The outline is shifted to its first vertex before the sum. Shoelace is a
+ * difference of products, and at `|x| ≈ 1e9` those products reach `1e18`, where
+ * one float64 step is larger than the whole shape: a 10×10 square then reads
+ * 128. Translating first costs one subtraction per point, is exact for
+ * neighbouring vertices, and leaves the sign untouched.
+ */
 export function subpathSignedArea(points) {
   if (!points || points.length < 3) return 0;
+  const [ox, oy] = points[0];
   let sum = 0;
   for (let i = 0; i < points.length; i += 1) {
-    const [x1, y1] = points[i];
-    const [x2, y2] = points[(i + 1) % points.length];
+    const [ax, ay] = points[i];
+    const [bx, by] = points[(i + 1) % points.length];
+    const x1 = ax - ox;
+    const y1 = ay - oy;
+    const x2 = bx - ox;
+    const y2 = by - oy;
     sum += x1 * y2 - x2 * y1;
   }
   return sum / 2;
@@ -118,17 +131,23 @@ export function subpathCentroid(points) {
   if (Math.abs(signedArea) < 1e-12 || !points || points.length < 3) {
     return { cx: 0, cy: 0, signedArea };
   }
+  // Same shift as above; the centroid comes back by adding the origin again.
+  const [ox, oy] = points[0];
   let cx = 0;
   let cy = 0;
   for (let i = 0; i < points.length; i += 1) {
-    const [x1, y1] = points[i];
-    const [x2, y2] = points[(i + 1) % points.length];
+    const [ax, ay] = points[i];
+    const [bx, by] = points[(i + 1) % points.length];
+    const x1 = ax - ox;
+    const y1 = ay - oy;
+    const x2 = bx - ox;
+    const y2 = by - oy;
     const cross = x1 * y2 - x2 * y1;
     cx += (x1 + x2) * cross;
     cy += (y1 + y2) * cross;
   }
   const factor = 1 / (6 * signedArea);
-  return { cx: cx * factor, cy: cy * factor, signedArea };
+  return { cx: cx * factor + ox, cy: cy * factor + oy, signedArea };
 }
 
 /**

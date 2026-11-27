@@ -1490,6 +1490,20 @@ test('fill="transparent" is a declaration of no ink', () => {
   assert.equal(stroked.noInk, true);
 });
 
+test('a drawing far from the origin keeps its exact area', () => {
+  // Shoelace is a difference of products. At x ≈ 1e9 those products reach 1e18,
+  // where one float64 step is larger than the shape itself: a 10×10 square read
+  // 128 and the centroid drifted out of its own ink box.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="1000000000 1000000000 24 24">' +
+      '<rect x="1000000000" y="1000000000" width="10" height="10"/></svg>',
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 100, 1e-6);
+  near(shape.ink.centroid.cx, 1000000005, 1e-6);
+  near(shape.ink.centroid.cy, 1000000005, 1e-6);
+});
+
 test('a stroke that draws nothing is not a hairline', () => {
   // `stroke-width: 0` and `stroke-opacity: 0` both paint nothing. Counting the
   // band anyway gives the drawing a centroid it does not have — a `ok` on an
