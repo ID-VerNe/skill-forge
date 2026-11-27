@@ -130,6 +130,8 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 |---|---|---|
 | `icon.svg` | `standalone` | ink box vs viewBox, centroid vs ink box |
 | `icon.svg` with `<text>`/`<image>` | — | `unknown`: visible ink that is not geometry |
+| `icon.svg` painting through `<style>`/`class` | — | paint is resolved, not ignored: attribute < rule < inline `style` |
+| `icon.svg` with `%` geometry or a `%` `stroke-width` | — | `unknown`: relative to a viewport the checker cannot see |
 | `icons/` (dir) | `keyline` | fill-ratio outliers across the set (needs ≥3 icons of one family) |
 | `styles.css` | rule | `text-box` in flex/grid, hard-coded nudges |
 | `Button.tsx` | rule | same, plus concentric radii from the element tree |
@@ -139,7 +141,7 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | `ok` | 0 | within tolerance | leave it alone |
 | `nudge` | 0 | measurable offset, acceptable band | adopt the suggestion, do not block |
 | `off` | 1 | certain defect | fix it |
-| `unknown` | 2 | context missing (display, parent, font, unmeasurable ink) | report the gap; **never guess** |
+| `unknown` | 2 | context missing (display, parent, font, unmeasurable ink, relative units) | report the gap; **never guess** |
 
 Two rules that make the output trustworthy:
 

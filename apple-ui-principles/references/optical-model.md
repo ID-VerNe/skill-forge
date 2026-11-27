@@ -43,15 +43,43 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
 | a `transform` with a percentage or unit argument | `geometry/unresolved-graphics` (`unparsed-transform`) |
-| a percentage `stroke-width` | `geometry/unresolved-graphics` (`stroke-width-percentage`) |
+| a percentage or relative `stroke-width`, on the shape **or any ancestor** | `geometry/unresolved-graphics` (`stroke-width-percentage`, `stroke-width-relative`) |
 | a shape whose `d` failed to parse | `geometry/unresolved-graphics` |
+| a geometry length in `%`, `em`, `pt`… | `geometry/unresolved-graphics` (`unparsed-length`) — a percentage is relative to a viewport we cannot see, and `parseFloat("100%")` is `100` |
+| a `viewBox` attribute that is not four finite numbers with a positive size | `geometry/unresolved-graphics` (`invalid-viewBox`) — the element does not render, so there is no canvas to measure against |
+| `<style>` rules this pass cannot evaluate (combinators, pseudo-classes, `@media`, geometry properties) | `geometry/unresolved-graphics` (`stylesheet-selector`, `stylesheet-conditional`, `stylesheet-geometry`) |
+| groups nested more than 200 deep | `geometry/unresolved-graphics` (`nesting-too-deep`) |
+| two subpaths with the same outline | `geometry/unresolved-graphics` (`overlapping-subpaths`) — they cancel under even-odd and render once under nonzero, so the sum is wrong either way |
 | even-odd outlines that partially overlap | `geometry/unresolved-graphics` (`overlapping-subpaths`) |
 | a computed centroid outside its own ink box | `geometry/unresolved-graphics` (`centroid-outside-ink`) |
+| an empty directory passed to keyline mode | `geometry/keyline-empty` |
 
 `<use>` is resolved when the target exists: the referenced node is re-walked
 with `x`/`y`, its `transform` and the target's `viewBox` folded into the matrix,
-and `<symbol>` targets contribute their children (a symbol only renders when
-instantiated).
+and `<symbol>` targets contribute their children *and their presentation
+attributes* (a sprite set puts `fill`/`stroke`/`fill-rule` on the symbol).
+
+### Internal stylesheets
+
+Exported icons often paint through a class rather than a presentation attribute:
+
+```html
+<style>.cls-1{fill:none}</style>
+<rect class="cls-1" width="18" height="18"/>
+```
+
+Ignoring that block does not leave the file ambiguous — it makes the checker
+wrong, because the element it measures as a solid background is in fact
+invisible. So `<style>` bodies are parsed and applied, in cascade order:
+presentation attribute < stylesheet rule < inline `style`, with `!important`
+outranking all of them and specificity (`#id` > `.class` > `tag`) breaking ties
+before source order.
+
+The supported selector grammar is deliberately small: a compound of one tag,
+one `#id` and any number of `.classes`, plus `*`, and comma lists of those.
+Anything else — descendant combinators, `:hover`, `[attr=…]`, `@media` — that
+would change a paint property becomes `unresolved`. A rule we might have to
+apply and did not is exactly the case where a guess turns into a wrong verdict.
 
 ### Clips
 
@@ -143,7 +171,12 @@ which conversion was used, and the evidence string appends
 `preserveAspectRatio="none"` stretches the axes independently, so there is no
 single scale: x and y are converted separately, `meta.unitScale` is `null`, and
 the tolerance basis is the smaller rendered dimension. `slice` uses the larger
-ratio, `meet` the smaller.
+ratio, `meet` the smaller. That holds on the assumed branch too — with no
+`width`, each axis is given 24px rather than sharing one factor.
+
+Absolute physical units are converted, not ignored: `width="1in"` is 96px by
+definition, so it takes the declared branch instead of falling through to the
+nominal 24px.
 
 ### Fill rule
 
@@ -156,9 +189,16 @@ container, and treating those as additive flips both the area and the centroid.
 Containment is classified per vertex: a subpath is *inside* another only when
 none of its vertices fall outside, and vertices lying on the boundary are
 ignored so an L-shaped icon whose hole shares a corner still measures correctly.
+Two subpaths with the same bounding box and the same absolute area are treated as
+one outline drawn twice — under even-odd they cancel to nothing, under nonzero
+they render once, and in both cases summing them is wrong.
+
 **Partially overlapping outlines are out of scope** — an even-odd XOR needs a
 boolean polygon operation, so the checker reports `overlapping-subpaths` rather
-than a centroid that may land outside the artwork.
+than a centroid that may land outside the artwork. Under `nonzero` a genuine
+overlap is still summed, which over-counts area; that is the one approximation
+left in the area model and it is why `off` on `geometry/centroid` deserves a
+second look at the artwork before it is trusted.
 
 ## 2. `#1` ink bbox vs viewBox
 
@@ -219,6 +259,14 @@ Cx = 1/(6A) Σ (x_i + x_{i+1})(x_i·y_{i+1} − x_{i+1}·y_i)
 
 Reference value used in the tests: triangle `(8,5) (8,19) (19,12)` → `A = 77`,
 `Cx = 35/3 ≈ 11.667`, while its bbox centre is `13.5`, so `dx = −1.833px`.
+
+A centroid offset is judged against the **smaller ink dimension**, not the
+horizontal extent. A tall thin glyph and a wide flat one of equal mass are
+equally sensitive to drift, and under `preserveAspectRatio="none"` the two axes
+carry different px scales — measuring a vertical drift with the horizontal one
+made a 0.55px sag read as `ok` on a stretched icon. (`#1` uses the viewBox short
+side instead, because it asks a different question: how far the ink sits from
+the *canvas* centre.)
 
 ### The damping constant `k` is taste, not physics
 

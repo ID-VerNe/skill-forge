@@ -19,10 +19,12 @@ import {
   applyMatrix,
   multiplyMatrix,
   shapeToPath,
+  parseLength,
   viewBoxMatrix,
   IDENTITY,
 } from './geom.mjs';
 import { buildReport, tolFor } from './report.mjs';
+import { cascade, parseStyle } from './stylesheet.mjs';
 
 const round = (n, d = 3) => Math.round(n * 10 ** d) / 10 ** d;
 const SHAPES = new Set(['path', 'rect', 'circle', 'ellipse', 'polygon', 'polyline', 'line']);
@@ -54,6 +56,8 @@ const UNMEASURABLE_INK = new Set([
   'switch',
 ]);
 const MAX_USE_DEPTH = 3;
+/** Group nesting beyond this is a refusal, not a stack overflow. */
+const MAX_NESTING = 200;
 
 /** Minimal XML scanner: enough for icon markup, strict enough to fail loudly. */
 function parseXml(text) {
@@ -106,16 +110,31 @@ function parseXml(text) {
   return root;
 }
 
+/**
+ * Read a `viewBox`, or `null` when the attribute is present but unusable.
+ *
+ * Two failure modes used to hide here. `" 0 0 512 512"` is legal — the leading
+ * space produces an empty first field under a naive split, the parse failed, and
+ * the code quietly invented a 24x24 canvas, reporting a perfectly centred icon
+ * as 1016% off. And when `viewBox` really is malformed the element does not
+ * render at all, so falling back to any canvas is fiction. Absent is the only
+ * case that gets a default, and then width/height describe the user space.
+ */
 function parseViewBox(attrs) {
-  if (attrs.viewBox) {
-    const parts = attrs.viewBox.split(/[\s,]+/).map(Number);
-    if (parts.length === 4 && parts.every((n) => Number.isFinite(n))) {
+  if (attrs.viewBox !== undefined) {
+    const parts = String(attrs.viewBox)
+      .trim()
+      .split(/[\s,]+/)
+      .filter(Boolean)
+      .map(Number);
+    if (parts.length === 4 && parts.every(Number.isFinite) && parts[2] > 0 && parts[3] > 0) {
       return { x: parts[0], y: parts[1], w: parts[2], h: parts[3] };
     }
+    return null;
   }
-  const w = Number.parseFloat(attrs.width || '24');
-  const h = Number.parseFloat(attrs.height || '24');
-  return { x: 0, y: 0, w: Number.isFinite(w) ? w : 24, h: Number.isFinite(h) ? h : 24 };
+  const w = absolutePx(attrs.width);
+  const h = absolutePx(attrs.height);
+  return { x: 0, y: 0, w: w !== null && w > 0 ? w : 24, h: h !== null && h > 0 ? h : 24 };
 }
 
 /**
@@ -132,34 +151,68 @@ function resolveLength(value, basis, fallback = basis) {
   return null;
 }
 
-/** Absolute length in px, or null when it depends on external context. */
+/**
+ * Absolute length in px, or null when it depends on external context.
+ *
+ * `1in` is absolute — CSS pins it to 96px — so it must not fall through to the
+ * "no size declared" branch, which would quietly assume a 24px render.
+ */
+const ABSOLUTE_UNITS = { px: 1, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, pt: 96 / 72, pc: 16 };
+
 function absolutePx(value) {
   if (value === undefined || value === null) return null;
-  const m = /^\s*(-?\d*\.?\d+)(px)?\s*$/.exec(String(value));
-  return m ? Number.parseFloat(m[1]) : null;
+  const m = /^\s*(-?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*(px|in|cm|mm|pt|pc)?\s*$/i.exec(String(value));
+  if (!m) return null;
+  return Number.parseFloat(m[1]) * ABSOLUTE_UNITS[(m[2] || 'px').toLowerCase()];
 }
 
-/** `style="fill:none;stroke:#000"` is presentation attributes by another name. */
-function parseStyle(value) {
-  if (!value) return {};
-  const out = {};
-  for (const part of value.split(';')) {
-    const colon = part.indexOf(':');
-    if (colon === -1) continue;
-    const prop = part.slice(0, colon).trim().toLowerCase();
-    const val = part.slice(colon + 1).trim();
-    if (prop && val) out[prop] = val;
-  }
-  return out;
-}
-
+/**
+ * Attributes after cascade. `node.effective` is filled in once per document by
+ * `applyStylesheets`; nodes outside that pass (a `<use>` clone) fall back to
+ * their own presentation attributes plus inline style.
+ */
 function effectiveAttrs(node) {
+  if (node.effective) return node.effective;
   return { ...node.attrs, ...parseStyle(node.attrs.style) };
 }
 
 function indexIds(node, map) {
-  if (node.attrs && node.attrs.id) map.set(node.attrs.id, node);
-  for (const child of node.children || []) indexIds(child, map);
+  // Iterative: an exported file can nest thousands of groups, and a recursive
+  // walk would blow the stack before any guard could run.
+  const stack = [node];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current.attrs && current.attrs.id) map.set(current.attrs.id, current);
+    for (const child of current.children || []) stack.push(child);
+  }
+}
+
+/** `<style>` bodies, with the attributes of the element that carried them. */
+function extractSheets(text) {
+  const out = [];
+  const re = /<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi;
+  const attrRe = /([\w:.-]+)\s*=\s*("([^"]*)"|'([^']*)')/g;
+  let m = re.exec(text);
+  while (m) {
+    const attrs = {};
+    let a = attrRe.exec(m[1]);
+    while (a) {
+      attrs[a[1].toLowerCase()] = a[3] !== undefined ? a[3] : a[4];
+      a = attrRe.exec(m[1]);
+    }
+    attrRe.lastIndex = 0;
+    out.push({ css: m[2], type: attrs.type || 'text/css' });
+    m = re.exec(text);
+  }
+  return out;
+}
+
+function applyStylesheets(text, root, ctx) {
+  const sheets = extractSheets(text);
+  if (sheets.length === 0) return;
+  const { effective, unresolved } = cascade(sheets, root);
+  for (const id of unresolved) ctx.unresolved.add(id);
+  for (const [node, attrs] of effective) node.effective = attrs;
 }
 
 function matrixFrom(attrs, base, ctx) {
@@ -172,16 +225,29 @@ function matrixFrom(attrs, base, ctx) {
   return multiplyMatrix(base, parsed);
 }
 
+/**
+ * `fill-opacity` accepts a percentage as well as a number, so `parseFloat` reads
+ * `50%` as fifty — fully opaque — instead of half. Only zero matters for area,
+ * but a wrong opacity flips `filled` in both directions.
+ */
+function resolveOpacity(raw, fallback) {
+  if (raw === undefined || raw === null) return fallback;
+  const text = String(raw).trim();
+  const pct = /^(-?\d*\.?\d+)%$/.exec(text);
+  const value = pct ? Number(pct[1]) / 100 : parseLength(text);
+  return value === null || !Number.isFinite(value) ? fallback : value;
+}
+
 function fillOpacityOf(attrs, inherited) {
-  if (attrs['fill-opacity'] === undefined) return inherited.fillOpacity ?? 1;
-  const value = Number.parseFloat(attrs['fill-opacity']);
-  return Number.isFinite(value) ? value : 1;
+  return resolveOpacity(attrs['fill-opacity'], inherited.fillOpacity ?? 1);
 }
 
 /**
  * `stroke-width` is in user units, or a percentage of the viewport diagonal —
  * which needs a rendered viewport we do not have. Refuse the percentage rather
- * than read "10%" as ten units.
+ * than read "10%" as ten units. The same refusal has to apply on ancestors,
+ * because `stroke-width` inherits: a `<g stroke-width="10%">` is exactly as
+ * unknowable as a `<path stroke-width="10%">`.
  */
 function strokeWidthOf(attrs, inherited, ctx) {
   if (attrs['stroke-width'] === undefined) return inherited.strokeWidth;
@@ -190,28 +256,27 @@ function strokeWidthOf(attrs, inherited, ctx) {
     ctx.unresolved.add('stroke-width-percentage');
     return inherited.strokeWidth;
   }
-  const value = Number.parseFloat(raw);
-  return Number.isFinite(value) ? value : inherited.strokeWidth;
+  const value = parseLength(raw);
+  if (value === null) {
+    ctx.unresolved.add('stroke-width-relative');
+    return inherited.strokeWidth;
+  }
+  return value;
 }
 
 /** Presentation state a node hands to its children. */
-function inheritedFor(attrs, inherited, visible, matrix) {
+function inheritedFor(attrs, inherited, visible, matrix, ctx) {
   return {
     matrix,
     fill: attrs.fill !== undefined ? attrs.fill : inherited.fill,
     stroke: attrs.stroke !== undefined ? attrs.stroke : inherited.stroke,
-    strokeWidth:
-      attrs['stroke-width'] !== undefined
-        ? Number.parseFloat(attrs['stroke-width'])
-        : inherited.strokeWidth,
+    strokeWidth: strokeWidthOf(attrs, inherited, ctx),
     fillRule: attrs['fill-rule'] || inherited.fillRule,
     // `fill-opacity` is inherited; `opacity` is not (it composites the group).
-    fillOpacity:
-      attrs['fill-opacity'] !== undefined
-        ? Number.parseFloat(attrs['fill-opacity'])
-        : inherited.fillOpacity,
+    fillOpacity: resolveOpacity(attrs['fill-opacity'], inherited.fillOpacity),
     visible,
     viewport: inherited.viewport,
+    level: (inherited.level || 0) + 1,
   };
 }
 
@@ -239,12 +304,18 @@ function resolveClipRect(raw, ctx, matrix) {
   // A clip rect that is itself clipped is not the shape it claims to be.
   if (a['clip-path'] && !/^none$/i.test(a['clip-path'].trim())) return null;
   // A rounded clip removes ink at the corners, so it is not a no-op rectangle.
-  if ((a.rx && Number.parseFloat(a.rx) !== 0) || (a.ry && Number.parseFloat(a.ry) !== 0)) return null;
+  const rx = a.rx === undefined ? 0 : parseLength(a.rx);
+  const ry = a.ry === undefined ? 0 : parseLength(a.ry);
+  if (rx === null || ry === null || rx !== 0 || ry !== 0) return null;
 
-  const x = Number.parseFloat(a.x || '0') || 0;
-  const y = Number.parseFloat(a.y || '0') || 0;
-  const w = Number.parseFloat(a.width || '0');
-  const h = Number.parseFloat(a.height || '0');
+  // Percentages here are relative to the clipping element's viewport. Reading
+  // `width="80%"` as 80 units produced both false offsets and false refusals —
+  // resolve or refuse, never approximate.
+  const x = a.x === undefined ? 0 : parseLength(a.x);
+  const y = a.y === undefined ? 0 : parseLength(a.y);
+  const w = a.width === undefined ? 0 : parseLength(a.width);
+  const h = a.height === undefined ? 0 : parseLength(a.height);
+  if (x === null || y === null || w === null || h === null) return null;
   if (!(w > 0) || !(h > 0)) return null;
 
   const corners = [
@@ -288,6 +359,13 @@ function collect(node, inherited, out, ctx) {
   const tag = String(node.tag).toLowerCase();
   if (NON_RENDERING.has(tag)) return out;
 
+  // Deeply nested groups are legal markup; recursing through thousands of them
+  // is not. Refuse the file instead of letting V8 refuse it for us.
+  if ((inherited.level || 0) > MAX_NESTING) {
+    ctx.unresolved.add('nesting-too-deep');
+    return out;
+  }
+
   const attrs = effectiveAttrs(node);
   // `display:none` removes the subtree outright; `visibility:hidden` does not —
   // a descendant may set `visibility:visible` and reappear.
@@ -329,13 +407,18 @@ function collect(node, inherited, out, ctx) {
       return out;
     }
     let matrix = multiplyMatrix(own, [1, 0, 0, 1, vx, vy]);
-    if (attrs.viewBox) {
+    if (attrs.viewBox !== undefined) {
+      const vb = parseViewBox(attrs);
+      if (!vb) {
+        ctx.unresolved.add('invalid-viewBox');
+        return out;
+      }
       matrix = multiplyMatrix(
         matrix,
-        viewBoxMatrix(parseViewBox(attrs), { x: 0, y: 0, w: vpW, h: vpH }, attrs.preserveAspectRatio),
+        viewBoxMatrix(vb, { x: 0, y: 0, w: vpW, h: vpH }, attrs.preserveAspectRatio),
       );
     }
-    const local = inheritedFor(attrs, inherited, visible, matrix);
+    const local = inheritedFor(attrs, inherited, visible, matrix, ctx);
     local.viewport = { w: vpW, h: vpH };
     // The clip applies in the *inner* coordinate system, after the viewBox map.
     withClip(attrs, [own, matrix], ctx, out, (sink) => {
@@ -374,7 +457,7 @@ function collect(node, inherited, out, ctx) {
     }
 
     const inner = { ...ctx, depth: ctx.depth + 1 };
-    const local = inheritedFor(attrs, inherited, visible, useMatrix);
+    const local = inheritedFor(attrs, inherited, visible, useMatrix, ctx);
 
     withClip(attrs, [useMatrix], ctx, out, (sink) => {
       if (targetTag === 'symbol') {
@@ -385,21 +468,27 @@ function collect(node, inherited, out, ctx) {
           ctx.unresolved.add('use-viewport');
           return;
         }
-        let matrix = useMatrix;
-        // The referenced tree's own transform is part of the instantiation.
-        matrix = matrixFrom(effectiveAttrs(target), matrix, ctx);
-        if (effectiveAttrs(target).viewBox) {
+        const symbolAttrs = effectiveAttrs(target);
+        if (symbolAttrs.display === 'none' || resolveOpacity(symbolAttrs.opacity, 1) === 0) return;
+        // A symbol carries presentation attributes of its own — sprite sets put
+        // `fill`, `stroke` and `fill-rule` there precisely so the children can
+        // omit them. Dropping them changed the area of every referenced path.
+        const symbolLocal = inheritedFor(symbolAttrs, local, visible, useMatrix, ctx);
+        let matrix = matrixFrom(symbolAttrs, useMatrix, ctx);
+        if (symbolAttrs.viewBox !== undefined) {
+          const vb = parseViewBox(symbolAttrs);
+          if (!vb) {
+            ctx.unresolved.add('invalid-viewBox');
+            return;
+          }
           matrix = multiplyMatrix(
             matrix,
-            viewBoxMatrix(
-              parseViewBox(effectiveAttrs(target)),
-              { x: 0, y: 0, w: vpW, h: vpH },
-              effectiveAttrs(target).preserveAspectRatio,
-            ),
+            viewBoxMatrix(vb, { x: 0, y: 0, w: vpW, h: vpH }, symbolAttrs.preserveAspectRatio),
           );
         }
-        const childLocal = { ...local, matrix, viewport: { w: vpW, h: vpH } };
-        for (const child of target.children || []) collect(child, childLocal, sink, inner);
+        symbolLocal.matrix = matrix;
+        symbolLocal.viewport = { w: vpW, h: vpH };
+        for (const child of target.children || []) collect(child, symbolLocal, sink, inner);
         return;
       }
       if (targetTag === 'svg') {
@@ -409,7 +498,9 @@ function collect(node, inherited, out, ctx) {
         const overrides = { ...effectiveAttrs(target), x: '0', y: '0' };
         if (attrs.width !== undefined) overrides.width = attrs.width;
         if (attrs.height !== undefined) overrides.height = attrs.height;
-        collect({ ...target, attrs: overrides }, local, sink, inner);
+        // The clone must not carry the target's cached cascade: its attributes
+        // are already flattened into `overrides`, and the cache would win.
+        collect({ ...target, attrs: overrides, effective: undefined }, local, sink, inner);
         return;
       }
       if (NON_RENDERING.has(targetTag)) {
@@ -429,13 +520,17 @@ function collect(node, inherited, out, ctx) {
         ctx.unresolved.add('clip-path');
         return out;
       }
-      const d = tag === 'path' ? attrs.d || '' : shapeToPath(tag, attrs);
-      if (!d) {
+      const shape = tag === 'path' ? { d: attrs.d || '', unparsed: false } : shapeToPath(tag, attrs);
+      if (shape.unparsed) {
+        // A percentage geometry is not a shape at the origin — it is a shape we
+        // cannot place. Dropping it silently would shrink the ink box.
+        ctx.unresolved.add('unparsed-length');
+      } else if (!shape.d && !shape.empty) {
         ctx.unresolved.add('unparsed-shape');
-      } else {
+      } else if (shape.d) {
         const strokeWidth = strokeWidthOf(attrs, inherited, ctx);
         out.push({
-          d,
+          d: shape.d,
           matrix: own,
           filled: (attrs.fill ?? inherited.fill) !== 'none' && (fillOpacityOf(attrs, inherited) !== 0),
           stroked: (attrs.stroke ?? inherited.stroke) !== undefined && (attrs.stroke ?? inherited.stroke) !== 'none',
@@ -450,7 +545,7 @@ function collect(node, inherited, out, ctx) {
   }
 
   // --- anything else with children is a container --------------------------
-  const bound = inheritedFor(attrs, inherited, visible, own);
+  const bound = inheritedFor(attrs, inherited, visible, own, ctx);
   withClip(attrs, [own], ctx, out, (sink) => {
     for (const child of node.children || []) collect(child, bound, sink, ctx);
   });
@@ -545,8 +640,19 @@ function uniformScale(matrix) {
  */
 function rootUnitScale(attrs, viewBox) {
   const nominal = 24;
+  const par = String(attrs.preserveAspectRatio || '').trim();
+  const stretches = par.toLowerCase().startsWith('none');
+  // `preserveAspectRatio="none"` has no single scale, and that is true of the
+  // assumed branch too: the axes get 24px each rather than sharing one factor.
   const reference = viewBox.w > 0 && viewBox.h > 0 ? nominal / Math.min(viewBox.w, viewBox.h) : 1;
-  const assumed = { x: reference, y: reference, uniform: reference, source: 'assumed' };
+  const assumed = stretches
+    ? {
+        x: viewBox.w > 0 ? nominal / viewBox.w : reference,
+        y: viewBox.h > 0 ? nominal / viewBox.h : reference,
+        uniform: null,
+        source: 'assumed',
+      }
+    : { x: reference, y: reference, uniform: reference, source: 'assumed' };
   if (attrs.width === undefined && attrs.height === undefined) return assumed;
   const w = absolutePx(attrs.width);
   const h = absolutePx(attrs.height);
@@ -555,7 +661,6 @@ function rootUnitScale(attrs, viewBox) {
 
   const rawX = w / viewBox.w;
   const rawY = h / viewBox.h;
-  const par = String(attrs.preserveAspectRatio || '').trim();
   if (par.toLowerCase().startsWith('none')) {
     const uniform = Math.abs(rawX - rawY) < 1e-9 ? rawX : null;
     return { x: rawX, y: rawY, uniform, source: 'declared' };
@@ -575,12 +680,31 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
   const ids = new Map();
   indexIds(svg, ids);
 
+  // An unparseable viewBox means the element does not render, so there is no
+  // canvas to measure against and no honest verdict to give.
+  if (!viewBox) {
+    return {
+      viewBox: { x: 0, y: 0, w: 24, h: 24 },
+      ink: { bbox: null, area: 0, centroid: { cx: 0, cy: 0 } },
+      strokeOnly: false,
+      noInk: true,
+      unresolved: ['invalid-viewBox'],
+      unitScale: null,
+      unitScaleX: null,
+      unitScaleY: null,
+      unitSource: 'assumed',
+    };
+  }
+
   const unit = rootUnitScale(svg.attrs || {}, viewBox);
   const unitScale = unit.uniform;
   const unitScaleX = unit.x;
   const unitScaleY = unit.y;
   const unitSource = unit.source;
   const ctx = { ids, unresolved: new Set(), depth: 0, root: svg, steps };
+  // Paint may live in an internal stylesheet, so resolve the cascade before
+  // anything reads an attribute.
+  applyStylesheets(text, svg, ctx);
   const shapes = collect(
     svg,
     {
@@ -716,7 +840,10 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
     unitSource: shape.unitSource || 'assumed',
   };
 
-  if (shape.noInk) {
+  // A canvas that failed to parse has no ink for a reason already reported;
+  // adding "the canvas may be empty" would point the reader at the wrong thing.
+  const canvasInvalid = (shape.unresolved || []).includes('invalid-viewBox');
+  if (shape.noInk && !canvasInvalid) {
     findings.push({
       id: 'geometry/no-ink',
       layer: 'exact',
@@ -734,7 +861,12 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
       forcedVerdict: 'unknown',
       pixel: false,
       evidence: `ink cannot be measured while these features are present: ${shape.unresolved.join(', ')}`,
-      suggested: { kind: 'inspect', value: 'flatten the artwork (expand clip paths / masks) and re-run' },
+      suggested: {
+        kind: 'inspect',
+        value: canvasInvalid
+          ? 'fix the viewBox; the element does not render as written'
+          : 'flatten the artwork (expand clip paths / masks) and re-run',
+      },
     });
   }
 
@@ -796,7 +928,17 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
     layer: 'exact',
     offset: -shiftX * sx,
     offsetY: -shiftY * sy,
-    basis: Math.max((ink.bbox.maxX - ink.bbox.minX) * sx, 1),
+    // A centroid offset is judged against the object's girth, not one axis: a
+    // tall thin glyph and a wide flat one of the same mass are equally sensitive
+    // to drift, and under `preserveAspectRatio="none"` the two axes have
+    // different px scales, so the smaller extent is the honest one.
+    basis: Math.max(
+      Math.min(
+        (ink.bbox.maxX - ink.bbox.minX) * sx,
+        (ink.bbox.maxY - ink.bbox.minY) * sy,
+      ),
+      1,
+    ),
     evidence:
       `area=${round(ink.area)} centroid=(${round(ink.centroid.cx)},${round(ink.centroid.cy)}) ` +
       `ink centre=(${round(inkCenter.x)},${round(inkCenter.y)})${scaleNote}`,
@@ -861,7 +1003,23 @@ export async function checkIconSet(dir, { threshold = 0.2 } = {}) {
   }
 
   if (rows.length === 0) {
-    return buildReport({ target: basename(dir), mode: 'keyline', findings: [] });
+    // An empty directory is not a consistent icon set; answering `ok` would make
+    // a mistyped path look like a passing audit.
+    return buildReport({
+      target: basename(dir),
+      mode: 'keyline',
+      findings: [
+        {
+          id: 'geometry/keyline-empty',
+          layer: 'heuristic',
+          forcedVerdict: 'unknown',
+          pixel: false,
+          offset: 0,
+          evidence: 'no .svg files in this directory, so there is no set to normalise',
+          suggested: { kind: 'inspect', value: 'check the path' },
+        },
+      ],
+    });
   }
 
   const blind = rows.filter((r) => r.noInk || r.unresolved);

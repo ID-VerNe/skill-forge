@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { analyzeSvg, checkShape, checkIconSet } from '../icon.mjs';
@@ -963,4 +963,242 @@ test('a 1:1 icon gets no delta field, because value already is the delta', () =>
   assert.equal(bbox.suggested.delta, undefined);
   assert.match(bbox.suggested.value, /^-2px \/ 0px$/);
   assert.match(bbox.suggested.viewBox, /^-2 0 24 24$/);
+});
+
+// --- paint that lives in a stylesheet ---------------------------------------
+
+test('paint declared in <style> is resolved, not ignored', () => {
+  // The background rect is invisible in the browser. Measuring it as solid ink
+  // put the drawn cross in the corner of a canvas that was full of paint.
+  const styled = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>.bg{fill:none}</style>' +
+      '<rect class="bg" width="24" height="24"/>' +
+      '<rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  const inline = analyzeSvg(
+    svg('<rect fill="none" width="24" height="24"/><rect x="14" y="8" width="8" height="8"/>'),
+  );
+  for (const shape of [styled, inline]) {
+    assert.deepEqual(shape.unresolved, []);
+    near(shape.ink.bbox.minX, 14);
+    near(shape.ink.bbox.minY, 8);
+  }
+  assert.equal(
+    checkShape(styled, { target: 's.svg' }).verdict,
+    checkShape(inline, { target: 'i.svg' }).verdict,
+  );
+});
+
+test('a stylesheet rule outranks a presentation attribute', () => {
+  // Cascade, not precedence by eye: `fill="black"` on the element loses to
+  // `.x{fill:none}` in the sheet.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>.x{fill:none}</style>' +
+      '<rect class="x" fill="#000" width="24" height="24"/>' +
+      '<rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  near(shape.ink.bbox.minX, 14);
+});
+
+test('inline style still beats the stylesheet', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>.x{fill:none}</style>' +
+      '<rect class="x" style="fill:#000" width="24" height="24"/>' +
+      '<rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  near(shape.ink.bbox.minX, 0);
+});
+
+test('a stylesheet this pass cannot evaluate is refused, not approximated', () => {
+  const descendantShape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>g rect{fill:none}</style><g><rect width="24" height="24"/></g>' +
+      '<rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  assert.match(descendantShape.unresolved.join(), /stylesheet-selector/);
+  assert.equal(checkShape(descendantShape, { target: 'd.svg' }).verdict, 'unknown');
+
+  const conditionalShape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<style>@media (prefers-color-scheme: dark){.bg{fill:none}}</style>' +
+      '<rect class="bg" width="24" height="24"/><rect x="14" y="8" width="8" height="8"/></svg>',
+  );
+  assert.match(conditionalShape.unresolved.join(), /stylesheet-conditional/);
+  assert.equal(checkShape(conditionalShape, { target: 'm.svg' }).verdict, 'unknown');
+});
+
+// --- lengths that are not user units ----------------------------------------
+
+test('percentage geometry is refused instead of read as units', () => {
+  // `parseFloat("100%")` is 100 — a background rect becomes ink at 100,100 and a
+  // perfectly centred icon reports +38px.
+  const percent = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<rect x="25%" y="25%" width="50%" height="50%"/></svg>',
+  );
+  const report = checkShape(percent, { target: 'p.svg' });
+  assert.equal(report.verdict, 'unknown');
+  assert.match(percent.unresolved.join(), /unparsed-length/);
+});
+
+test('a percentage clip rect is refused, in both directions', () => {
+  const clip = (inkX) =>
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+    '<clipPath id="c"><rect x="10%" width="80%" height="100%"/></clipPath>' +
+    `<g clip-path="url(#c)"><rect x="${inkX}" y="8" width="8" height="8"/></g></svg>`;
+  for (const x of [8, 16]) {
+    const report = checkShape(analyzeSvg(clip(x)), { target: 'c.svg' });
+    assert.equal(report.verdict, 'unknown', `ink at ${x}`);
+  }
+});
+
+test('a percentage stroke-width is refused on ancestors too', () => {
+  // `stroke-width` inherits; only checking the shape itself let a <g> smuggle a
+  // percentage through as plain units.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<g fill="none" stroke="#000" stroke-width="10%"><path d="M6 12 H18"/></g></svg>',
+  );
+  assert.match(shape.unresolved.join(), /stroke-width-percentage/);
+  assert.equal(checkShape(shape, { target: 'g.svg' }).verdict, 'unknown');
+});
+
+test('a viewBox with surrounding whitespace still parses', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox=" 0 0 512 512">' +
+      '<rect x="56" y="56" width="400" height="400"/></svg>',
+  );
+  assert.deepEqual(shape.viewBox, { x: 0, y: 0, w: 512, h: 512 });
+  near(shape.unitScale, 24 / 512, 1e-9);
+  assert.equal(checkShape(shape, { target: 'w.svg' }).verdict, 'ok');
+});
+
+test('a malformed viewBox is refused rather than replaced by 24x24', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 abc 24">' +
+      '<rect x="0" y="0" width="20" height="24"/></svg>',
+  );
+  assert.equal(shape.noInk, true);
+  assert.match(shape.unresolved.join(), /invalid-viewBox/);
+  const report = checkShape(shape, { target: 'bad.svg' });
+  assert.equal(report.verdict, 'unknown');
+  // The reason is the canvas, not "maybe it is empty" — do not report both.
+  assert.deepEqual(
+    report.findings.map((f) => f.id),
+    ['geometry/unresolved-graphics'],
+  );
+});
+
+test('physical units are absolute, not a reason to assume 24px', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="1in" height="1in">' +
+      '<rect x="0" y="0" width="24" height="24"/></svg>',
+  );
+  near(shape.unitScale, 96 / 24, 1e-9);
+  assert.equal(shape.unitSource, 'declared');
+});
+
+test('preserveAspectRatio="none" has no single scale, even when assumed', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" preserveAspectRatio="none">' +
+      '<rect x="0" y="0" width="24" height="24"/></svg>',
+  );
+  assert.equal(shape.unitScale, null);
+  near(shape.unitScaleX, 1, 1e-9);
+});
+
+// --- paint declared on <symbol> --------------------------------------------
+
+test('a <symbol> hands its own paint to the instance', () => {
+  // Sprite sets put `fill`/`stroke`/`fill-rule` on the symbol so children can
+  // omit them. Ignoring that changed the area of every referenced path.
+  const symbol = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<symbol id="s" fill-rule="evenodd">' +
+      '<path d="M4 4 H20 V20 H4 Z M8 8 H20 V20 H8 Z"/></symbol>' +
+      '<use href="#s"/></svg>',
+  );
+  const inline = analyzeSvg(
+    svg('<path fill-rule="evenodd" d="M4 4 H20 V20 H4 Z M8 8 H20 V20 H8 Z"/>'),
+  );
+  near(symbol.ink.area, inline.ink.area, 1e-6);
+  near(symbol.ink.centroid.cx, inline.ink.centroid.cx, 1e-6);
+
+  const stroked = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+      '<symbol id="s" fill="none" stroke="#000" stroke-width="2">' +
+      '<path d="M6 12 H18"/></symbol><use href="#s"/></svg>',
+  );
+  assert.equal(checkShape(stroked, { target: 's.svg' }).verdict, 'ok');
+});
+
+// --- shape bookkeeping -----------------------------------------------------
+
+test('overlapping subpaths are refused instead of double-counted', () => {
+  const duplicate = analyzeSvg(
+    svg('<path fill-rule="evenodd" d="M4 4 H20 V20 H4 Z M4 4 H20 V20 H4 Z"/>'),
+  );
+  assert.match(duplicate.unresolved.join(), /overlapping-subpaths/);
+  // A genuine hole is still measured.
+  const hole = analyzeSvg(svg('<path fill-rule="evenodd" d="M2 2 H22 V22 H2 Z M6 6 H18 V18 H6 Z"/>'));
+  assert.deepEqual(hole.unresolved, []);
+  near(hole.ink.area, 20 * 20 - 12 * 12, 1e-6);
+});
+
+test('a zero radius is empty ink, not a parse failure', () => {
+  const shape = analyzeSvg(svg('<circle cx="12" cy="12" r="0"/>'));
+  assert.equal(shape.noInk, true);
+  assert.deepEqual(shape.unresolved, []);
+});
+
+test('deep nesting is refused before the stack gives out', () => {
+  const deep =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
+    '<g>'.repeat(6000) +
+    '<rect x="0" y="0" width="20" height="24"/>' +
+    '</g>'.repeat(6000) +
+    '</svg>';
+  const shape = analyzeSvg(deep);
+  assert.match(shape.unresolved.join(), /nesting-too-deep/);
+  assert.equal(checkShape(shape, { target: 'deep.svg' }).verdict, 'unknown');
+});
+
+// --- CLI surface -----------------------------------------------------------
+
+test('text output carries the attribute to paste, not just the px number', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optical-'));
+  const file = join(dir, 'big.svg');
+  writeFileSync(
+    file,
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480">' +
+      '<rect x="0" y="0" width="440" height="480"/></svg>',
+  );
+  const out = run('check', file);
+  assert.match(out.stdout, /paste viewBox="-20 0 480 480"/);
+  assert.match(out.stdout, /delta -20 \/ 0/);
+});
+
+test('a missing path is a usage error, not a verdict', () => {
+  const out = run('check', join(tmpdir(), 'definitely-not-here.svg'));
+  assert.equal(out.status, 64);
+  assert.match(out.stderr, /no such file/);
+});
+
+test('one unreadable path does not take the batch down', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optical-'));
+  const good = join(dir, 'good.svg');
+  writeFileSync(good, svg('<rect x="2" y="0" width="20" height="24"/>'));
+  // A directory with an .svg name and no icons in it.
+  const empty = join(dir, 'empty.svg');
+  mkdirSync(empty);
+  const out = run('check', good, empty, '--json');
+  const reports = JSON.parse(out.stdout);
+  assert.equal(reports.length, 2);
+  assert.equal(reports[0].verdict, 'ok');
+  assert.equal(reports[1].verdict, 'unknown');
+  assert.match(reports[1].findings[0].id, /keyline-empty/);
+  assert.equal(out.status, 2);
 });

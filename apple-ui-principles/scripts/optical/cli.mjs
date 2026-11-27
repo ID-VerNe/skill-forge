@@ -12,7 +12,7 @@ import { basename, extname, resolve } from 'node:path';
 import { checkIconFile, checkIconSet } from './icon.mjs';
 import { checkCss, checkTsx } from './rule.mjs';
 import { capMidpointDelta, readFontMetrics } from './font.mjs';
-import { exitCodeFor, summarise, tolFor } from './report.mjs';
+import { exitCodeFor, summarise, tolFor, buildReport } from './report.mjs';
 
 const USAGE = `optical — optical alignment checks
 
@@ -189,6 +189,12 @@ function printText(reports, explain) {
       lines.push(
         `  ${f.verdict.padEnd(7)} ${f.id.padEnd(30)} ${amountFor(f).padEnd(16)} ${f.suggested?.value ?? ''}`,
       );
+      // `value` is px; the paste-able form is the viewBox itself. Printing only
+      // the number invites adding it to an origin measured in user units.
+      if (f.suggested?.kind === 'viewBox-origin' && f.suggested.viewBox) {
+        const delta = f.suggested.delta ? ` (delta ${f.suggested.delta})` : '';
+        lines.push(`          paste viewBox="${f.suggested.viewBox}"${delta}`);
+      }
       if (explain) lines.push(`          ${f.evidence}`);
     }
   }
@@ -248,7 +254,26 @@ async function main() {
     const policy = await loadPolicy(opts.policy);
     const reports = [];
     for (const path of opts.paths) {
-      reports.push(applyPolicy(await checkPath(resolve(path), opts), policy));
+      const resolved = resolve(path);
+      try {
+        reports.push(applyPolicy(await checkPath(resolved, opts), policy));
+      } catch (err) {
+        // Usage errors describe the invocation, not the file — they must abort.
+        if (err && err.usage) throw err;
+        // A path the user typed wrong is a usage error, not a verdict.
+        if (err && err.code === 'ENOENT') throw usage(`no such file: ${path}`);
+        // One unreadable file must not take the rest of the batch down with it,
+        // and `--json` callers need an object for every path they passed.
+        reports.push(
+          buildReport({
+            target: basename(resolved),
+            mode: opts.mode,
+            findings: [],
+            policy,
+            meta: { error: String(err && err.message), unresolved: ['input-error'] },
+          }),
+        );
+      }
     }
 
     if (opts.json) {

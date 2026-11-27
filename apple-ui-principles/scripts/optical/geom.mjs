@@ -130,6 +130,18 @@ export function subpathCentroid(points) {
  * relies on.
  */
 export function netShape(subpaths) {
+  // Two subpaths with the same outline are one region, not two. Summing them
+  // doubles the area and drags the centroid towards it, so refuse instead.
+  const boxes = subpaths.map((sub) => bboxOfPoints(sub));
+  const areas = subpaths.map((sub) => Math.abs(subpathSignedArea(sub)));
+  for (let i = 0; i < subpaths.length; i += 1) {
+    for (let j = i + 1; j < subpaths.length; j += 1) {
+      if (sameOutline(boxes[i], boxes[j], areas[i], areas[j])) {
+        return { area: 0, cx: 0, cy: 0, overlapping: true };
+      }
+    }
+  }
+
   let area = 0;
   let mx = 0;
   let my = 0;
@@ -176,8 +188,37 @@ function classifyPoint(point, polygon, eps) {
 }
 
 /** Orientation sign of the triplet p→q→r (0 for collinear). */
-function orientation([px, py], [qx, qy], [rx, ry]) {
-  const value = (qy - py) * (rx - qx) - (qx - px) * (ry - qy);
+/**
+ * Two subpaths that describe the same region.
+ *
+ * Comparing outlines vertex by vertex would need a curve-aware equality test;
+ * equal bounding box plus equal absolute area is a cheap, deliberately
+ * conservative stand-in. A false positive costs a refusal, never a wrong number.
+ */
+function sameOutline(a, b, areaA, areaB) {
+  if (!a || !b) return false;
+  const eps = 1e-6;
+  if (Math.abs(a.minX - b.minX) > eps || Math.abs(a.maxX - b.maxX) > eps) return false;
+  if (Math.abs(a.minY - b.minY) > eps || Math.abs(a.maxY - b.maxY) > eps) return false;
+  return Math.abs(areaA - areaB) <= 1e-6 * Math.max(1, areaA);
+}
+
+function boxesIntersect(a, b) {
+  if (!a || !b) return false;
+  return a.minX <= b.maxX && b.minX <= a.maxX && a.minY <= b.maxY && b.minY <= a.maxY;
+}
+
+function boxContainsBox(outer, inner, eps) {
+  if (!outer || !inner) return false;
+  return (
+    inner.minX >= outer.minX - eps &&
+    inner.minY >= outer.minY - eps &&
+    inner.maxX <= outer.maxX + eps &&
+    inner.maxY <= outer.maxY + eps
+  );
+}
+
+function orientation([px, py], [qx, qy], [rx, ry]) {  const value = (qy - py) * (rx - qx) - (qx - px) * (ry - qy);
   if (Math.abs(value) < 1e-9) return 0;
   return Math.sign(value);
 }
@@ -221,6 +262,7 @@ export function netShapeEvenOdd(subpaths) {
     sub,
     area: Math.abs(subpathSignedArea(sub)),
     centroid: subpathCentroid(sub),
+    box: bboxOfPoints(sub),
   }));
   const eps = 1e-6;
 
@@ -229,6 +271,15 @@ export function netShapeEvenOdd(subpaths) {
 
   for (let i = 0; i < items.length; i += 1) {
     for (let j = i + 1; j < items.length; j += 1) {
+      // Identical outlines cancel to nothing under even-odd, but they leave every
+      // vertex `boundary` and no containment, so the nesting pass below would
+      // count both at full weight. Catch them first.
+      if (sameOutline(items[i].box, items[j].box, items[i].area, items[j].area)) {
+        overlapping = true;
+        continue;
+      }
+      // Cheap reject: disjoint bounding boxes cannot cross and cannot nest.
+      if (!boxesIntersect(items[i].box, items[j].box)) continue;
       // Crossing outlines are never a nesting relation, even when no vertex of
       // one lands inside the other (a plus sign, for instance).
       if (outlinesCross(items[i].sub, items[j].sub)) overlapping = true;
@@ -238,6 +289,8 @@ export function netShapeEvenOdd(subpaths) {
   for (let i = 0; i < items.length; i += 1) {
     for (let j = 0; j < items.length; j += 1) {
       if (i === j) continue;
+      // A vertex of `i` can only be inside `j` if `i`'s box is inside `j`'s.
+      if (!boxContainsBox(items[j].box, items[i].box, eps)) continue;
       let inside = 0;
       let outside = 0;
       for (const vertex of items[i].sub) {
@@ -375,13 +428,50 @@ export function parseTransform(value) {
   return result;
 }
 
-/** Convert SVG primitive shapes into path data so there is one ink pipeline. */
+/**
+ * Parse a geometry length. Returns `null` for anything this static pass cannot
+ * turn into user units.
+ *
+ * The important case is `%`: a percentage is relative to the nearest viewport,
+ * and `parseFloat("100%")` is `100` — a number indistinguishable from a real
+ * 100-unit rectangle once it reaches the area integral. That turns a background
+ * rect into ink at the canvas corner and reports a centred icon as 158% off.
+ * `em`, `pt` and friends depend on a context we do not have either. Absent is
+ * also `null`; callers apply their own default.
+ */
+export function parseLength(raw) {
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  if (s === '') return null;
+  const match = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(px)?$/i.exec(s);
+  return match ? Number(match[1]) : null;
+}
+
+const SHAPE_LENGTH_ATTRS = {
+  rect: ['x', 'y', 'width', 'height', 'rx', 'ry'],
+  circle: ['cx', 'cy', 'r'],
+  ellipse: ['cx', 'cy', 'rx', 'ry'],
+  line: ['x1', 'y1', 'x2', 'y2'],
+  polygon: [],
+  polyline: [],
+};
+
+/**
+ * Convert SVG primitive shapes into path data so there is one ink pipeline.
+ *
+ * Returns `{ d, unparsed }` rather than a string: a length this pass cannot
+ * resolve has to surface as "no measurement" upstream, not as a shape that
+ * silently collapses to zero or, worse, to a wrong number.
+ */
 export function shapeToPath(tag, attrs) {
+  for (const name of SHAPE_LENGTH_ATTRS[tag] || []) {
+    if (attrs[name] !== undefined && parseLength(attrs[name]) === null) {
+      return { d: '', unparsed: true };
+    }
+  }
   const num = (name, fallback = 0) => {
-    const raw = attrs[name];
-    if (raw === undefined) return fallback;
-    const parsed = Number.parseFloat(raw);
-    return Number.isNaN(parsed) ? fallback : parsed;
+    const parsed = parseLength(attrs[name]);
+    return parsed === null ? fallback : parsed;
   };
 
   switch (tag) {
@@ -390,26 +480,29 @@ export function shapeToPath(tag, attrs) {
       const y = num('y');
       const w = num('width');
       const h = num('height');
-      if (w <= 0 || h <= 0) return '';
+      if (w <= 0 || h <= 0) return { d: '', unparsed: false, empty: true };
       const rx = Math.min(num('rx', num('ry', 0)), w / 2);
       const ry = Math.min(num('ry', num('rx', 0)), h / 2);
       if (rx > 0 || ry > 0) {
         const r = Math.max(rx, 0);
         const r2 = Math.max(ry, 0);
-        return [
-          `M${x + r} ${y}`,
-          `H${x + w - r}`,
-          `A${r} ${r2} 0 0 1 ${x + w} ${y + r2}`,
-          `V${y + h - r2}`,
-          `A${r} ${r2} 0 0 1 ${x + w - r} ${y + h}`,
-          `H${x + r}`,
-          `A${r} ${r2} 0 0 1 ${x} ${y + h - r2}`,
-          `V${y + r2}`,
-          `A${r} ${r2} 0 0 1 ${x + r} ${y}`,
-          'Z',
-        ].join(' ');
+        return {
+          d: [
+            `M${x + r} ${y}`,
+            `H${x + w - r}`,
+            `A${r} ${r2} 0 0 1 ${x + w} ${y + r2}`,
+            `V${y + h - r2}`,
+            `A${r} ${r2} 0 0 1 ${x + w - r} ${y + h}`,
+            `H${x + r}`,
+            `A${r} ${r2} 0 0 1 ${x} ${y + h - r2}`,
+            `V${y + r2}`,
+            `A${r} ${r2} 0 0 1 ${x + r} ${y}`,
+            'Z',
+          ].join(' '),
+          unparsed: false,
+        };
       }
-      return `M${x} ${y} H${x + w} V${y + h} H${x} Z`;
+      return { d: `M${x} ${y} H${x + w} V${y + h} H${x} Z`, unparsed: false };
     }
     case 'circle':
     case 'ellipse': {
@@ -417,29 +510,36 @@ export function shapeToPath(tag, attrs) {
       const cy = num('cy');
       const rx = tag === 'circle' ? num('r') : num('rx');
       const ry = tag === 'circle' ? num('r') : num('ry');
-      if (rx <= 0 || ry <= 0) return '';
-      return [
-        `M${cx - rx} ${cy}`,
-        `A${rx} ${ry} 0 1 0 ${cx + rx} ${cy}`,
-        `A${rx} ${ry} 0 1 0 ${cx - rx} ${cy}`,
-        'Z',
-      ].join(' ');
+      if (rx <= 0 || ry <= 0) return { d: '', unparsed: false, empty: true };
+      return {
+        d: [
+          `M${cx - rx} ${cy}`,
+          `A${rx} ${ry} 0 1 0 ${cx + rx} ${cy}`,
+          `A${rx} ${ry} 0 1 0 ${cx - rx} ${cy}`,
+          'Z',
+        ].join(' '),
+        unparsed: false,
+      };
     }
     case 'polygon':
     case 'polyline': {
       const raw = (attrs.points || '').trim();
-      if (!raw) return '';
+      if (!raw) return { d: '', unparsed: false, empty: true };
       const nums = raw.split(/[\s,]+/).map(Number);
-      if (nums.length < 4) return '';
+      if (nums.length < 4) return { d: '', unparsed: false, empty: true };
+      if (!nums.every(Number.isFinite)) return { d: '', unparsed: true };
       const parts = [`M${nums[0]} ${nums[1]}`];
       for (let i = 2; i + 1 < nums.length; i += 2) parts.push(`L${nums[i]} ${nums[i + 1]}`);
       if (tag === 'polygon') parts.push('Z');
-      return parts.join(' ');
+      return { d: parts.join(' '), unparsed: false };
     }
     case 'line':
-      return `M${num('x1')} ${num('y1')} L${num('x2')} ${num('y2')}`;
+      return {
+        d: `M${num('x1')} ${num('y1')} L${num('x2')} ${num('y2')}`,
+        unparsed: false,
+      };
     default:
-      return '';
+      return { d: '', unparsed: false, empty: true };
   }
 }
 
