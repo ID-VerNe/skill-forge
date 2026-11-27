@@ -122,7 +122,14 @@ async function loadPolicy(path) {
 
 async function checkPath(path, opts) {
   const info = await stat(path);
-  if (info.isDirectory()) return checkIconSet(path);
+  if (info.isDirectory()) {
+    // Only `auto` and `keyline` make sense for a directory; silently running the
+    // keyline check for `--mode standalone` would answer a question nobody asked.
+    if (opts.mode !== 'auto' && opts.mode !== 'keyline') {
+      throw usage(`--mode ${opts.mode} needs a file; a directory only supports keyline`);
+    }
+    return checkIconSet(path);
+  }
   if (opts.mode === 'keyline') {
     throw usage('--mode keyline needs a directory, not a single file');
   }

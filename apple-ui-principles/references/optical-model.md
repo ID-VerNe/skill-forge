@@ -38,9 +38,12 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 |---|---|
 | empty canvas, no shapes, all shapes `fill:none` without stroke | `geometry/no-ink` |
 | `mask` or `filter` present | `geometry/unresolved-graphics` |
+| `<text>`, `<image>`, `<foreignObject>`, `<video>`, `<canvas>`, `<switch>` | `geometry/unresolved-graphics` (`unsupported-ink:*`) — visible, but not geometry |
 | a `clip-path` whose geometry is not a plain rect, or one that cuts the ink | `geometry/unresolved-graphics` |
 | `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
+| a `transform` with a percentage or unit argument | `geometry/unresolved-graphics` (`unparsed-transform`) |
+| a percentage `stroke-width` | `geometry/unresolved-graphics` (`stroke-width-percentage`) |
 | a shape whose `d` failed to parse | `geometry/unresolved-graphics` |
 | even-odd outlines that partially overlap | `geometry/unresolved-graphics` (`overlapping-subpaths`) |
 | a computed centroid outside its own ink box | `geometry/unresolved-graphics` (`centroid-outside-ink`) |
@@ -71,8 +74,10 @@ refuse*, never approximate:
 | any other geometry (circles, paths, rounded rects, multiple children, `objectBoundingBox`) | `clip-path`, `unknown` |
 | a shape clipping itself | `clip-path`, `unknown` — the container walk would drop the shape |
 
-Rotations on the clip are folded into an axis-aligned bounding box, which is a
-*superset* of the real clip. That can only add refusals, never a wrong number.
+A `clip-path` on a shape that clips **itself** needs the intersection of two
+outlines, so it is refused. A `clip-path` on a `transform`ed clip rect is refused
+too: the rect would have to be rotated, and the containment test only knows about
+axis-aligned boxes. Both are refusals, not approximations.
 
 ### Nested viewports
 
@@ -99,15 +104,30 @@ The nested viewport's **clip** is not modelled: ink drawn outside it is measured
 as if visible. This only matters for artwork that overflows its own viewport,
 which is a defect worth seeing.
 
+A `transform` on the **root** `<svg>` is ignored on purpose. That transform
+belongs to the host page's placement of the canvas, not to the artwork's
+internal coordinate system, so letting it through would report a `104px` offset
+for an icon that is perfectly centred.
+
+`transform` parsing is strict: an argument that is not a plain number (`10%`,
+`2em`, `var(--x)`) invalidates the *whole* list. Dropping the bad argument would
+shift the rest left — `translate(10%,8)` would silently become `translate(8,0)`,
+a wrong answer with no warning.
+
 ### Units
 
 Measurements are taken in viewBox user units, but every reported `measured`,
 `basis` and suggestion is in **rendered px**. The conversion comes from the root
 element's `width`/`height`: `width="48"` on a 24-unit viewBox means each user
 unit is 2px, so a 10-unit offset is reported as `20px`. Without absolute
-`width`/`height` the icon convention (1 unit = 1px) applies; `meta.unitScale`
-records which one was used, and the evidence string appends
-`[user units ×N = px]` whenever the two differ.
+`width`/`height` the icon convention (1 unit = 1px) applies; `meta.unitScale`,
+`meta.unitScaleX`/`unitScaleY` and `meta.unitSource` record which one was used,
+and the evidence string appends `[user units ×N = px]` whenever they differ.
+
+`preserveAspectRatio="none"` stretches the axes independently, so there is no
+single scale: x and y are converted separately, `meta.unitScale` is `null`, and
+the tolerance basis is the smaller rendered dimension. `slice` uses the larger
+ratio, `meet` the smaller.
 
 ### Fill rule
 
@@ -137,17 +157,31 @@ which is why it is reported separately from `#2`.
 Stroke-only shapes expand the box by `stroke-width/2`; joins and caps are not
 modelled, so treat `±half-linewidth` as the accuracy of the bbox for stroke icons.
 
-The suggestion is a pair `(kind, value)` where `value` is the delta to **add to
-the viewBox origin**, together with the literal resulting attribute:
+### Reading a suggestion
+
+Every `suggested` object is `{kind, value}` and `kind` fixes what the number
+means. The two geometric kinds move the ink in *opposite* directions, which is
+why the kind is part of the contract rather than decoration:
+
+| `kind` | `value` means | `measured.dx` relation |
+|---|---|---|
+| `viewBox-origin` | delta to **add to the viewBox origin** | equal to `measured.dx` |
+| `redraw` | how far to move the **visual mass inside the artwork** | `−measured.dx` |
 
 ```json
 { "kind": "viewBox-origin", "value": "-4px / 0px", "viewBox": "-4 0 24 24" }
 ```
 
-Moving the origin by `d` moves the artwork by `−d`, so the value equals the
-measured offset rather than its negation. The `viewBox` string is the
-unambiguous form — an agent that pastes it gets the centred result, whereas a
-signed number invites a sign flip.
+Moving the origin by `d` moves the artwork by `−d`, so `viewBox-origin` equals
+the measured offset itself. The `viewBox` string is the unambiguous form — an
+agent that pastes it gets the centred result, whereas a signed number invites a
+sign flip.
+
+`redraw` is the `#2` case, and it is a different fix: **translating the artwork
+cannot change a centroid offset**, because the centroid and the ink box move
+together. The imbalance is in the mass distribution, so the shape has to change —
+lengthen the opposite arm, thin the heavy side, or accept the offset as taste
+(§3).
 
 ## 3. `#2` area centroid
 
@@ -323,6 +357,13 @@ codes stay distinct so a broken project never looks like an unverifiable one.
 - No rendering. Font fallback, glyph hinting, sub-pixel positioning and
   `letter-spacing` accumulation are out of scope.
 - Stroke joins, caps and dashes are approximated by a constant-width band.
+- Tailwind variant prefixes (`md:`, `dark:hover:`, `supports-[…]:`) are stripped
+  before matching, because `hidden md:flex` and `md:flex` describe the same
+  container. The consequence is that a variant-qualified `flex` is treated as
+  unconditional; at breakpoints where it does not apply, `text-box` may in fact
+  work.
+- Conflicting `text-box` declarations across `@layer`s are `unknown`: layer order
+  decides the winner, and the order may live in another file.
 - CSS is tokenised, not parsed. Unbalanced braces, unterminated strings and
   declaration-less preludes degrade to `unknown` rather than a best guess.
 - `<use>` resolution is single-target and single-pass, capped at three levels

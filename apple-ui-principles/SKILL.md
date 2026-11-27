@@ -129,6 +129,7 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | Input | Mode | What is measured |
 |---|---|---|
 | `icon.svg` | `standalone` | ink box vs viewBox, centroid vs ink box |
+| `icon.svg` with `<text>`/`<image>` | — | `unknown`: visible ink that is not geometry |
 | `icons/` (dir) | `keyline` | fill-ratio outliers across the set (needs ≥3 icons of one family) |
 | `styles.css` | rule | `text-box` in flex/grid, hard-coded nudges |
 | `Button.tsx` | rule | same, plus concentric radii from the element tree |
@@ -138,7 +139,7 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | `ok` | 0 | within tolerance | leave it alone |
 | `nudge` | 0 | measurable offset, acceptable band | adopt the suggestion, do not block |
 | `off` | 1 | certain defect | fix it |
-| `unknown` | 2 | context missing (display, parent, font) | report the gap; **never guess** |
+| `unknown` | 2 | context missing (display, parent, font, unmeasurable ink) | report the gap; **never guess** |
 
 Two rules that make the output trustworthy:
 
@@ -149,7 +150,17 @@ When a report holds both `off` and `unknown`, the exit code is `1` (the defect i
 
 ### Baking the correction
 
-For an asset that reports `geometry/centroid off`, do not scatter `translate-x-[1.5px]` through components. Shift the ink inside its own canvas (adjust the `viewBox` origin or the path), then re-run until `ok`. Any `flex items-center justify-center` downstream inherits the fix for free.
+Do not scatter `translate-x-[1.5px]` through components. Fix it in the asset, then re-run until `ok`; any `flex items-center justify-center` downstream inherits the fix for free.
+
+The two geometry findings have **different** fixes, and the report says which:
+
+| Finding | Fix | `suggested.value` |
+|---|---|---|
+| `geometry/ink-bbox` | move the viewBox origin | delta to add to the origin (paste `suggested.viewBox`) |
+| `geometry/centroid` | redraw the mass — translating cannot fix it | how far to move the visual mass |
+
+A centroid offset survives any translation because the centroid and the ink box
+move together. If the number is inside tolerance, leave the shape alone.
 
 `geometry/ink-bbox` prints the literal attribute to paste:
 

@@ -492,11 +492,14 @@ test('the viewBox suggestion and the measured offset agree in sign', () => {
   assert.equal(f.suggested.value, '-4px / 0px', JSON.stringify(f.suggested));
 });
 
-test('the centroid suggestion covers both axes', () => {
+test('the centroid suggestion covers both axes and is not a translation', () => {
   const shape = analyzeSvg(svg('<path d="M4 4 L16 6 L10 18 Z"/>'));
   const report = checkShape(shape, { mode: 'standalone', target: 'diag.svg' });
   const f = report.findings.find((x) => x.id === 'geometry/centroid');
-  assert.equal(f.suggested.value, '0px / 1.67px', JSON.stringify(f.suggested));
+  // Translating the artwork cannot change a centroid offset: the centroid and the
+  // ink box move together, so the suggestion has to say "redraw", not "shift".
+  assert.equal(f.suggested.kind, 'redraw');
+  assert.equal(f.suggested.value, 'move the visual mass 0px / 1.67px', JSON.stringify(f.suggested));
 });
 
 test('visibility:hidden is inherited but a descendant can restore it', () => {
@@ -703,17 +706,174 @@ test('a nested selector is still a different element', () => {
   assert.match(f.evidence, /\.btn span/);
 });
 
-test('a clip on a structural element is refused, not silently dropped', () => {
-  const clip =
-    '<defs><clipPath id="c"><rect x="0" y="0" width="24" height="24"/></clipPath></defs>';
-  const cases = [
-    `${clip}<symbol id="s"><rect x="4" y="4" width="16" height="16"/></symbol><use href="#s" clip-path="url(#c)"/>`,
-    `${clip}<svg clip-path="url(#c)" x="0" y="0" width="12" height="12" viewBox="0 0 12 12"><rect x="0" y="0" width="12" height="12"/></svg>`,
-  ];
-  for (const body of cases) {
+test('a clip on <use>/<svg> is evaluated against the instantiated content', () => {
+  const clip = (id, w) =>
+    `<defs><clipPath id="${id}"><rect x="0" y="0" width="${w}" height="24"/></clipPath></defs>`;
+  const symbol = '<symbol id="s"><rect x="4" y="4" width="16" height="16"/></symbol>';
+  const nested =
+    '<svg width="12" height="12" viewBox="0 0 12 12"><rect x="0" y="0" width="12" height="12"/></svg>';
+
+  // A clip that covers everything must not change the conclusion.
+  const okSymbol = analyzeSvg(svg(`${clip('c', 24)}${symbol}<use href="#s" clip-path="url(#c)"/>`));
+  assert.deepEqual(okSymbol.unresolved, []);
+  near(okSymbol.ink.bbox.minX, 4, 1e-6);
+  near(okSymbol.ink.bbox.maxX, 20, 1e-6);
+
+  const okSvg = analyzeSvg(svg(`${clip('c', 24)}${nested.replace('<svg ', '<svg clip-path="url(#c)" ')}`));
+  assert.deepEqual(okSvg.unresolved, []);
+  near(okSvg.ink.bbox.maxX, 12, 1e-6);
+
+  // A clip that would remove ink is unmeasurable, not empty.
+  const cutSymbol = analyzeSvg(svg(`${clip('d', 10)}${symbol}<use href="#s" clip-path="url(#d)"/>`));
+  assert.ok(cutSymbol.unresolved.includes('clip-path-cuts-ink'), JSON.stringify(cutSymbol.unresolved));
+
+  const cutSvg = analyzeSvg(
+    svg(`${clip('d', 10)}${nested.replace('<svg ', '<svg clip-path="url(#d)" ')}`),
+  );
+  assert.ok(cutSvg.unresolved.includes('clip-path-cuts-ink'), JSON.stringify(cutSvg.unresolved));
+});
+
+test('a no-op clip never changes the verdict for a container', () => {
+  const plain = checkShape(analyzeSvg(svg('<g><rect x="4" y="4" width="16" height="16"/></g>')), {
+    target: 'a.svg',
+  });
+  const clipped = checkShape(
+    analyzeSvg(
+      svg(
+        '<defs><clipPath id="c"><rect x="0" y="0" width="24" height="24"/></clipPath></defs>' +
+          '<g clip-path="url(#c)"><rect x="4" y="4" width="16" height="16"/></g>',
+      ),
+    ),
+    { target: 'b.svg' },
+  );
+  assert.equal(clipped.verdict, plain.verdict);
+  near(clipped.findings[0].measured.dx, plain.findings[0].measured.dx, 1e-9);
+});
+
+test('fill-opacity is inherited, opacity is not', () => {
+  const invisible = analyzeSvg(
+    svg('<g fill-opacity="0"><rect x="4" y="4" width="16" height="16"/></g>'),
+  );
+  assert.equal(invisible.noInk, true);
+
+  const visible = analyzeSvg(
+    svg('<g fill-opacity="0.4"><rect x="4" y="4" width="16" height="16"/></g>'),
+  );
+  assert.equal(visible.noInk, false);
+  // opacity composites the whole group, so a semi-transparent group is still ink
+  const group = analyzeSvg(svg('<g opacity="0.5"><rect x="4" y="4" width="16" height="16"/></g>'));
+  assert.equal(group.noInk, false);
+});
+
+// --- round 5: one pipeline for scopes, honest units --------------------------
+
+test('<use> into an <svg viewBox> applies the viewBox exactly once', () => {
+  const shape = analyzeSvg(
+    svg(
+      '<defs><svg id="s" viewBox="0 0 10 10"><rect width="10" height="10"/></svg></defs>' +
+        '<use href="#s"/>',
+    ),
+  );
+  // 10 units scaled 2.4 into the 24-unit viewport: 0..24, not 0..57.6.
+  near(shape.ink.bbox.maxX, 24, 1e-6);
+  near(shape.ink.bbox.maxY, 24, 1e-6);
+});
+
+test('ink we can see but cannot measure is unresolved, not empty', () => {
+  for (const body of [
+    '<text x="2" y="2">hi</text>',
+    '<image x="0" y="0" width="10" height="10" href="a.png"/>',
+    '<foreignObject width="10" height="10"><div/></foreignObject>',
+  ]) {
     const shape = analyzeSvg(svg(body));
-    // Walking `children` of a <use>/<svg> would produce no ink and no complaint.
-    assert.ok(shape.unresolved.includes('clip-path'), JSON.stringify(shape.unresolved));
-    assert.equal(shape.noInk, true);
+    assert.ok(
+      shape.unresolved.some((u) => u.startsWith('unsupported-ink:')),
+      `${body} -> ${JSON.stringify(shape.unresolved)}`,
+    );
   }
+});
+
+test('a transform on the root <svg> is not part of the artwork', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" transform="translate(100,100)">' +
+      '<rect x="4" y="4" width="16" height="16"/></svg>',
+  );
+  near(shape.ink.bbox.minX, 4, 1e-6);
+  near(shape.ink.bbox.maxX, 20, 1e-6);
+});
+
+test('preserveAspectRatio="none" scales each axis separately', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="48" height="24" preserveAspectRatio="none">' +
+      '<rect x="0" y="0" width="4" height="4"/></svg>',
+  );
+  near(shape.unitScaleX, 2, 1e-9);
+  near(shape.unitScaleY, 1, 1e-9);
+  assert.equal(shape.unitScale, null);
+  assert.equal(shape.unitSource, 'declared');
+
+  const report = checkShape(shape, { target: 'stretch.svg' });
+  const f = report.findings.find((x) => x.id === 'geometry/ink-bbox');
+  // ink centre (2,2) vs viewBox centre (12,12): -10 units -> -20px / -10px.
+  near(f.measured.dx, -20, 1e-6);
+  near(f.measured.dy, -10, 1e-6);
+});
+
+test('preserveAspectRatio="slice" scales by the larger ratio', () => {
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="48" height="24" preserveAspectRatio="xMidYMid slice">' +
+      '<rect x="0" y="0" width="4" height="4"/></svg>',
+  );
+  near(shape.unitScaleX, 2, 1e-9);
+  near(shape.unitScaleY, 2, 1e-9);
+});
+
+test('a transform with an unresolvable argument is refused, not truncated', () => {
+  // Dropping "10%" would turn translate(10%,8) into translate(8,0).
+  const shape = analyzeSvg(svg('<g transform="translate(10%,8)"><rect x="0" y="0" width="4" height="4"/></g>'));
+  assert.ok(shape.unresolved.includes('unparsed-transform'), JSON.stringify(shape.unresolved));
+
+  const bad = analyzeSvg(svg('<g transform="skewX(2em)"><rect x="0" y="0" width="4" height="4"/></g>'));
+  assert.ok(bad.unresolved.includes('unparsed-transform'), JSON.stringify(bad.unresolved));
+});
+
+test('a percentage stroke-width is not read as user units', () => {
+  const shape = analyzeSvg(
+    svg('<rect x="4" y="4" width="16" height="16" stroke="#000" stroke-width="10%"/>'),
+  );
+  assert.ok(shape.unresolved.includes('stroke-width-percentage'), JSON.stringify(shape.unresolved));
+});
+
+test('conflicting trim declarations across @layer are unknown, not last-wins', () => {
+  const css =
+    '@layer base, overrides;' +
+    '@layer base { .x { text-box-trim: trim-both } }' +
+    '@layer overrides { .x { text-box-trim: none } }';
+  const report = checkCss(css, { target: 'layer.css' });
+  const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+  assert.ok(f, JSON.stringify(report.findings, null, 2));
+  assert.equal(f.verdict, 'unknown');
+  assert.match(f.evidence, /cascade order/);
+});
+
+test('tailwind variant prefixes do not hide the display decision', () => {
+  for (const cls of ['text-box-trim md:flex', 'hidden md:flex text-box-trim', 'text-box-trim dark:hover:grid']) {
+    const report = checkTsx(`<div className="${cls}" />`, { target: 'variant.tsx' });
+    const f = report.findings.find((x) => x.id === 'rule/text-box-in-flex');
+    assert.ok(f, `${cls}: ${JSON.stringify(report.findings, null, 2)}`);
+    assert.equal(f.verdict, 'off', cls);
+  }
+});
+
+test('a non-flex display utility is a pass, not a gap', () => {
+  for (const cls of ['text-box-trim block', 'text-box-trim sr-only', 'text-box-trim inline-block']) {
+    const report = checkTsx(`<div className="${cls}" />`, { target: 'block.tsx' });
+    assert.equal(report.findings.length, 0, `${cls}: ${JSON.stringify(report.findings, null, 2)}`);
+  }
+});
+
+test('a directory does not silently answer a standalone question', () => {
+  const r = run('check', fixture('icons/set'), '--mode', 'standalone');
+  assert.equal(r.status, 64, r.stderr);
+  assert.match(r.stderr, /directory/);
 });

@@ -137,6 +137,25 @@ function displayKind(raw) {
 function textBoxFindings(blocks) {
   const findings = [];
   for (const block of mergeBySelector(blocks)) {
+    const declaresTrim = block.order.some(([prop]) => prop === 'text-box' || prop === 'text-box-trim');
+    if (!declaresTrim) continue;
+
+    // `@layer a { .x { text-box-trim: none } }` vs `@layer b { .x { text-box-trim: trim-both } }`:
+    // which one wins depends on layer order, which this file may not contain.
+    // This has to be decided *before* replaying the order, because the replay
+    // would pick the last one and present a coin flip as a fact.
+    if (block.conflicts.has('text-box') || block.conflicts.has('text-box-trim')) {
+      findings.push({
+        id: 'rule/text-box-in-flex',
+        layer: 'exact',
+        forcedVerdict: 'unknown',
+        pixel: false,
+        evidence: `${block.selector} declares text-box differently in separate contexts; whether trimming is on depends on cascade order`,
+        suggested: { kind: 'inspect', value: 'check the @layer order, or read the computed style' },
+      });
+      continue;
+    }
+
     const trim = effectiveTrim(block.order);
     if (!trim) continue;
     const display = displayKind(block.decls.display);
@@ -396,7 +415,7 @@ const CLASS_HELPERS = /\b(?:clsx|cn|classnames|classNames|twMerge|twJoin|cva)\b/
  * and if anything that looks like code remains, the set is conditional.
  */
 export function classInfo(expr) {
-  if (!expr) return { tokens: [], ambiguous: false };
+  if (!expr) return { tokens: [], stems: [], ambiguous: false };
   const tokens = extractLiterals(expr)
     .join(' ')
     .split(/\s+/)
@@ -407,6 +426,7 @@ export function classInfo(expr) {
     .map((t) => t.replace(/^!/, '').replace(/!$/, ''))
     .filter(Boolean);
 
+  const stems = tokens.map(stripVariants).filter(Boolean);
   const interpolated = expr.includes('${');
   const residual = expr
     .replace(STRIP_LITERALS, ' ')
@@ -415,7 +435,7 @@ export function classInfo(expr) {
     .replace(/[\s(),.[\]]/g, '');
 
   const ambiguous = interpolated || /[?&|+]|[\w$]/.test(residual);
-  return { tokens, ambiguous };
+  return { tokens, stems, ambiguous };
 }
 
 /** Back-compat helper for callers that only need the token list. */
@@ -577,8 +597,35 @@ function tailwindPadding(token, axis = '') {
   return m[1] in PADDING_SCALE ? PADDING_SCALE[m[1]] : null;
 }
 
-/** Tailwind's layout-display utilities, used to tell "not a flex container" from "unknown". */
-const DISPLAY_TOKEN = /^(block|inline|inline-block|flow-root|contents|hidden|table|table-row|table-cell|list-item)$/;
+/**
+ * Tailwind's layout-display utilities, used to tell "not a flex container" from
+ * "unknown". `sr-only` is not a display utility but it is unambiguously not a
+ * flex container either.
+ */
+const DISPLAY_TOKEN =
+  /^(block|inline|inline-block|flow-root|contents|hidden|table|table-row|table-cell|list-item|sr-only|not-sr-only)$/;
+
+/**
+ * `md:flex`, `dark:hover:grid`, `supports-[display:grid]:flex` all describe a
+ * flex container under a condition. Ignoring the prefix made `md:flex` invisible
+ * while `hidden md:flex` silently passed; both are the same container.
+ */
+function stripVariants(token) {
+  let i = 0;
+  let stem = 0;
+  while (i < token.length) {
+    const ch = token[i];
+    if (ch === '[') {
+      const end = token.indexOf(']', i);
+      if (end === -1) break;
+      i = end + 1;
+      continue;
+    }
+    if (ch === ':') stem = i + 1;
+    i += 1;
+  }
+  return token.slice(stem);
+}
 
 function firstRadius(tokens) {
   for (const token of tokens) {
@@ -608,9 +655,9 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
 
   for (const el of elements) {
     const info = classInfo(el.className);
-    const hasBoxTrim = info.tokens.some(isBoxTrim);
+    const hasBoxTrim = info.stems.some(isBoxTrim);
     if (!hasBoxTrim) continue;
-    const flexy = info.tokens.find((t) => FLEXY.test(t));
+    const flexy = info.stems.find((t) => FLEXY.test(t));
     if (flexy) {
       findings.push(
         degradeIfConditional(info, {
@@ -626,7 +673,7 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
     }
     // No layout-display utility at all: the container type lives outside this
     // element (parent, stylesheet, inline style), so it cannot be asserted.
-    if (info.tokens.some((t) => DISPLAY_TOKEN.test(t))) continue;
+    if (info.stems.some((t) => DISPLAY_TOKEN.test(t))) continue;
     findings.push(
       degradeIfConditional(info, {
         id: 'rule/text-box-in-flex',
@@ -641,12 +688,12 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
 
   for (const el of elements) {
     const info = classInfo(el.className);
-    const outerRadius = firstRadius(info.tokens);
+    const outerRadius = firstRadius(info.stems);
     if (outerRadius === undefined) continue;
 
-    const uniform = info.tokens.map((t) => tailwindPadding(t)).find((p) => p !== null && p !== undefined);
-    const padX = info.tokens.map((t) => tailwindPadding(t, 'x')).find((p) => p !== null && p !== undefined);
-    const padY = info.tokens.map((t) => tailwindPadding(t, 'y')).find((p) => p !== null && p !== undefined);
+    const uniform = info.stems.map((t) => tailwindPadding(t)).find((p) => p !== null && p !== undefined);
+    const padX = info.stems.map((t) => tailwindPadding(t, 'x')).find((p) => p !== null && p !== undefined);
+    const padY = info.stems.map((t) => tailwindPadding(t, 'y')).find((p) => p !== null && p !== undefined);
 
     let padding;
     if (uniform !== undefined) {
@@ -671,7 +718,7 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
     for (const child of elements) {
       if (child.parent !== el) continue;
       const childInfo = classInfo(child.className);
-      const childRadius = firstRadius(childInfo.tokens);
+      const childRadius = firstRadius(childInfo.stems);
       if (childRadius === undefined) continue;
 
       const conditional = info.ambiguous || childInfo.ambiguous;

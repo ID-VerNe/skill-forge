@@ -41,7 +41,18 @@ const NON_RENDERING = new Set([
   'desc',
   'metadata',
 ]);
-const UNRESOLVABLE = ['clip-path', 'mask', 'filter'];
+const UNRESOLVABLE = ['mask', 'filter'];
+// Elements that paint, but not as geometry we can measure.
+const UNMEASURABLE_INK = new Set([
+  'text',
+  'tspan',
+  'textpath',
+  'image',
+  'foreignobject',
+  'video',
+  'canvas',
+  'switch',
+]);
 const MAX_USE_DEPTH = 3;
 
 /** Minimal XML scanner: enough for icon markup, strict enough to fail loudly. */
@@ -151,6 +162,38 @@ function indexIds(node, map) {
   for (const child of node.children || []) indexIds(child, map);
 }
 
+function matrixFrom(attrs, base, ctx) {
+  if (!attrs.transform) return base;
+  const parsed = parseTransform(attrs.transform);
+  if (!parsed) {
+    ctx.unresolved.add('unparsed-transform');
+    return base;
+  }
+  return multiplyMatrix(base, parsed);
+}
+
+function fillOpacityOf(attrs, inherited) {
+  if (attrs['fill-opacity'] === undefined) return inherited.fillOpacity ?? 1;
+  const value = Number.parseFloat(attrs['fill-opacity']);
+  return Number.isFinite(value) ? value : 1;
+}
+
+/**
+ * `stroke-width` is in user units, or a percentage of the viewport diagonal —
+ * which needs a rendered viewport we do not have. Refuse the percentage rather
+ * than read "10%" as ten units.
+ */
+function strokeWidthOf(attrs, inherited, ctx) {
+  if (attrs['stroke-width'] === undefined) return inherited.strokeWidth;
+  const raw = String(attrs['stroke-width']).trim();
+  if (/%$/.test(raw)) {
+    ctx.unresolved.add('stroke-width-percentage');
+    return inherited.strokeWidth;
+  }
+  const value = Number.parseFloat(raw);
+  return Number.isFinite(value) ? value : inherited.strokeWidth;
+}
+
 /** Presentation state a node hands to its children. */
 function inheritedFor(attrs, inherited, visible, matrix) {
   return {
@@ -162,6 +205,11 @@ function inheritedFor(attrs, inherited, visible, matrix) {
         ? Number.parseFloat(attrs['stroke-width'])
         : inherited.strokeWidth,
     fillRule: attrs['fill-rule'] || inherited.fillRule,
+    // `fill-opacity` is inherited; `opacity` is not (it composites the group).
+    fillOpacity:
+      attrs['fill-opacity'] !== undefined
+        ? Number.parseFloat(attrs['fill-opacity'])
+        : inherited.fillOpacity,
     visible,
     viewport: inherited.viewport,
   };
@@ -237,7 +285,8 @@ function rectContains(rect, box, eps = 1e-6) {
 }
 
 function collect(node, inherited, out, ctx) {
-  if (NON_RENDERING.has(String(node.tag).toLowerCase())) return out;
+  const tag = String(node.tag).toLowerCase();
+  if (NON_RENDERING.has(tag)) return out;
 
   const attrs = effectiveAttrs(node);
   // `display:none` removes the subtree outright; `visibility:hidden` does not —
@@ -250,99 +299,53 @@ function collect(node, inherited, out, ctx) {
       ? inherited.visible
       : attrs.visibility !== 'hidden' && attrs.visibility !== 'collapse';
 
-  for (const attr of UNRESOLVABLE) {
-    if (attr === 'clip-path') continue; // handled below, where it can be resolved
-    if (attrs[attr] && !/^none$/i.test(attrs[attr])) ctx.unresolved.add(attr);
-  }
-
-  // A clip that provably contains the artwork is a no-op.
-  //
-  // Icon exporters wrap everything in
-  //   <clipPath id="x"><rect width="16" height="16"/></clipPath>
-  // i.e. a clip exactly the size of the canvas. Refusing to measure those makes
-  // the checker blind on most real icon sets, so the clip is resolved when it is
-  // a plain axis-aligned rect and the subtree's ink fits inside it. Anything
-  // that would actually cut the drawing stays unmeasurable.
-  const clipRaw = attrs['clip-path'];
-  if (clipRaw && !/^none$/i.test(clipRaw.trim())) {
-    // A shape clipping itself needs the intersection, not a container walk; and
-    // a structural element (`<use>`, `<svg>`) carries its content outside
-    // `children`, so walking those would silently drop the artwork.
-    const structural = node.tag === 'use' || node.tag === 'svg';
-    const matrix = attrs.transform
-      ? multiplyMatrix(inherited.matrix, parseTransform(attrs.transform))
-      : inherited.matrix;
-    const rect = SHAPES.has(node.tag) || structural ? null : resolveClipRect(clipRaw, ctx, matrix);
-    if (!rect) {
-      ctx.unresolved.add('clip-path');
-      return out;
-    }
-    const local = inheritedFor(attrs, inherited, visible, matrix);
-    const captured = [];
-    for (const child of node.children || []) collect(child, local, captured, ctx);
-    const box = bboxOfShapes(captured, ctx.steps);
-    if (box && !rectContains(rect, box)) {
-      // The clip removes ink; the remainder needs a boolean intersection of
-      // arbitrary outlines.
-      ctx.unresolved.add('clip-path-cuts-ink');
-      return out;
-    }
-    out.push(...captured);
+  // Ink we can see but cannot measure. Silently treating these as empty would
+  // report "the canvas has nothing in it", which is a different — and false —
+  // statement.
+  if (UNMEASURABLE_INK.has(tag)) {
+    ctx.unresolved.add(`unsupported-ink:${tag}`);
     return out;
   }
 
-  // A nested <svg> opens a new viewport: its x/y/width/height place it inside the
-  // parent's user space, and its own viewBox rescales everything below it. The
-  // root <svg> is excluded — we measure in its viewBox units on purpose.
-  if (node.tag === 'svg' && node !== ctx.root) {
+  for (const attr of UNRESOLVABLE) {
+    if (attrs[attr] && !/^none$/i.test(attrs[attr])) ctx.unresolved.add(attr);
+  }
+
+  // A root <svg> transform is not part of the artwork's coordinate system: the
+  // outer canvas is whatever the host draws it into.
+  const own = node === ctx.root ? inherited.matrix : matrixFrom(attrs, inherited.matrix, ctx);
+
+  // --- a nested <svg> opens a viewport ------------------------------------
+  if (tag === 'svg' && node !== ctx.root) {
     // Percentages resolve against the nearest enclosing viewport, not the root.
     const basisW = inherited.viewport.w;
     const basisH = inherited.viewport.h;
     const vpW = resolveLength(attrs.width, basisW);
     const vpH = resolveLength(attrs.height, basisH);
-    if (vpW === null || vpH === null) {
-      ctx.unresolved.add('viewport-relative-units');
-      return out;
-    }
     const vx = resolveLength(attrs.x, basisW, 0);
     const vy = resolveLength(attrs.y, basisH, 0);
-    if (vx === null || vy === null) {
+    if (vpW === null || vpH === null || vx === null || vy === null) {
       ctx.unresolved.add('viewport-relative-units');
       return out;
     }
-    let matrix = attrs.transform
-      ? multiplyMatrix(inherited.matrix, parseTransform(attrs.transform))
-      : inherited.matrix;
-    matrix = multiplyMatrix(matrix, [1, 0, 0, 1, vx, vy]);
+    let matrix = multiplyMatrix(own, [1, 0, 0, 1, vx, vy]);
     if (attrs.viewBox) {
       matrix = multiplyMatrix(
         matrix,
         viewBoxMatrix(parseViewBox(attrs), { x: 0, y: 0, w: vpW, h: vpH }, attrs.preserveAspectRatio),
       );
     }
-    for (const child of node.children || []) {
-      collect(
-        child,
-        {
-          matrix,
-          fill: attrs.fill !== undefined ? attrs.fill : inherited.fill,
-          stroke: attrs.stroke !== undefined ? attrs.stroke : inherited.stroke,
-          strokeWidth:
-            attrs['stroke-width'] !== undefined
-              ? Number.parseFloat(attrs['stroke-width'])
-              : inherited.strokeWidth,
-          fillRule: attrs['fill-rule'] || inherited.fillRule,
-          visible,
-          viewport: { w: vpW, h: vpH },
-        },
-        out,
-        ctx,
-      );
-    }
+    const local = inheritedFor(attrs, inherited, visible, matrix);
+    local.viewport = { w: vpW, h: vpH };
+    // The clip applies in the *inner* coordinate system, after the viewBox map.
+    withClip(attrs, matrix, ctx, out, (sink) => {
+      for (const child of node.children || []) collect(child, local, sink, ctx);
+    });
     return out;
   }
 
-  if (node.tag === 'use') {
+  // --- <use> instantiates its target ---------------------------------------
+  if (tag === 'use') {
     const href = attrs.href || attrs['xlink:href'] || '';
     const id = href.startsWith('#') ? href.slice(1) : '';
     const target = id ? ctx.ids.get(id) : null;
@@ -362,101 +365,126 @@ function collect(node, inherited, out, ctx) {
       return out;
     }
     // `transform` wraps the element; x/y translate its own coordinate system.
-    let matrix = attrs.transform
-      ? multiplyMatrix(inherited.matrix, parseTransform(attrs.transform))
-      : inherited.matrix;
-    matrix = multiplyMatrix(matrix, [1, 0, 0, 1, x, y]);
-
+    const useMatrix = multiplyMatrix(own, [1, 0, 0, 1, x, y]);
     const targetTag = String(target.tag).toLowerCase();
-    const targetAttrs = effectiveAttrs(target);
-    // <use> width/height only matter when the target establishes a viewport.
-    let childViewport = inherited.viewport;
-    if (targetTag === 'symbol' || targetTag === 'svg') {
-      const vpW = resolveLength(attrs.width, inherited.viewport.w);
-      const vpH = resolveLength(attrs.height, inherited.viewport.h);
-      if (vpW === null || vpH === null) {
-        ctx.unresolved.add('use-viewport');
-        return out;
-      }
-      if (targetAttrs.viewBox) {
-        matrix = multiplyMatrix(
-          matrix,
-          viewBoxMatrix(
-            parseViewBox(targetAttrs),
-            { x: 0, y: 0, w: vpW, h: vpH },
-            targetAttrs.preserveAspectRatio,
-          ),
-        );
-      }
-      childViewport = { w: vpW, h: vpH };
-    } else if (attrs.width !== undefined || attrs.height !== undefined) {
-      // width/height on a <use> of a non-viewport target are ignored by the user
-      // agent, so there is nothing to scale — but say so rather than guess.
+
+    // width/height on a <use> only mean anything for viewport-establishing targets.
+    if (targetTag !== 'symbol' && targetTag !== 'svg' && (attrs.width !== undefined || attrs.height !== undefined)) {
       ctx.unresolved.add('use-viewport-ignored');
     }
 
-    // A <use> carries its own presentation attributes for the referenced tree.
-    const local = {
-      matrix,
-      fill: attrs.fill !== undefined ? attrs.fill : inherited.fill,
-      stroke: attrs.stroke !== undefined ? attrs.stroke : inherited.stroke,
-      strokeWidth:
-        attrs['stroke-width'] !== undefined
-          ? Number.parseFloat(attrs['stroke-width'])
-          : inherited.strokeWidth,
-      fillRule: attrs['fill-rule'] || inherited.fillRule,
-      visible,
-      viewport: childViewport,
-    };
-    const inner = { ...ctx, depth: ctx.depth + 1, unresolved: ctx.unresolved };
+    const inner = { ...ctx, depth: ctx.depth + 1 };
+    const local = inheritedFor(attrs, inherited, visible, useMatrix);
 
-    if (targetTag === 'symbol') {
-      // <symbol> is non-rendering on its own but renders when instantiated.
-      for (const child of target.children || []) collect(child, local, out, inner);
-    } else if (NON_RENDERING.has(targetTag)) {
-      ctx.unresolved.add('use-target-not-renderable');
-    } else {
-      collect(target, local, out, inner);
+    withClip(attrs, useMatrix, ctx, out, (sink) => {
+      if (targetTag === 'symbol') {
+        // <symbol> is non-rendering on its own but renders when instantiated.
+        const vpW = resolveLength(attrs.width, inherited.viewport.w);
+        const vpH = resolveLength(attrs.height, inherited.viewport.h);
+        if (vpW === null || vpH === null) {
+          ctx.unresolved.add('use-viewport');
+          return;
+        }
+        let matrix = useMatrix;
+        // The referenced tree's own transform is part of the instantiation.
+        matrix = matrixFrom(effectiveAttrs(target), matrix, ctx);
+        if (effectiveAttrs(target).viewBox) {
+          matrix = multiplyMatrix(
+            matrix,
+            viewBoxMatrix(
+              parseViewBox(effectiveAttrs(target)),
+              { x: 0, y: 0, w: vpW, h: vpH },
+              effectiveAttrs(target).preserveAspectRatio,
+            ),
+          );
+        }
+        const childLocal = { ...local, matrix, viewport: { w: vpW, h: vpH } };
+        for (const child of target.children || []) collect(child, childLocal, sink, ctx);
+        return;
+      }
+      if (targetTag === 'svg') {
+        // Let the nested-viewport branch apply the viewBox exactly once. The
+        // <use> width/height override the target's own, and x/y are already in
+        // `useMatrix`, so the clone is placed at the origin.
+        const overrides = { ...effectiveAttrs(target), x: '0', y: '0' };
+        if (attrs.width !== undefined) overrides.width = attrs.width;
+        if (attrs.height !== undefined) overrides.height = attrs.height;
+        collect({ ...target, attrs: overrides }, local, sink, inner);
+        return;
+      }
+      if (NON_RENDERING.has(targetTag)) {
+        ctx.unresolved.add('use-target-not-renderable');
+        return;
+      }
+      collect(target, local, sink, inner);
+    });
+    return out;
+  }
+
+  // --- a shape is ink ------------------------------------------------------
+  if (SHAPES.has(tag)) {
+    if (visible) {
+      if (attrs['clip-path'] && !/^none$/i.test(attrs['clip-path'].trim())) {
+        // Clipping a shape to itself needs the intersection of two outlines.
+        ctx.unresolved.add('clip-path');
+        return out;
+      }
+      const d = tag === 'path' ? attrs.d || '' : shapeToPath(tag, attrs);
+      if (!d) {
+        ctx.unresolved.add('unparsed-shape');
+      } else {
+        const strokeWidth = strokeWidthOf(attrs, inherited, ctx);
+        out.push({
+          d,
+          matrix: own,
+          filled: (attrs.fill ?? inherited.fill) !== 'none' && (fillOpacityOf(attrs, inherited) !== 0),
+          stroked: (attrs.stroke ?? inherited.stroke) !== undefined && (attrs.stroke ?? inherited.stroke) !== 'none',
+          strokeWidth: Number.isFinite(strokeWidth) ? strokeWidth : 1,
+          // Even `fill-rule` is inherited, and an inherited `evenodd` changes the
+          // area of every child path.
+          fillRule: (attrs['fill-rule'] || inherited.fillRule || 'nonzero').toLowerCase(),
+        });
+      }
     }
     return out;
   }
 
-  const matrix = attrs.transform
-    ? multiplyMatrix(inherited.matrix, parseTransform(attrs.transform))
-    : inherited.matrix;
-  const fill = attrs.fill !== undefined ? attrs.fill : inherited.fill;
-  const stroke = attrs.stroke !== undefined ? attrs.stroke : inherited.stroke;
-  const strokeWidth = attrs['stroke-width'] !== undefined
-    ? Number.parseFloat(attrs['stroke-width'])
-    : inherited.strokeWidth;
-  const fillRule = (attrs['fill-rule'] || inherited.fillRule || 'nonzero').toLowerCase();
-  const fillOpacity = attrs['fill-opacity'] !== undefined ? Number.parseFloat(attrs['fill-opacity']) : 1;
-
-  if (SHAPES.has(node.tag) && visible) {
-    const d = node.tag === 'path' ? attrs.d || '' : shapeToPath(node.tag, attrs);
-    if (!d) {
-      ctx.unresolved.add('unparsed-shape');
-    } else {
-      out.push({
-        d,
-        matrix,
-        filled: fill !== 'none' && fillOpacity !== 0,
-        stroked: stroke !== undefined && stroke !== 'none',
-        strokeWidth: Number.isFinite(strokeWidth) ? strokeWidth : 1,
-        fillRule,
-      });
-    }
-  }
-
-  for (const child of node.children || []) {
-    collect(
-      child,
-      { matrix, fill, stroke, strokeWidth, fillRule, visible, viewport: inherited.viewport },
-      out,
-      ctx,
-    );
-  }
+  // --- anything else with children is a container --------------------------
+  const bound = inheritedFor(attrs, inherited, visible, own);
+  withClip(attrs, own, ctx, out, (sink) => {
+    for (const child of node.children || []) collect(child, bound, sink, ctx);
+  });
   return out;
+}
+
+/**
+ * Resolve `clip-path` when it provably does not remove any ink.
+ *
+ * Icon exporters wrap everything in a clip the exact size of the canvas, so
+ * refusing every clip makes the checker blind on most real icon sets. A clip
+ * that would actually cut the drawing still becomes `unknown`: the remainder
+ * needs a boolean intersection of arbitrary outlines.
+ */
+function withClip(attrs, matrix, ctx, out, emit) {
+  const clipRaw = attrs['clip-path'];
+  if (!clipRaw || /^none$/i.test(String(clipRaw).trim())) {
+    emit(out);
+    return;
+  }
+  const rect = resolveClipRect(clipRaw, ctx, matrix);
+  if (!rect) {
+    ctx.unresolved.add('clip-path');
+    return;
+  }
+  const captured = [];
+  emit(captured);
+  if (captured.length === 0) return;
+  const box = bboxOfShapes(captured, ctx.steps);
+  if (box && !rectContains(rect, box)) {
+    ctx.unresolved.add('clip-path-cuts-ink');
+    return;
+  }
+  out.push(...captured);
 }
 
 function bboxUnion(a, b) {
@@ -491,26 +519,35 @@ function uniformScale(matrix) {
 }
 
 /**
- * Rendered px per user unit for the root element. `width="100"` with a 24-unit
- * viewBox means every measurement below is in 24ths, not pixels — reporting that
- * as `px` would inflate or deflate every verdict.
+ * Rendered px per user unit, per axis.
  *
- * The scale is only claimed when *both* dimensions are absolute. A single
- * `width="48"` or `height="100%"` leaves the rendered box unknowable, so the
- * icon convention (1 unit = 1px) applies and says so via `unitSource`.
+ * `width="100"` with a 24-unit viewBox means every measurement is in 24ths, not
+ * pixels — reporting that as `px` inflates or deflates every verdict. The scale
+ * is only claimed when *both* dimensions are absolute; a lone `width="48"` or
+ * `height="100%"` leaves the rendered box unknowable, so the icon convention
+ * (1 unit = 1px) applies and `source` says so.
+ *
+ * `preserveAspectRatio="none"` stretches the axes independently, so there is no
+ * single number: x and y are reported separately and `unitScale` is `null`.
  */
 function rootUnitScale(attrs, viewBox) {
-  const hasW = attrs.width !== undefined;
-  const hasH = attrs.height !== undefined;
-  if (!hasW && !hasH) return { scale: 1, source: 'assumed' };
+  const assumed = { x: 1, y: 1, uniform: 1, source: 'assumed' };
+  if (attrs.width === undefined && attrs.height === undefined) return assumed;
   const w = absolutePx(attrs.width);
   const h = absolutePx(attrs.height);
-  if (w === null || h === null) return { scale: 1, source: 'assumed' };
-  const sx = viewBox.w > 0 ? w / viewBox.w : 1;
-  const sy = viewBox.h > 0 ? h / viewBox.h : 1;
-  // preserveAspectRatio defaults to `meet`, so the smaller ratio is the one that
-  // actually scales the artwork.
-  return { scale: Math.min(sx, sy), source: 'declared' };
+  if (w === null || h === null) return assumed;
+  if (!(viewBox.w > 0) || !(viewBox.h > 0)) return assumed;
+
+  const rawX = w / viewBox.w;
+  const rawY = h / viewBox.h;
+  const par = String(attrs.preserveAspectRatio || '').trim();
+  if (par.toLowerCase().startsWith('none')) {
+    const uniform = Math.abs(rawX - rawY) < 1e-9 ? rawX : null;
+    return { x: rawX, y: rawY, uniform, source: 'declared' };
+  }
+  // `slice` fills the viewport (larger ratio wins), `meet` fits inside it.
+  const scale = /\bslice\b/i.test(par) ? Math.max(rawX, rawY) : Math.min(rawX, rawY);
+  return { x: scale, y: scale, uniform: scale, source: 'declared' };
 }
 
 /**
@@ -523,7 +560,11 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
   const ids = new Map();
   indexIds(svg, ids);
 
-  const { scale: unitScale, source: unitSource } = rootUnitScale(svg.attrs || {}, viewBox);
+  const unit = rootUnitScale(svg.attrs || {}, viewBox);
+  const unitScale = unit.uniform;
+  const unitScaleX = unit.x;
+  const unitScaleY = unit.y;
+  const unitSource = unit.source;
   const ctx = { ids, unresolved: new Set(), depth: 0, root: svg, steps };
   const shapes = collect(
     svg,
@@ -533,6 +574,7 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
       stroke: undefined,
       strokeWidth: 1,
       fillRule: 'nonzero',
+      fillOpacity: 1,
       visible: true,
       viewport: { w: viewBox.w, h: viewBox.h },
     },
@@ -599,6 +641,8 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
       strokeOnly: false,
       noInk: true,
       unitScale,
+      unitScaleX,
+      unitScaleY,
       unitSource,
       unresolved: [...ctx.unresolved],
     };
@@ -629,6 +673,8 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
     strokeOnly: filledArea === 0 && strokeArea > 0,
     noInk: totalArea <= 1e-9 || !finalBox,
     unitScale,
+    unitScaleX,
+    unitScaleY,
     unitSource,
     unresolved: [...ctx.unresolved],
   };
@@ -649,7 +695,9 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
     strokeOnly: shape.strokeOnly,
     ink: shape.ink,
     viewBox: shape.viewBox,
-    unitScale: shape.unitScale ?? 1,
+    unitScale: shape.unitScale ?? null,
+    unitScaleX: shape.unitScaleX ?? 1,
+    unitScaleY: shape.unitScaleY ?? 1,
     unitSource: shape.unitSource || 'assumed',
   };
 
@@ -683,10 +731,15 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
   const inkCenter = boxCenter(ink.bbox);
   // Measurements are taken in viewBox user units; offsets, tolerance basis and
   // suggestions are reported in rendered px.
-  const unitScale = shape.unitScale ?? 1;
-  const basis = (Math.min(viewBox.w, viewBox.h) || 24) * unitScale;
+  const sx = shape.unitScaleX ?? 1;
+  const sy = shape.unitScaleY ?? 1;
+  const basis = Math.min((viewBox.w || 24) * sx, (viewBox.h || 24) * sy);
   const scaleNote =
-    unitScale === 1 ? '' : ` [user units ×${round(unitScale, 4)} = px]`;
+    sx === 1 && sy === 1
+      ? ''
+      : sx === sy
+        ? ` [user units ×${round(sx, 4)} = px]`
+        : ` [user units ×${round(sx, 4)} = px horizontally, ×${round(sy, 4)} vertically]`;
 
   const dInkX = inkCenter.x - vbCenter.x;
   const dInkY = inkCenter.y - vbCenter.y;
@@ -694,8 +747,8 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
   findings.push({
     id: 'geometry/ink-bbox',
     layer: 'exact',
-    offset: dInkX * unitScale,
-    offsetY: dInkY * unitScale,
+    offset: dInkX * sx,
+    offsetY: dInkY * sy,
     basis,
     evidence:
       `ink bbox=(${round(ink.bbox.minX)},${round(ink.bbox.minY)})-` +
@@ -705,7 +758,7 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
       // Delta to add to the viewBox origin: moving the origin by +delta moves the
       // artwork by -delta, so this is the measured offset itself.
       kind: 'viewBox-origin',
-      value: `${round(dInkX * unitScale, 2)}px / ${round(dInkY * unitScale, 2)}px`,
+      value: `${round(dInkX * sx, 2)}px / ${round(dInkY * sy, 2)}px`,
       viewBox: `${round(viewBox.x + dInkX, 3)} ${round(viewBox.y + dInkY, 3)} ${round(viewBox.w, 3)} ${round(viewBox.h, 3)}`,
     },
   });
@@ -716,19 +769,20 @@ export function checkShape(shape, { mode = 'standalone', target = '<inline>' } =
   findings.push({
     id: 'geometry/centroid',
     layer: 'exact',
-    offset: -shiftX * unitScale,
-    offsetY: -shiftY * unitScale,
-    basis: Math.max(ink.bbox.maxX - ink.bbox.minX, 1) * unitScale,
+    offset: -shiftX * sx,
+    offsetY: -shiftY * sy,
+    basis: Math.max((ink.bbox.maxX - ink.bbox.minX) * sx, 1),
     evidence:
       `area=${round(ink.area)} centroid=(${round(ink.centroid.cx)},${round(ink.centroid.cy)}) ` +
       `ink centre=(${round(inkCenter.x)},${round(inkCenter.y)})${scaleNote}`,
     suggested: {
-      kind: 'optical-shift',
-      // Both axes: a diagonal imbalance is not fixable by nudging x alone.
+      // Translating the artwork moves the centroid and the box together, so it
+      // cannot change this number: the mass distribution itself has to change.
+      kind: 'redraw',
       value:
-        Math.abs(shiftY * unitScale) < 0.005
-          ? `${round(shiftX * unitScale, 2)}px`
-          : `${round(shiftX * unitScale, 2)}px / ${round(shiftY * unitScale, 2)}px`,
+        Math.abs(shiftY * sy) < 0.005
+          ? `move the visual mass ${round(shiftX * sx, 2)}px`
+          : `move the visual mass ${round(shiftX * sx, 2)}px / ${round(shiftY * sy, 2)}px`,
     },
   });
 
@@ -766,14 +820,15 @@ export async function checkIconSet(dir, { threshold = 0.2 } = {}) {
     const shape = analyzeSvg(text);
     const boxArea = (shape.viewBox.w || 1) * (shape.viewBox.h || 1);
     const ratio = shape.ink.area / boxArea;
-    const unit = shape.unitScale ?? 1;
+    const unitX = shape.unitScaleX ?? 1;
+    const unitY = shape.unitScaleY ?? 1;
     rows.push({
       file,
       ratio,
       linear: Math.sqrt(Math.max(ratio, 0)),
       // The fill ratio is unitless, but the overshoot below is a length, so the
       // reference size must be in rendered px.
-      size: Math.min(shape.viewBox.w, shape.viewBox.h) * unit,
+      size: Math.min(shape.viewBox.w * unitX, shape.viewBox.h * unitY),
       strokeOnly: shape.strokeOnly,
       noInk: shape.noInk,
       unresolved: shape.unresolved.length > 0,

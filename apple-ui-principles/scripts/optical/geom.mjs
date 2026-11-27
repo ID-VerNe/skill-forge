@@ -301,7 +301,12 @@ export function applyMatrix(m, x, y) {
   return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
 }
 
-/** Parse an SVG transform list into a single matrix. */
+/**
+ * Parse an SVG transform list into a single matrix.
+ * @returns {number[]|null} `null` when any argument cannot be resolved to a
+ *   number. Dropping the bad argument would shift the rest left — `translate(10%,8)`
+ *   would silently become `translate(8,0)` — so the whole transform is refused.
+ */
 export function parseTransform(value) {
   if (!value) return IDENTITY;
   let result = IDENTITY;
@@ -309,14 +314,26 @@ export function parseTransform(value) {
   let match = re.exec(value);
   while (match) {
     const name = match[1];
-    const args = match[2]
-      .split(/[\s,]+/)
-      .map(Number)
-      .filter((n) => !Number.isNaN(n));
+    const args = [];
+    for (const raw of match[2].split(/[\s,]+/).filter((part) => part !== '')) {
+      if (name === 'rotate' || name === 'skewX' || name === 'skewY') {
+        const m = /^(-?\d*\.?\d+)(deg|grad|rad|turn)?$/.exec(raw);
+        if (!m) return null;
+        let angle = Number.parseFloat(m[1]);
+        if (m[2] === 'rad') angle = (angle * 180) / Math.PI;
+        else if (m[2] === 'grad') angle = angle * 0.9;
+        else if (m[2] === 'turn') angle = angle * 360;
+        args.push(angle);
+      } else {
+        if (!/^-?\d*\.?\d+$/.test(raw)) return null;
+        args.push(Number.parseFloat(raw));
+      }
+    }
     let m = IDENTITY;
     switch (name) {
       case 'matrix':
         if (args.length === 6) m = args;
+        else return null;
         break;
       case 'translate':
         m = [1, 0, 0, 1, args[0] || 0, args[1] || 0];
@@ -350,7 +367,7 @@ export function parseTransform(value) {
         m = [1, Math.tan(((args[0] || 0) * Math.PI) / 180), 0, 1, 0, 0];
         break;
       default:
-        break;
+        return null;
     }
     result = multiplyMatrix(result, m);
     match = re.exec(value);
