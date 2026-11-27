@@ -148,11 +148,21 @@ refuse*, never approximate:
 | any other geometry (circles, paths, rounded rects, multiple children, `objectBoundingBox`) | `clip-path`, `unknown` |
 | a shape clipping itself | `clip-path`, `unknown` — the container walk would drop the shape |
 
-On a viewport-establishing element (`<use>` of a `<symbol>`, nested `<svg>`) the
-clip's coordinate space is ambiguous — authored in the outer space or the inner
-one? The checker resolves the clip in **both** readings and passes only when both
-contain the ink, so an ambiguous clip can only produce a refusal, never a wrong
-pass.
+Each of those elements resolves its clip in a different space, and two of the
+three are not where the spec prose makes them look:
+
+| Clip sits on | Resolved in | What that was measured with |
+|---|---|---|
+| a plain container (`<g>`, `<path>`, …) | that element's own user space | — |
+| `<use>` | **after** the element's own `x`/`y` | `x="6"`, clip `0 0 12 12` → the whole 12×12 drawn; clip `6 6 12 12` → 6×6 drawn |
+| nested `<svg>` | the space its `viewBox` establishes — the **inner** one | 5 clip units over a 10-unit viewBox scaled 2.4× → 12 px of ink, not 5 |
+| `<symbol>` | the same inner space | identical to the nested `<svg>` above |
+
+All four rows were rendered and measured in headless Chrome on one 24×24
+drawing, not reasoned out: reading a nested `<svg>` clip in the outer space is
+what the property's wording invites and it is wrong, which is why a symbol and
+a nested `<svg>` of the same artwork used to disagree. The three tests in
+`regression.test.mjs` that pin this down are cheaper than re-deriving it.
 
 A `clip-path` on a shape that clips **itself** needs the intersection of two
 outlines, so it is refused. A `clip-path` on a `transform`ed clip rect is refused
@@ -559,8 +569,9 @@ codes stay distinct so a broken project never looks like an unverifiable one.
 - `<use>` resolution is single-target and single-pass, capped at three levels
   of nesting. Targets without their own `viewBox` inherit the caller's user
   space; targets sized in relative units degrade to `unknown`.
-- Nested `<svg>` viewports are transformed but not clipped (§1 "Nested
-  viewports").
+- Nested `<svg>` viewports clip their content. Ink that escapes the viewport is
+  detected and refused (`ink-outside-viewport`); the trimmed remainder is never
+  computed (§1 "Nested viewports", "Clips").
 - Tailwind numeric scales are **v3's**. v4 derives every radius from
   `--radius-*`, so a themed project may disagree with `titleRadius()`. That is
   why non-concentric radius is `heuristic` and capped at `nudge`.

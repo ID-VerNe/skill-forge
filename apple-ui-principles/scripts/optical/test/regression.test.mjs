@@ -886,16 +886,56 @@ test('a self-referencing <symbol> terminates instead of overflowing the stack', 
   assert.ok(shape.unresolved.includes('use-nested-too-deep'), JSON.stringify(shape.unresolved));
 });
 
-test('a clip on a viewport element must contain the ink under both readings', () => {
-  // The clip rect is authored in the outer space (0..24). Read in the inner
-  // space of a 10-unit viewBox scaled 2.4x it would cover 0..57.6, so a naive
-  // single-reading check could pass a clip that actually cuts.
+test('a clip on a viewport element is read in the space its viewBox establishes', () => {
+  // 10 clip units over a 10-unit viewBox scaled 2.4x covers the whole drawing.
+  // Read in the outer space it would cover only 10 of 24 units and look like a
+  // cut — headless Chrome draws all 24, so the inner space is the real one.
   const body =
     '<defs><clipPath id="c"><rect x="0" y="0" width="10" height="10"/></clipPath></defs>' +
     '<svg clip-path="url(#c)" width="24" height="24" viewBox="0 0 10 10">' +
     '<rect x="0" y="0" width="10" height="10"/></svg>';
   const shape = analyzeSvg(svg(body));
-  assert.ok(shape.unresolved.includes('clip-path-cuts-ink'), JSON.stringify(shape.unresolved));
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 576, 1e-6);
+});
+
+test('a symbol and a nested <svg> of one drawing get one verdict', () => {
+  // Same pixels, two spellings. They must not disagree — that is the whole
+  // point of resolving clip in the space the element actually uses.
+  const clip = '<clipPath id="c"><rect width="10" height="10"/></clipPath>';
+  const symbol = analyzeSvg(
+    svg(
+      `${clip}<symbol id="s" viewBox="0 0 10 10" clip-path="url(#c)">` +
+        '<rect width="10" height="10"/></symbol><use href="#s" width="24" height="24"/>',
+    ),
+  );
+  const nested = analyzeSvg(
+    svg(
+      `${clip}<svg viewBox="0 0 10 10" width="24" height="24" clip-path="url(#c)">` +
+        '<rect width="10" height="10"/></svg>',
+    ),
+  );
+  assert.deepEqual(symbol.unresolved, []);
+  assert.deepEqual(nested.unresolved, []);
+  near(symbol.ink.area, nested.ink.area, 1e-6);
+  near(symbol.ink.centroid.cx, nested.ink.centroid.cx, 1e-6);
+  near(symbol.ink.centroid.cy, nested.ink.centroid.cy, 1e-6);
+});
+
+test("a clip on a <use> is read after the element's own x/y", () => {
+  // The referenced 12x12 square lands at 6..18 either way; only the clip moves.
+  // Chrome draws it whole when the clip says 0..12 and cuts it to 6x6 when the
+  // clip says 6..18, which is `x`/`y` applied to the clip and not to the content.
+  const at = (clipRect) =>
+    `<defs><clipPath id="c"><rect ${clipRect}/></clipPath><g id="g">` +
+    '<rect width="12" height="12"/></g></defs><use href="#g" x="6" y="6" clip-path="url(#c)"/>';
+  const whole = analyzeSvg(svg(at('x="0" y="0" width="12" height="12"')));
+  assert.deepEqual(whole.unresolved, []);
+  near(whole.ink.area, 144, 1e-6);
+  near(whole.ink.bbox.minX, 6, 1e-6);
+
+  const cut = analyzeSvg(svg(at('x="6" y="6" width="12" height="12"')));
+  assert.ok(cut.unresolved.includes('clip-path-cuts-ink'), JSON.stringify(cut.unresolved));
 });
 
 test('a display conflict that stays flexy is still a defect', () => {

@@ -598,7 +598,7 @@ function collect(node, inherited, out, ctx) {
     const local = inheritedFor(attrs, inherited, visible, matrix, ctx);
     local.viewport = { w: vpW, h: vpH };
     // The clip applies in the *inner* coordinate system, after the viewBox map.
-    withClip(attrs, [own, matrix], ctx, out, (sink) => {
+    withClip(attrs, matrix, ctx, out, (sink) => {
       withViewport({ x: 0, y: 0, w: vpW, h: vpH }, outerMatrix, ctx, sink, (inner) => {
         for (const child of node.children || []) collect(child, local, inner, ctx);
       });
@@ -638,10 +638,10 @@ function collect(node, inherited, out, ctx) {
     const inner = { ...ctx, depth: ctx.depth + 1 };
     const local = inheritedFor(attrs, inherited, visible, useMatrix, ctx);
 
-    // `clip-path` on a <use> is resolved in the element's own user space, which
-    // is the parent's — `x`/`y` translate the *referenced content*, not the
-    // <use> itself. So `own`, not `useMatrix`.
-    withClip(attrs, [own], ctx, out, (sink) => {
+    // `clip-path` on a <use> is resolved in the space *after* its own `x`/`y`
+    // translate: the attributes act like a transform on the element, and a clip
+    // is resolved in the element's own local space. Measured, not assumed.
+    withClip(attrs, useMatrix, ctx, out, (sink) => {
       if (targetTag === 'symbol') {
         // <symbol> is non-rendering on its own but renders when instantiated.
         const vpW = resolveLength(attrs.width, inherited.viewport.w);
@@ -688,7 +688,7 @@ function collect(node, inherited, out, ctx) {
         // A symbol clips to the viewport the <use> gives it, exactly like a
         // nested <svg>. Its own clip-path is in the symbol's user space, which
         // is the one its viewBox establishes — `matrix`, not `useMatrix`.
-        withClip(symbolAttrs, [matrix], ctx, sink, (clipped) => {
+        withClip(symbolAttrs, matrix, ctx, sink, (clipped) => {
           withViewport({ x: 0, y: 0, w: vpW, h: vpH }, useMatrix, ctx, clipped, (viewport) => {
             for (const child of target.children || []) collect(child, symbolLocal, viewport, inner);
           });
@@ -775,7 +775,7 @@ function collect(node, inherited, out, ctx) {
 
   // --- anything else with children is a container --------------------------
   const bound = inheritedFor(attrs, inherited, visible, own, ctx);
-  withClip(attrs, [own], ctx, out, (sink) => {
+  withClip(attrs, own, ctx, out, (sink) => {
     for (const child of node.children || []) collect(child, bound, sink, ctx);
   });
   return out;
@@ -821,30 +821,27 @@ function withViewport(rect, outerMatrix, ctx, out, emit) {
  * refusing every clip makes the checker blind on most real icon sets. A clip
  * that would actually cut the drawing still becomes `unknown`: the remainder
  * needs a boolean intersection of arbitrary outlines.
+ *
+ * `space` maps the user space the clip is resolved in to root space — each
+ * caller passes the one that applies to its element (`optical-model.md` records
+ * how each was pinned down, because two of the three are not where they look).
  */
-function withClip(attrs, matrices, ctx, out, emit) {
+function withClip(attrs, space, ctx, out, emit) {
   const clipRaw = attrs['clip-path'];
   if (!clipRaw || /^none$/i.test(String(clipRaw).trim())) {
     emit(out);
     return;
   }
-  const rects = [];
-  for (const matrix of matrices) {
-    const rect = resolveClipRect(clipRaw, ctx, matrix);
-    if (!rect) {
-      ctx.unresolved.add('clip-path');
-      return;
-    }
-    rects.push(rect);
+  const rect = resolveClipRect(clipRaw, ctx, space);
+  if (!rect) {
+    ctx.unresolved.add('clip-path');
+    return;
   }
   const captured = [];
   emit(captured);
   if (captured.length === 0) return;
   const box = bboxOfShapes(captured, ctx.steps, ctx);
-  // A viewport-establishing element is clipped in one of two plausible spaces
-  // (before or after its own viewBox). Passing only when *both* readings contain
-  // the ink keeps the decision conservative.
-  if (box && !rects.every((rect) => rectContains(rect, box))) {
+  if (box && !rectContains(rect, box)) {
     ctx.unresolved.add('clip-path-cuts-ink');
     return;
   }
