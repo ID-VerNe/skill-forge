@@ -52,7 +52,9 @@ Two rules keep that pipeline from lying:
   that doubled the band (402px² where Chrome draws 201) and pushed a stroked box
   outside its own canvas. Under `preserveAspectRatio="none"` the two axes carry
   different px-per-unit factors, so a single width cannot describe the band and
-  the file is refused as `non-scaling-stroke-scale`. A stylesheet may set the
+  the file is refused as `non-scaling-stroke-scale`. A `%` width has already been
+  resolved through the viewport diagonal, so it is **not** divided again. A
+  stylesheet may set the
   property too; the cascade carries `vector-effect` like any other paint property.
 - **A paint value that does not parse is not a colour.** `fill`/`stroke` were
   asked one question — *is this the string `none`?* — and everything else became
@@ -121,7 +123,8 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
 | a `transform` that is not a bare-number list — a unit (`translate(2px,0)`, `rotate(45deg)`), a percentage, `var()`, an unknown function, wrong argument count, empty argument (`translate(10,)`), trailing junk, a trailing dot (`translate(6.,6.)`) | measured **untransformed**, with no finding — the engine drops the whole attribute, so the element sits in its parent's space. The parseable prefix is never applied: that would turn `translate(10%,8)` into `translate(8,0)`. A sign is a number (`+4`) and adjacent signed numbers are two of them (`6-6`, `.5.5`), both applied |
-| a `stroke-width` in any unit — `10%` (`stroke-width-percentage`), or `2pt` / `1em` / `1in` (`stroke-width-relative`), on the shape **or any ancestor** | `geometry/unresolved-graphics`. The percentage is relative to a viewport the file does not fix, and the absolute units are declined on purpose: `pt`, `pc`, `mm` and `in` would each need a px-per-unit constant, which is a second place to be wrong about the same number. `2px` is accepted — one px *is* one user unit. Write the others in user units |
+| a `stroke-width` in `%` with no declared viewBox and no absolute root sides | `geometry/unresolved-graphics` (`stroke-width-percentage`) — there is no real diagonal to take the percentage of; the nominal 24×24 canvas is a comparison convention, not a viewport. With a viewBox, `10%` is 10% of the normalised diagonal and is measured (2.4 units on a 24-unit canvas, Chrome-verified at both 24px and 48px render sizes) |
+| a `stroke-width` in `2pt` / `1em` / `1in` (`stroke-width-relative`), on the shape **or any ancestor** | `geometry/unresolved-graphics`. Absolute units are declined on purpose: `pt`, `pc`, `mm` and `in` would each need a px-per-unit constant, which is a second place to be wrong about the same number. `2px` is accepted — one px *is* one user unit. Write the others in user units |
 | a `stroke-width` that overflows to infinity (`1e999`) | `geometry/unresolved-graphics` (`stroke-width-not-finite`) — one engine clamps it to the largest length and paints over the canvas, another drops the declaration |
 | a `stroke-width` that is finite but whose band area is not (`1e308`) | `geometry/unresolved-graphics` (`non-finite-ink`) — `width × length` overflows to `Infinity` and the centroid comes back `NaN`; `NaN` compares false against every tolerance, so without this check the report reads `off` with a `NaN` displacement instead of admitting it has no measurement |
 | a `d` the path parser rejects or only partially parses | `geometry/unresolved-graphics` (`unparsed-path`) — svgpath reports `M0 0 L` as "missed param" and still returns one point |
@@ -289,6 +292,13 @@ Both cases build the SVG 1.1 viewBox transform:
 scale  = min(viewport.w / vb.w, viewport.h / vb.h)     // preserveAspectRatio: meet
 offset = viewport.origin + (viewport.size − vb.size·scale)·align − vb.origin·scale
 ```
+
+The attribute's keywords are **case-sensitive** and its grammar is
+`[defer] <align> [<meetOrSlice>]` or `none` alone. Chrome drops
+`xMidYMid SLICE`, `xmidymid slice` and `xMidYMid slice defer` wholesale and
+renders the default `xMidYMid meet`. Lower-casing the value used to make the
+model invent a 2× canvas scale for those files and report a centred icon as
+`nudge`. `defer`, when legal, changes no geometry.
 
 `preserveAspectRatio="none"` switches to independent `sx`/`sy`. A `<use>` of a
 `<symbol>` gets a viewport of `(x, y, width ?? 100%, height ?? 100%)`; a nested
@@ -680,8 +690,20 @@ claim to make).
 
 ## 8. `#7` cap midpoint
 
-Let `upem` be units per em, `asc`/`desc` the hhea ascender/descender, `cap` the
-OS/2 `sCapHeight`, `S` the font size and `L` the line-height.
+Let `upem` be units per em, `asc`/`desc` the ascender/descender the text engine
+actually uses, `cap` the OS/2 `sCapHeight`, `S` the font size and `L` the
+line-height.
+
+**`asc`/`desc` are not always `hhea`.** Chrome on Windows takes OS/2
+`sTypoAscender`/`sTypoDescender` when `fsSelection` bit 7 (`USE_TYPO_METRICS`) is
+set, and `usWinAscent`/`usWinDescent` otherwise. Calibri's hhea pair is
+1536/−512, which predicts −2.109px at 32px; its win pair is 1950/550, predicting
++0.828px, and Chrome renders +0.844px — the sign was reversed. Arial Black and
+Cascadia show the same rule; six other Windows fonts happened to have identical
+hhea and win pairs, which is why only two fonts exposed the bug. The chosen pair
+is reported as `metricSource` (`os2-typo` / `os2-win` / `hhea` when neither OS/2
+pair is populated, as in generated test fonts). Values are Chrome-on-Windows
+calibrated; other platforms may use another pair.
 
 ```
 content height  C = (asc − desc)/upem · S

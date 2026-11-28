@@ -20,6 +20,14 @@ function fail(code, message) {
  * Half-leading shifts the cap top and the box centre by the same amount, so
  * line-height cancels out entirely:
  *   delta = fontSize * (ascender + descender - capHeight) / (2 * upem)
+ *
+ * The ascender/descender pair is the one the text engine actually uses for the
+ * line box, **not** necessarily `hhea`. Chrome on Windows uses OS/2 `sTypo*`
+ * when `fsSelection` bit 7 (`USE_TYPO_METRICS`) is set and `usWinAscent` /
+ * `usWinDescent` otherwise. Calibri is the failure this distinction fixes:
+ * hhea gives 1536/-512 (−2.109px at 32px) while win gives 1950/550 (+0.828px);
+ * Chrome renders +0.844px. The sign was reversed. `metricSource` records which
+ * pair was chosen so the number is auditable.
  */
 export function capMidpointDelta(metrics, { fontSize, lineHeight } = {}) {
   if (!metrics || !(metrics.upem > 0)) {
@@ -76,13 +84,26 @@ export function readFontMetrics(buffer) {
   const upem = head.offset + 18 + 2 <= buf.length ? buf.readUInt16BE(head.offset + 18) : 0;
   if (!upem) throw fail('ERR_FONT_METRICS', 'unitsPerEm is zero');
 
-  const ascender = buf.readInt16BE(hhea.offset + 4);
-  const descender = buf.readInt16BE(hhea.offset + 6);
+  const hheaAscender = buf.readInt16BE(hhea.offset + 4);
+  const hheaDescender = buf.readInt16BE(hhea.offset + 6);
 
   let capHeight;
-  if (os2 && os2.offset + 2 <= buf.length) {
-    const version = buf.readUInt16BE(os2.offset);
-    if (version >= 2 && os2.offset + 90 <= buf.length) {
+  let os2Version = 0;
+  let selection = 0;
+  let typoAscender = 0;
+  let typoDescender = 0;
+  let winAscender = 0;
+  let winDescender = 0;
+  if (os2 && os2.offset + 78 <= buf.length) {
+    os2Version = buf.readUInt16BE(os2.offset);
+    if (os2Version >= 1) {
+      selection = buf.readUInt16BE(os2.offset + 62);
+      typoAscender = buf.readInt16BE(os2.offset + 68);
+      typoDescender = buf.readInt16BE(os2.offset + 70);
+      winAscender = buf.readUInt16BE(os2.offset + 74);
+      winDescender = buf.readUInt16BE(os2.offset + 76);
+    }
+    if (os2Version >= 2 && os2.offset + 90 <= buf.length) {
       capHeight = buf.readInt16BE(os2.offset + 88);
     }
   }
@@ -90,5 +111,24 @@ export function readFontMetrics(buffer) {
     throw fail('ERR_FONT_METRICS', 'OS/2 table has no sCapHeight (version < 2)');
   }
 
-  return { upem, ascender, descender, capHeight };
+  // Bit 7 says the typo pair is authoritative. A zero pair (common in generated
+  // test fonts) is not authoritative — it would put the baseline off the canvas.
+  let ascender;
+  let descender;
+  let metricSource;
+  if ((selection & 0x80) && typoAscender > 0 && typoDescender < 0) {
+    ascender = typoAscender;
+    descender = typoDescender;
+    metricSource = 'os2-typo';
+  } else if (winAscender > 0 && winDescender > 0) {
+    ascender = winAscender;
+    descender = -winDescender;
+    metricSource = 'os2-win';
+  } else {
+    ascender = hheaAscender;
+    descender = hheaDescender;
+    metricSource = 'hhea';
+  }
+
+  return { upem, ascender, descender, capHeight, metricSource, os2Version };
 }

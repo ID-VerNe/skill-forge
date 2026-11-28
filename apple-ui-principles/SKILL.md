@@ -38,7 +38,7 @@ Mathematical perfection often looks visually wrong because **"the human eye is n
 - **Action (preferred):** `text-box: trim-both cap alphabetic;` — Baseline since August 2026 (Chrome 133+, Safari 18.2+, Firefox 154+).
 - **Critical caveat:** `text-box` has **no effect on flex or grid containers**, and Chromium does not trim inline boxes. Button labels almost always live in a flex container, so the declaration silently no-ops. Apply it on an inline child, or check the report for `rule/text-box-in-flex`.
 - **What the checker accepts as "armed":** only `trim-both` / `trim-start` / `trim-end`, in the longhand or shorthand, resolved in source order. `text-box: normal` and `text-box: cap alphabetic` reset trimming to `none` (omitted shorthand components take their initial value), so neither is reported. `display: flex !important` still counts as flex; `display: var(--d)` and contexts that disagree about `display` report `unknown`.
-- **Legacy fallback:** if the target browser lacks `text-box`, compute the exact compensation with `#7` rather than guessing `margin-top: -1px`. The offset is `fontSize × (ascender + descender − capHeight) / (2 × upem)` and is independent of `line-height`.
+- **Legacy fallback:** if the target browser lacks `text-box`, compute the compensation with `#7` rather than guessing `margin-top: -1px`. The offset is `fontSize × (ascender + descender − capHeight) / (2 × upem)`, independent of `line-height`. The ascender/descender are the pair the browser uses for the line box (OS/2 typo or win, not necessarily hhea); the checker reports which pair it picked as `metricSource`. Values are calibrated to Chrome on Windows.
 
 ### 4. Optical Illusions & Mach Bands (侧抑制与视觉错觉) [不可校验]
 

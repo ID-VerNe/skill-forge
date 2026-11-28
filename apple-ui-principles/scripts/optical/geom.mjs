@@ -1149,24 +1149,48 @@ export function shapeToPath(tag, attrs) {
  * reads as a large offset in the report and as "the artwork is off-centre" in
  * the fix. `preserveAspectRatio` defaults to `xMidYMid meet`.
  */
+/**
+ * Parse `preserveAspectRatio` the way the engine does: the keywords are
+ * case-sensitive and the grammar is `[defer] <align> [<meetOrSlice>]` or `none`.
+ *
+ * Lower-casing the value turned `xMidYMid SLICE`, `xmidymid slice` and
+ * `xMidYMid slice defer` into valid-looking slice declarations. Chrome drops
+ * all three (the attribute is case-sensitive) and renders `xMidYMid meet`.
+ * Measuring them as slice invented a 2x canvas scale and promoted `ok` to
+ * `nudge`. `defer` is only legal as a leading token and changes no geometry.
+ *
+ * @returns {{mode: 'none'|'meet'|'slice', align: string}} — invalid values fall
+ *   back to the SVG default, which is what the browser does.
+ */
+export function parsePreserveAspectRatio(value) {
+  const tokens = String(value || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (tokens[0] === 'defer') tokens.shift();
+  if (tokens.length === 1 && tokens[0] === 'none') return { mode: 'none', align: 'xMidYMid' };
+  if (tokens.length < 1 || tokens.length > 2) return { mode: 'meet', align: 'xMidYMid' };
+  if (!/^x(Min|Mid|Max)Y(Min|Mid|Max)$/.test(tokens[0])) {
+    return { mode: 'meet', align: 'xMidYMid' };
+  }
+  const mode = tokens[1] === undefined ? 'meet' : tokens[1] === 'slice' ? 'slice' : null;
+  return mode === null ? { mode: 'meet', align: 'xMidYMid' } : { mode, align: tokens[0] };
+}
+
 export function viewBoxMatrix(vb, rect, preserveAspectRatio = '') {
   const w = rect.w;
   const h = rect.h;
   if (!(vb.w > 0) || !(vb.h > 0)) return [1, 0, 0, 1, rect.x, rect.y];
 
-  const par = String(preserveAspectRatio || '').trim();
-  if (par.toLowerCase().startsWith('none')) {
+  const { mode, align } = parsePreserveAspectRatio(preserveAspectRatio);
+  if (mode === 'none') {
     const sx = w / vb.w;
     const sy = h / vb.h;
     return [sx, 0, 0, sy, rect.x - vb.x * sx, rect.y - vb.y * sy];
   }
 
-  const parts = par.split(/\s+/);
-  const align = parts[0] && /^(x(Min|Mid|Max))(Y(Min|Mid|Max))$/.test(parts[0]) ? parts[0] : 'xMidYMid';
-  const meetOrSlice = (parts[1] || 'meet').toLowerCase();
-
   const scale =
-    meetOrSlice === 'slice'
+    mode === 'slice'
       ? Math.max(w / vb.w, h / vb.h)
       : Math.min(w / vb.w, h / vb.h);
 

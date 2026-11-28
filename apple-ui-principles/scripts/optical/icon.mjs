@@ -24,6 +24,7 @@ import {
   parseLength,
   CSS_NUMBER,
   numberList,
+  parsePreserveAspectRatio,
   viewBoxMatrix,
   IDENTITY,
 } from './geom.mjs';
@@ -545,18 +546,52 @@ function paintServerPaints(target, ctx, depth = 0) {
 }
 
 /**
- * `stroke-width` is in user units, or a percentage of the viewport diagonal —
- * which needs a rendered viewport we do not have. Refuse the percentage rather
- * than read "10%" as ten units. The same refusal has to apply on ancestors,
- * because `stroke-width` inherits: a `<g stroke-width="10%">` is exactly as
- * unknowable as a `<path stroke-width="10%">`.
+ * The normalised diagonal a `stroke-width="10%"` is a percentage of.
+ *
+ * SVG defines the percentage against `sqrt((vb.w² + vb.h²) / 2)` — in **user
+ * units**, so a 48px canvas over a 24-unit viewBox still gives 24 units and 10%
+ * is a 2.4-unit band. Refusing every percentage because the viewport "is not
+ * fixed" was wrong whenever the file declares an absolute canvas and a viewBox;
+ * Chrome measures it, and the file carries every number needed to do the same.
+ * Without either, the basis really is unknowable and the caller still refuses.
+ */
+function viewportDiagonal(ctx) {
+  const root = ctx.root;
+  if (!root || !root.attrs) return null;
+  // `parseViewBox` supplies a nominal 24x24 when nothing is declared. That is a
+  // comparison convention, not a canvas, so a percentage against it would be a
+  // guess. Only a declared viewBox or absolute sides give a real diagonal.
+  const w = absolutePx(root.attrs.width);
+  const h = absolutePx(root.attrs.height);
+  if (root.attrs.viewBox === undefined && (w === null || h === null)) return null;
+  const vb = parseViewBox(root.attrs);
+  if (vb && vb.w > 0 && vb.h > 0) return Math.hypot(vb.w, vb.h) / Math.SQRT2;
+  if (w > 0 && h > 0) return Math.hypot(w, h) / Math.SQRT2;
+  return null;
+}
+
+/**
+ * `stroke-width` is in user units, or a percentage of the viewport diagonal.
+ * The percentage has to resolve on ancestors too, since `stroke-width`
+ * inherits: a `<g stroke-width="10%">` is as measurable as a `<path>` with the
+ * same declaration once the root viewport is in the file.
  */
 function strokeWidthOf(attrs, inherited, ctx) {
   if (attrs['stroke-width'] === undefined) return inherited.strokeWidth;
   const raw = String(attrs['stroke-width']).trim();
   if (/%$/.test(raw)) {
-    ctx.unresolved.add('stroke-width-percentage');
-    return inherited.strokeWidth;
+    const number = raw.slice(0, -1);
+    const basis = CSS_NUMBER.test(number) ? viewportDiagonal(ctx) : null;
+    if (basis === null) {
+      ctx.unresolved.add('stroke-width-percentage');
+      return inherited.strokeWidth;
+    }
+    const value = (Number(number) / 100) * basis;
+    if (!Number.isFinite(value) || value < 0) {
+      ctx.unresolved.add('stroke-width-percentage');
+      return inherited.strokeWidth;
+    }
+    return value;
   }
   const value = parseLength(raw);
   if (value === null) {
@@ -655,6 +690,11 @@ function inheritedFor(attrs, inherited, visible, matrix, ctx) {
     fill: paintValue(attrs.fill, inherited.fill, 'black', color),
     stroke: paintValue(attrs.stroke, inherited.stroke, 'none', color),
     strokeWidth: strokeWidthOf(attrs, inherited, ctx),
+    // A % width is already expressed in user units through the viewport
+    // diagonal. With `non-scaling-stroke` the usual px→unit division must be
+    // skipped, or the same 10% is converted twice.
+    strokeWidthFromViewport:
+      inherited.strokeWidthFromViewport || /%$/.test(String(attrs['stroke-width'] ?? '')),
     fillRule: fillRuleOf(attrs, inherited),
     // `fill-opacity` is inherited; `opacity` is not (it composites the group).
     fillOpacity: resolveOpacity(attrs['fill-opacity'], inherited.fillOpacity),
@@ -1038,6 +1078,8 @@ function collect(node, inherited, out, ctx) {
           // must not multiply it by the matrix.
           nonScalingStroke:
             String(attrs['vector-effect'] ?? '').trim().toLowerCase() === 'non-scaling-stroke',
+          strokeWidthFromViewport:
+            inherited.strokeWidthFromViewport || /%$/.test(String(attrs['stroke-width'] ?? '')),
           // Even `fill-rule` is inherited, and an inherited `evenodd` changes the
           // area of every child path.
           fillRule: fillRuleOf(attrs, inherited),
@@ -1232,7 +1274,11 @@ function zeroSided(attrs) {
  *   refuse rather than assume; `{x,y,w,h}` in user units otherwise.
  */
 function visibleUserRect(attrs, viewBox) {
-  if (!/\bslice\b/i.test(String(attrs.preserveAspectRatio || ''))) return null;
+  const { mode, align } = parsePreserveAspectRatio(attrs.preserveAspectRatio);
+  // Strict grammar: `xMidYMid SLICE`, `xmidymid slice` and a trailing `defer`
+  // are dropped by the engine, which renders `meet` and crops nothing. Reading
+  // them as slice invented a crop and reported visible ink as unknown.
+  if (mode !== 'slice') return null;
   const w = absolutePx(attrs.width);
   const h = absolutePx(attrs.height);
   // Without both sides the viewport's aspect ratio is not in the file, so which
@@ -1246,9 +1292,7 @@ function visibleUserRect(attrs, viewBox) {
   const visibleH = h / scale;
   // Which side the overflow lands on follows the alignment; `xMidYMid` is the
   // default when the keyword is missing or unreadable.
-  const align = String(attrs.preserveAspectRatio || '').trim().split(/\s+/)[0] || '';
   const frac = (axis) => {
-    if (!/^x(Min|Mid|Max)Y(Min|Mid|Max)$/.test(align)) return 0.5;
     const part = axis === 'x' ? align.slice(1, 4) : align.slice(5, 8);
     return part === 'Min' ? 0 : part === 'Max' ? 1 : 0.5;
   };
@@ -1271,8 +1315,8 @@ function boxWithin(box, rect, eps = 1e-9) {
 
 function rootUnitScale(attrs, viewBox) {
   const nominal = 24;
-  const par = String(attrs.preserveAspectRatio || '').trim();
-  const stretches = par.toLowerCase().startsWith('none');
+  const { mode: parMode } = parsePreserveAspectRatio(attrs.preserveAspectRatio);
+  const stretches = parMode === 'none';
   // `preserveAspectRatio="none"` has no single scale, and that is true of the
   // assumed branch too: the axes get 24px each rather than sharing one factor.
   const reference = viewBox.w > 0 && viewBox.h > 0 ? nominal / Math.min(viewBox.w, viewBox.h) : 1;
@@ -1295,12 +1339,12 @@ function rootUnitScale(attrs, viewBox) {
 
   const rawX = w / viewBox.w;
   const rawY = h / viewBox.h;
-  if (par.toLowerCase().startsWith('none')) {
+  if (parMode === 'none') {
     const uniform = Math.abs(rawX - rawY) < 1e-9 ? rawX : null;
     return { x: rawX, y: rawY, uniform, source: 'declared' };
   }
   // `slice` fills the viewport (larger ratio wins), `meet` fits inside it.
-  const scale = /\bslice\b/i.test(par) ? Math.max(rawX, rawY) : Math.min(rawX, rawY);
+  const scale = parMode === 'slice' ? Math.max(rawX, rawY) : Math.min(rawX, rawY);
   return { x: scale, y: scale, uniform: scale, source: 'declared' };
 }
 
@@ -1353,6 +1397,7 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
       fill: 'black',
       stroke: undefined,
       strokeWidth: 1,
+      strokeWidthFromViewport: false,
       fillRule: 'nonzero',
       fillOpacity: 1,
       visible: true,
@@ -1442,7 +1487,9 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
         if (!(unitScale > 0)) {
           ctx.unresolved.add('non-scaling-stroke-scale');
           width = null;
-        } else {
+        } else if (!shape.strokeWidthFromViewport) {
+          // A % width already went through the viewport diagonal, so its user-unit
+          // value is final. Dividing again converted it a second time.
           width /= unitScale;
         }
       }
@@ -1504,9 +1551,17 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
   // doable, cropping a *stroked* one to a rect is not expressible as
   // `perimeter × width`, and half-clipping would be worse than saying so.
   if (finalBox) {
-    const visible = visibleUserRect(svg.attrs || {}, viewBox);
-    if (visible === undefined || (visible && !boxWithin(finalBox, visible))) {
-      ctx.unresolved.add('root-slice-clip');
+    // `overflow="visible"` turns the root clip off too. Refusing here would have
+    // thrown away a number that is directly recomputable from the ink box — and
+    // contradicted optical-model.md, which says visible ink is measured as
+    // authored. A class setting works because the cascade fills `svg.effective`.
+    const overflow = (svg.effective && svg.effective.overflow) ?? svg.attrs.overflow;
+    const rootVisible = String(overflow ?? '').trim().toLowerCase() === 'visible';
+    if (!rootVisible) {
+      const visible = visibleUserRect(svg.attrs || {}, viewBox);
+      if (visible === undefined || (visible && !boxWithin(finalBox, visible))) {
+        ctx.unresolved.add('root-slice-clip');
+      }
     }
   }
 

@@ -844,11 +844,23 @@ test('a transform attribute with units is dropped, the way the engine drops it',
   near(moved.ink.bbox.minX, 6, 1e-9);
 });
 
-test('a percentage stroke-width is not read as user units', () => {
-  const shape = analyzeSvg(
-    svg('<rect x="4" y="4" width="16" height="16" stroke="#000" stroke-width="10%"/>'),
+test('a percentage stroke-width is not read as ten user units', () => {
+  // 10% is 10% of the normalised viewport diagonal. With a viewBox in the file
+  // that is a number, and Chrome measures the band: a 24-unit diagonal makes it
+  // 2.4 units, not 10, on either a 24px or a 48px canvas.
+  const band = analyzeSvg(
+    svg('<rect x="8" y="8" width="8" height="8" fill="none" stroke="#000" stroke-width="10%"/>'),
   );
-  assert.ok(shape.unresolved.includes('stroke-width-percentage'), JSON.stringify(shape.unresolved));
+  assert.deepEqual(band.unresolved, []);
+  near(band.ink.area, 76.8, 0.01); // perimeter 32 × 2.4
+  near(band.ink.bbox.minX, 6.8, 0.01);
+
+  // Without a viewBox or an absolute canvas there is no diagonal to take the
+  // percentage of, and that is still a refusal rather than a guess.
+  const noBasis = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg"><rect width="8" height="8" fill="none" stroke="#000" stroke-width="10%"/></svg>',
+  );
+  assert.ok(noBasis.unresolved.includes('stroke-width-percentage'), JSON.stringify(noBasis.unresolved));
 });
 
 test('conflicting trim declarations across @layer are unknown, not last-wins', () => {
@@ -1102,15 +1114,23 @@ test('a percentage clip rect is refused, in both directions', () => {
   }
 });
 
-test('a percentage stroke-width is refused on ancestors too', () => {
-  // `stroke-width` inherits; only checking the shape itself let a <g> smuggle a
-  // percentage through as plain units.
+test('a percentage stroke-width resolves on ancestors too', () => {
+  // `stroke-width` inherits; only checking the shape itself used to let a <g>
+  // smuggle a percentage through as ten plain units. The diagonal is now shared
+  // down the tree, so 10% of a 24-unit diagonal is 2.4 units on the child path.
   const shape = analyzeSvg(
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">' +
       '<g fill="none" stroke="#000" stroke-width="10%"><path d="M6 12 H18"/></g></svg>',
   );
-  assert.match(shape.unresolved.join(), /stroke-width-percentage/);
-  assert.equal(checkShape(shape, { target: 'g.svg' }).verdict, 'unknown');
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 28.8, 0.01); // 12 units × 2.4
+
+  // The refusal still applies when the ancestor's percentage has no basis.
+  const noBasis = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg">' +
+      '<g fill="none" stroke="#000" stroke-width="10%"><path d="M6 12 H18"/></g></svg>',
+  );
+  assert.match(noBasis.unresolved.join(), /stroke-width-percentage/);
 });
 
 test('a viewBox with surrounding whitespace still parses', () => {
@@ -2531,4 +2551,57 @@ test('overflow:visible set through a class still turns the clip off', () => {
   );
   assert.deepEqual(shape.unresolved, []);
   near(shape.ink.area, 400, 1e-6);
+});
+
+// --- preserveAspectRatio grammar is case-sensitive -------------------------
+
+test('an upper-case or trailing-defer preserveAspectRatio is ignored by the engine', () => {
+  // Chrome drops `xMidYMid SLICE`, `xmidymid slice` and `xMidYMid slice defer`
+  // and renders the default `xMidYMid meet`. Lower-casing the value made the
+  // model invent a 2x scale: dy=1.2px where the render has 0.583px.
+  const root = (par) =>
+    `<svg xmlns="http://www.w3.org/2000/svg" width="48" height="24" viewBox="0 0 24 24" preserveAspectRatio="${par}">`
+      + '<rect x="7" y="7.6" width="10" height="10"/></svg>';
+
+  const valid = analyzeSvg(root('xMidYMid slice'));
+  near(valid.unitScale, 2, 1e-9);
+  for (const bad of ['xMidYMid SLICE', 'xmidymid slice', 'xMidYMid slice defer', 'NONE']) {
+    const shape = analyzeSvg(root(bad));
+    assert.deepEqual(shape.unresolved, [], bad);
+    near(shape.unitScale, 1, 1e-9);
+  }
+});
+
+test('overflow:visible turns off the root slice crop', () => {
+  // optical-model.md says visible ink is measured as authored. The crop check
+  // ignored `overflow`, so a band visibly drawn above the canvas came back
+  // `unknown` instead of the 22px offset that its own user-space box implies.
+  const open = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="24" viewBox="0 0 24 24"'
+      + ' preserveAspectRatio="xMidYMid slice" overflow="visible">'
+      + '<rect x="10" y="0" width="4" height="2"/></svg>',
+  );
+  assert.deepEqual(open.unresolved, []);
+  near(open.ink.bbox.minY, 0, 1e-9);
+
+  const hidden = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="24" viewBox="0 0 24 24"'
+      + ' preserveAspectRatio="xMidYMid slice">'
+      + '<rect x="10" y="0" width="4" height="2"/></svg>',
+  );
+  assert.ok(hidden.unresolved.includes('root-slice-clip'));
+});
+
+test('a percentage stroke-width is not converted twice by non-scaling-stroke', () => {
+  // Chrome: 10% of a 48px viewport is 4.8px = 2.4 user units here. The
+  // percentage already resolved through the diagonal; dividing by the root
+  // scale a second time halved the band.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24">'
+      + '<rect x="8" y="8" width="8" height="8" fill="none" stroke="#000" stroke-width="10%"'
+      + ' vector-effect="non-scaling-stroke"/></svg>',
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 76.8, 0.01);
+  near(shape.ink.bbox.minX, 6.8, 0.01);
 });
