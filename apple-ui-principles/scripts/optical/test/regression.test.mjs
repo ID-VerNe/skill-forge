@@ -3101,3 +3101,82 @@ test('the logical margin-block shorthand and transform:var()', () => {
   // A window-sized translate is still reported as a nudge, not flagged twice.
   near(nudge('.x{font-size:16px;margin-top:var(--x);transform:translateY(2px)}'), 2, 0.01);
 });
+
+// --- round 23: unary before a bracket, area intermediates, list invalidation --
+
+test('a unary sign may only precede a numeric token', () => {
+  // CSS attaches the sign to a number token, so `-(2px)` and `-min(...)` are a
+  // delimiter plus a bracket/function — dropped at parse time. Accepting them
+  // computed -24px and reported `ok` on a real 2px margin.
+  const finding = (css) =>
+    checkCss(css, { target: 'bracket.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge' || x.id === 'rule/nudge-unreadable',
+    );
+  for (const value of ['calc(-(24px))', 'calc(+(2px))', 'calc(-(-2px))', 'calc(-min(24px,24px))']) {
+    const css = `.x{font-size:16px;margin-top:2px;margin-top:${value}}`;
+    assert.equal(finding(css).id, 'rule/nudge-unreadable', value);
+    assert.equal(checkCss(css, { target: 'bracket.css' }).verdict, 'unknown', value);
+  }
+  // A fractional literal still starts with a digit, so it stays valid.
+  const ok = checkCss('.x{font-size:16px;margin-top:calc(-.5px)}', { target: 'bracket.css' });
+  assert.equal(ok.verdict, 'ok', JSON.stringify(ok.findings));
+});
+
+test('an area is a legal intermediate exponent', () => {
+  // `calc(2px*2px/2px)` is a length: the intermediate area is legal, only the
+  // final type matters. Rejecting exp > 1 mid-expression reported `unknown` on a
+  // valid 2px value — the mirror image of the `2px/2px*2px` case.
+  const nudge = (value) => {
+    const f = checkCss(`.x{font-size:16px;margin-top:${value}}`, {
+      target: 'area.css',
+    }).findings.find((x) => x.id === 'rule/hardcoded-vertical-nudge');
+    return f ? f.measured.dx : 0;
+  };
+  near(nudge('calc(2px*2px/2px)'), 2, 0.01);
+  near(nudge('calc(2px*2px*2px/2px/2px)'), 2, 0.01);
+  // length⁻¹ is not a CSS type, so this stays invalid.
+  assert.equal(
+    checkCss('.x{font-size:16px;margin-top:calc(2px/2px/2px)}', { target: 'area.css' })
+      .findings[0].id,
+    'rule/nudge-unreadable',
+  );
+});
+
+test('a readable margin survives an unreadable transform', () => {
+  // `transform: var(--t)` hides the translate, but the 2px margin is still a
+  // measurement we made — unknown would bury it.
+  const f = checkCss('.x{font-size:16px;margin-top:2px;transform:var(--t)}', {
+    target: 'mixed.css',
+  }).findings.find((x) => x.id === 'rule/hardcoded-vertical-nudge');
+  assert.ok(f, 'the margin half is measurable');
+  near(f.measured.dx, 2, 0.01);
+  // With nothing readable, unknown is the answer.
+  assert.equal(
+    checkCss('.x{font-size:16px;transform:var(--t)}', { target: 'mixed.css' }).verdict,
+    'unknown',
+  );
+  // A `var()` inside matrix() is a valid transform of unknown value.
+  assert.equal(
+    checkCss('.x{font-size:16px;transform:matrix(1,0,0,1,0,var(--y))}', { target: 'mixed.css' })
+      .verdict,
+    'unknown',
+  );
+});
+
+test('one malformed transform function invalidates the whole declaration', () => {
+  const verdict = (decl) =>
+    checkCss(`.x{font-size:16px;${decl}}`, { target: 'list.css' }).verdict;
+  const nudge = (decl) => {
+    const f = checkCss(`.x{font-size:16px;${decl}}`, { target: 'list.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge',
+    );
+    return f ? f.measured.dx : 0;
+  };
+  // `calc(2px)` is a length where matrix wants a number, and a 5-argument matrix
+  // is malformed: the browser drops all of it, so the translatey disappears too.
+  assert.equal(verdict('transform:translateY(2px) matrix(1,0,0,1,0,calc(2px))'), 'ok');
+  assert.equal(verdict('transform:translateY(2px) matrix(1,0,0,1,0)'), 'ok');
+  // Functions that carry no Y offset are not malformed, and do not cancel one.
+  near(nudge('transform:translateY(2px) rotate(45deg)'), 2, 0.01);
+  near(nudge('transform:translateY(2px) perspective(10px)'), 2, 0.01);
+});

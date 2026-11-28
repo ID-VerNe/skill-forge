@@ -346,11 +346,12 @@ function evalMath(src, emPx) {
       return mk(op === '+' ? a.v + b.v : a.v - b.v, a.exp);
     }
     if (op === '*') {
-      const exp = a.exp + b.exp;
-      // length × length is an area and length⁻¹ is not a value at all.
-      return exp > 1 ? UNREADABLE : mk(a.v * b.v, exp);
+      // An area is a legal *intermediate* type — `calc(2px*2px/2px)` is a length
+      // — so the exponent is only checked against the wanted type at the end.
+      return mk(a.v * b.v, a.exp + b.exp);
     }
     const exp = a.exp - b.exp;
+    // length⁻¹ is not a CSS type at any point, so dividing by a length is out.
     return exp < 0 ? UNREADABLE : mk(a.v / b.v, exp);
   }
 
@@ -409,9 +410,11 @@ function evalMath(src, emPx) {
     const sign = s[i];
     if (sign === '-' || sign === '+') {
       i += 1;
-      // A unary sign belongs to its operand's token: `- 2px` is a delimiter plus
-      // a dimension, which the grammar rejects, and `--2px` is an ident.
-      if (i >= s.length || CSS_WS.test(s[i]) || s[i] === '-' || s[i] === '+') return UNREADABLE;
+      // A unary sign belongs to its operand's *numeric* token: `- 2px` is a
+      // delimiter plus a dimension, `--2px` is an ident, and `-(2px)` /
+      // `-min(...)` are a delimiter plus a bracket or function. All rejected,
+      // and the declaration is dropped, so an earlier one keeps applying.
+      if (i >= s.length || !/[0-9.]/.test(s[i])) return UNREADABLE;
       const value = unary();
       if (value === UNREADABLE) return UNREADABLE;
       return sign === '-' ? mk(-value.v, value.exp) : value;
@@ -625,55 +628,63 @@ function splitArgs(text) {
  */
 function translateYOffsets(value) {
   const text = stripImportant(value).value;
+  const none = { sum: 0, parts: [], unreadable: false };
   // `transform: var(--t)` is valid CSS whose value lives elsewhere; reading it as
   // "no translation" answered `ok` on a real 2px move.
-  if (/var\(/i.test(text)) return { sum: 0, parts: [], unreadable: true };
+  if (/var\(/i.test(text)) return { ...none, unreadable: true };
   // A top-level comma makes the whole declaration invalid (`translateY(2px),
   // translateY(2px)`), so the browser applies no transform at all.
-  if (components(text).length === 0) return { sum: 0, parts: [], unreadable: false };
+  if (components(text).length === 0) return none;
   let depth = 0;
   for (let i = 0; i < text.length; i += 1) {
     if (text[i] === '(') depth += 1;
     else if (text[i] === ')') depth -= 1;
-    else if (text[i] === ',' && depth === 0) return { sum: 0, parts: [], unreadable: false };
+    else if (text[i] === ',' && depth === 0) return none;
   }
+
+  const arity = { translatey: [1], translate3d: [3], translate: [1, 2], matrix: [6], matrix3d: [16] };
+  // `matrix(a,b,c,d,e,f)` puts the translation in `f`, `matrix3d` in the fourth
+  // column — index 13. Both move the box exactly like a translate.
+  const yIndex = { translatey: 0, translate3d: 1, translate: 1, matrix: 5, matrix3d: 13 };
+
   const fn = /([a-zA-Z][a-zA-Z0-9]*)\(/g;
   const parts = [];
   let m;
   while ((m = fn.exec(text)) !== null) {
     const name = m[1].toLowerCase();
     const open = m.index + m[0].length;
-    let depth = 1;
+    let level = 1;
     let i = open;
-    for (; i < text.length && depth > 0; i += 1) {
-      if (text[i] === '(') depth += 1;
-      else if (text[i] === ')') depth -= 1;
+    for (; i < text.length && level > 0; i += 1) {
+      if (text[i] === '(') level += 1;
+      else if (text[i] === ')') level -= 1;
     }
-    if (depth !== 0) return { sum: parts.reduce((a, b) => a + b, 0), parts, unreadable: false };
+    if (level !== 0) return { ...none, parts };
     const args = splitArgs(text.slice(open, i - 1));
-    let index = -1;
-    let bare = false;
-    if (name === 'translatey' && args.length === 1) index = 0;
-    else if (name === 'translate3d' && args.length === 3) index = 1;
-    else if (name === 'translate' && args.length === 2) index = 1;
-    // `matrix(a,b,c,d,e,f)` puts the translation in `f`, and `matrix3d` puts it
-    // in the fourth column — index 13. Both move the box exactly like a
-    // translate, so ignoring them answered `ok` on a real 2px shift. Their
-    // arguments are unitless <number>s by definition, not lengths.
-    else if (name === 'matrix' && args.length === 6) {
-      index = 5;
-      bare = true;
-    } else if (name === 'matrix3d' && args.length === 16) {
-      index = 13;
-      bare = true;
-    }
-    if (index >= 0) {
-      // A unitless non-zero translate is invalid CSS and moves nothing;
-      // `lengthInPx` rejects it and resolves `calc()` when it can.
-      const amount = bare ? evalNumberValue(args[index]) : lengthInPx(args[index], null);
-      if (amount !== UNREADABLE && Number.isFinite(amount)) parts.push(amount);
-    }
     fn.lastIndex = i;
+    const allowed = arity[name];
+    if (!allowed) continue; // rotate(), skew(), perspective() … carry no Y offset
+    // One malformed transform function invalidates the whole declaration, so the
+    // browser applies none of the list — not just the function we could not read.
+    if (!allowed.includes(args.length)) return none;
+
+    if (name === 'matrix' || name === 'matrix3d') {
+      // Every argument is a <number>: a length here is a declaration the browser
+      // drops, while a `var()` is valid CSS with an unknown value.
+      const numbers = args.map((arg) => evalNumberValue(arg));
+      if (numbers.includes(UNREADABLE)) {
+        const unresolved = args.some((arg) => /var\(/i.test(arg));
+        return unresolved ? { ...none, unreadable: true } : none;
+      }
+      const y = numbers[yIndex[name]];
+      if (y !== 0) parts.push(y);
+      continue;
+    }
+
+    // A unitless non-zero translate is invalid CSS and moves nothing;
+    // `lengthInPx` rejects it and resolves `calc()` when it can.
+    const amount = lengthInPx(args[yIndex[name]], null);
+    if (amount !== UNREADABLE) parts.push(amount);
   }
   return { sum: parts.reduce((a, b) => a + b, 0), parts, unreadable: false };
 }
@@ -707,7 +718,13 @@ function nudgeFindings(blocks) {
     // inside the window is still reported as a nudge, so the block is not
     // flagged twice.
     if (margin.unreadable || transform.unreadable) {
-      const known = transform.unreadable ? 0 : Math.abs(transform.sum);
+      // Whatever is still readable is measured: a 2px margin beside a
+      // `transform: var(--t)` is a nudge we can name, not a blank.
+      const known = margin.unreadable
+        ? transform.unreadable
+          ? 0
+          : Math.abs(transform.sum)
+        : Math.abs(margin.value);
       if (known < 1 || known > 3) {
         findings.push({
           id: 'rule/nudge-unreadable',

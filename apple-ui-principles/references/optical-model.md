@@ -719,13 +719,19 @@ because it asserts an offset nobody measured:
 The evaluator carries a **length exponent** rather than a string type, because a
 confident number from an expression CSS rejects is the same false `ok` as no
 evaluation at all. `0` is a `<number>`, `1` a `<length>`; multiplication adds the
-exponent and division subtracts it, so `calc(2px / 2px * 2px)` is a length (`2px`)
-while `calc(2px*2px)` is an area and `calc(4px/2px)` is a bare number. Adding a
-length to a number (`calc(2px + 0)`) is invalid, and a binary `+`/`-` needs
-whitespace on both sides: `calc(2px+1px)` tokenises as `2px` then `+1px`. A unary
-sign belongs to its operand's token, so `calc(- 2px)` is a delimiter followed by a
-dimension and `calc(--2px)` is an ident — both are dropped at parse time, and the
-earlier declaration keeps applying.
+exponent and division subtracts it, and only the **final** type has to be a
+length, so the area in `calc(2px * 2px / 2px)` is a legal intermediate and the
+whole expression is `2px`. `calc(2px*2px)` on its own is still an area and
+`calc(4px/2px)` is a bare number; a negative exponent (`calc(2px/2px/2px)`,
+`calc(2/2px)`) is not a CSS type at any point. Adding a length to a number
+(`calc(2px + 0)`) is invalid, and a binary `+`/`-` needs whitespace on both sides:
+`calc(2px+1px)` tokenises as `2px` then `+1px`.
+
+A unary sign belongs to a **numeric** token, so it must be followed by a digit or
+a dot: `calc(- 2px)` is a delimiter followed by a dimension, `calc(--2px)` is an
+ident, and `calc(-(2px))` or `calc(-min(…))` are a delimiter followed by a bracket
+or a function. All of those are dropped at parse time — and the earlier
+declaration keeps applying.
 
 Arity is part of the grammar too. `margin-top` takes exactly one value, `margin`
 at most four and `margin-block` at most two, so `margin-top:2px 3px` is dropped
@@ -741,6 +747,12 @@ respectively, read as the unitless `<number>`s they are (a `calc()` number such 
 (`translateY(2px), translateY(2px)`) invalidates the declaration, so no transform
 is applied, while `transform: var(--t)` is valid CSS whose value lives outside the
 file — that one is `unknown`, not a zero.
+
+One malformed function invalidates the **whole** declaration, not just itself:
+`translateY(2px) matrix(1,0,0,1,0,calc(2px))` applies no transform at all, because
+`calc(2px)` is a length where `matrix()` wants a number. Functions that simply
+carry no Y offset (`rotate()`, `skewX()`, `perspective()`) are not malformed and
+do not cancel a translate beside them.
 
 The reporting window is `1px ≤ |offset| ≤ 3px` **per contribution**. A single
 `margin-top: 4px` is layout and stays silent, and so is a `24px` margin that a
