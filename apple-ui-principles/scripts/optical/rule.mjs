@@ -272,22 +272,163 @@ function pxLength(s) {
 }
 
 /** A declaration that wins the cascade but whose length we cannot evaluate. */
-const UNCALCULABLE = Symbol('uncalculable');
+const UNREADABLE = Symbol('unreadable');
 
 /**
- * The top margin one declaration writes, or `UNCALCULABLE`.
+ * Evaluate px-only length math: `calc()`, `min()`, `max()`, `clamp()`.
+ *
+ * `calc(2px)` **is** `2px`. Treating every function as unknowable cleared a real
+ * 2px margin and answered `ok`, which is the one mistake this checker must not
+ * make. Operators follow CSS precedence; `em` is resolved only when the block
+ * itself declares a px font size; anything else (`rem`, `%`, `vw`, `var()`)
+ * stays unreadable so the caller can answer `unknown` instead of guessing.
+ */
+function evalLengthMath(src, emPx) {
+  const s = String(src);
+  let i = 0;
+
+  const skip = () => {
+    while (i < s.length && /\s/.test(s[i])) i += 1;
+  };
+
+  const scale = (unit) => {
+    if (!unit) return 1;
+    if (/^px$/i.test(unit)) return 1;
+    if (/^em$/i.test(unit)) return emPx === null ? UNREADABLE : emPx;
+    return UNREADABLE;
+  };
+
+  function atom() {
+    skip();
+    if (s[i] === '(') {
+      i += 1;
+      const inner = sum();
+      skip();
+      if (inner === UNREADABLE || s[i] !== ')') return UNREADABLE;
+      i += 1;
+      return inner;
+    }
+    const fn = /^(calc|min|max|clamp)\(/i.exec(s.slice(i));
+    if (fn) {
+      i += fn[0].length;
+      const name = fn[1].toLowerCase();
+      const args = [];
+      for (;;) {
+        const value = sum();
+        if (value === UNREADABLE) return UNREADABLE;
+        args.push(value);
+        skip();
+        if (s[i] === ',') {
+          i += 1;
+          continue;
+        }
+        if (s[i] === ')') {
+          i += 1;
+          break;
+        }
+        return UNREADABLE;
+      }
+      if (name === 'calc') return args.length === 1 ? args[0] : UNREADABLE;
+      if (name === 'min') return Math.min(...args);
+      if (name === 'max') return Math.max(...args);
+      if (args.length !== 3) return UNREADABLE;
+      return Math.max(args[0], Math.min(args[1], args[2]));
+    }
+    const num = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)([a-z%]*)/i.exec(s.slice(i));
+    if (!num) return UNREADABLE;
+    i += num[0].length;
+    const factor = scale(num[2]);
+    if (factor === UNREADABLE) return UNREADABLE;
+    return Number(num[1]) * factor;
+  }
+
+  function unary() {
+    skip();
+    if (s[i] === '-') {
+      i += 1;
+      const value = unary();
+      return value === UNREADABLE ? UNREADABLE : -value;
+    }
+    if (s[i] === '+') {
+      i += 1;
+      return unary();
+    }
+    return atom();
+  }
+
+  function product() {
+    let left = unary();
+    if (left === UNREADABLE) return UNREADABLE;
+    for (;;) {
+      skip();
+      const op = s[i];
+      if (op !== '*' && op !== '/') return left;
+      i += 1;
+      const right = unary();
+      if (right === UNREADABLE) return UNREADABLE;
+      left = op === '*' ? left * right : left / right;
+    }
+  }
+
+  function sum() {
+    let left = product();
+    if (left === UNREADABLE) return UNREADABLE;
+    for (;;) {
+      skip();
+      const op = s[i];
+      if (op !== '+' && op !== '-') return left;
+      i += 1;
+      const right = product();
+      if (right === UNREADABLE) return UNREADABLE;
+      left = op === '+' ? left + right : left - right;
+    }
+  }
+
+  // The whole value must be exactly one function call: CSS rejects
+  // `calc(2px)+1px` — the declaration is dropped and the margin stays 0 — and
+  // parsing it as an expression turned an invalid value into a phantom 3px.
+  const value = atom();
+  skip();
+  if (value === UNREADABLE || i !== s.length || !Number.isFinite(value)) return UNREADABLE;
+  return value;
+}
+
+/** One length in px, or `UNREADABLE`. */
+function lengthInPx(raw, emPx) {
+  const s = String(raw ?? '').trim();
+  const px = pxLength(s);
+  if (px !== null) return px;
+  if (/^(?:calc|min|max|clamp)\(/i.test(s)) return evalLengthMath(s, emPx);
+  const em = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)em$/i.exec(s);
+  if (em) return emPx === null ? UNREADABLE : Number(em[1]) * emPx;
+  return UNREADABLE;
+}
+
+/** The first component of a shorthand, ignoring whitespace inside `calc(...)`. */
+function firstComponent(value) {
+  const s = String(value).trim();
+  let depth = 0;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0 && /\s/.test(ch)) return s.slice(0, i);
+  }
+  return s;
+}
+
+/**
+ * The top margin one declaration writes, or `UNREADABLE`.
  *
  * `auto` computes to zero on a block box, so it is a *known* zero — a later
- * `margin-top:auto` really does cancel an earlier `margin-top:2px`. Any other
- * non-px length (`1em`, `calc(0px)`, `var(--x)`) does override the earlier
- * declaration but leaves the offset unknowable; keeping the stale 2px there
- * reported a nudge Chrome does not draw.
+ * `margin-top:auto` really does cancel an earlier `margin-top:2px`. Everything
+ * else goes through `lengthInPx`, which evaluates px math and reports what it
+ * genuinely cannot resolve instead of pretending the value is zero.
  */
-function marginTopToken(value) {
-  const first = value.trim().split(/\s+/)[0] || '';
+function marginTopToken(value, emPx) {
+  const first = firstComponent(value);
   if (/^auto$/i.test(first)) return 0;
-  const px = pxLength(first);
-  return px === null ? UNCALCULABLE : px;
+  return lengthInPx(first, emPx);
 }
 
 /**
@@ -300,18 +441,29 @@ function marginTopToken(value) {
  * `margin-top:0;margin:2px`. A two-value shorthand is vertical/horizontal, so
  * its first value is the top margin too.
  */
-function marginTopOf(entries) {
+function marginTopOf(entries, emPx = null) {
   let best = null;
   for (const [prop, raw] of entries) {
     if (prop !== 'margin-top' && prop !== 'margin-block-start' && prop !== 'margin') continue;
     const { value, important } = stripImportant(raw);
-    const candidate = marginTopToken(value);
-    if (!best || important || !best.important) best = { value: candidate, important };
+    if (!best || important || !best.important) {
+      best = {
+        value: marginTopToken(value, emPx),
+        important,
+        raw: firstComponent(value),
+      };
+    }
   }
-  // An unreadable winner contributes nothing we can assert; the transform half
-  // of the nudge is still measured on its own.
-  if (!best || best.value === UNCALCULABLE) return 0;
-  return best.value;
+  if (!best) return { value: 0, unreadable: false, raw: '' };
+  if (best.value === UNREADABLE) return { value: 0, unreadable: true, raw: best.raw };
+  return { value: best.value, unreadable: false, raw: best.raw };
+}
+
+/** The px font size the block declares, or `null` when `em` cannot be resolved. */
+function declaredFontPx(decls) {
+  const raw = decls['font-size'];
+  if (raw === undefined) return null;
+  return pxLength(String(raw).trim());
 }
 
 /** The winning declaration for one property, including `!important` over order. */
@@ -332,51 +484,124 @@ function cascadeValue(entries, prop) {
  * a Y nudge too — recognising only `translateY`/`translate3d` reported `ok` on
  * a real 2px move.
  */
-function translateYSum(value) {
-  const text = stripImportant(value).value;
-  const num = '([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:[eE][+-]?\\d+)?)';
-  const reY = new RegExp(`translateY\\(\\s*${num}(px)?\\s*\\)`, 'gi');
-  const re3 = new RegExp(`translate3d\\(\\s*[^,()]+,\\s*${num}(px)?\\s*,`, 'gi');
-  const re2 = new RegExp(`translate\\(\\s*[^,()]+,\\s*${num}(px)?\\s*\\)`, 'gi');
-  let sum = 0;
-  let found = false;
-  for (const re of [reY, re3, re2]) {
-    let m;
-    while ((m = re.exec(text)) !== null) {
-      const amount = Number(m[1]);
-      // A unitless non-zero translation is invalid CSS and moves nothing.
-      if (!m[2] && amount !== 0) continue;
-      sum += amount;
-      found = true;
+/** Split an argument list at top-level commas, keeping nested calls intact. */
+function splitArgs(text) {
+  const args = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    else if (ch === ',' && depth === 0) {
+      args.push(text.slice(start, i));
+      start = i + 1;
     }
   }
-  return found ? sum : null;
+  args.push(text.slice(start));
+  return args;
+}
+
+/**
+ * Every Y translation contributes; `translateY(1px) translateY(2px)` is 3px.
+ *
+ * `translate(x, y)` moves the element on both axes, so its *second* argument is
+ * a Y nudge too — recognising only `translateY`/`translate3d` reported `ok` on
+ * a real 2px move. Arguments are read with real parenthesis balance instead of a
+ * regex, because `translate(calc(1px + 1px), 2px)` has a comma inside a nested
+ * call and a `[^,()]+` pattern silently dropped the whole function.
+ *
+ * Returns the individual offsets as well as their sum: two stacked 2px
+ * translations are the same "two hacks" signal as a margin plus a translate.
+ */
+function translateYOffsets(value) {
+  const text = stripImportant(value).value;
+  const fn = /([a-zA-Z][a-zA-Z0-9]*)\(/g;
+  const parts = [];
+  let m;
+  while ((m = fn.exec(text)) !== null) {
+    const name = m[1].toLowerCase();
+    const open = m.index + m[0].length;
+    let depth = 1;
+    let i = open;
+    for (; i < text.length && depth > 0; i += 1) {
+      if (text[i] === '(') depth += 1;
+      else if (text[i] === ')') depth -= 1;
+    }
+    if (depth !== 0) return { sum: parts.reduce((a, b) => a + b, 0), parts };
+    const args = splitArgs(text.slice(open, i - 1));
+    let index = -1;
+    if (name === 'translatey' && args.length === 1) index = 0;
+    else if (name === 'translate3d' && args.length === 3) index = 1;
+    else if (name === 'translate' && args.length === 2) index = 1;
+    if (index >= 0) {
+      // A unitless non-zero translation is invalid CSS and moves nothing;
+      // `lengthInPx` already rejects it, and resolves `calc()` when it can.
+      const amount = lengthInPx(args[index], null);
+      if (amount !== UNREADABLE) parts.push(amount);
+    }
+    fn.lastIndex = i;
+  }
+  return { sum: parts.reduce((a, b) => a + b, 0), parts };
 }
 
 function nudgeFindings(blocks) {
   const findings = [];
   for (const block of blocks) {
-    // Chrome moves the text for all of these spellings; matching only
-    // `margin-top: 2px` reported `ok` on a real 2px displacement.
-    const entries = block.order || Object.entries(block.decls);
-    // Both spellings move the same text, so they compose rather than compete: a
-    // zero margin does not cancel `translateY(2px)`, and a translate that pulls
-    // back a margin nets out. Reading margin first (`??`) made
-    // `margin:0;transform:translateY(2px)` — and the ubiquitous `margin:0 auto`
-    // centring idiom — come back `ok` on a real 2px move.
-    const margin = marginTopOf(entries);
-    const transform = translateYSum(cascadeValue(entries, 'transform')) ?? 0;
-    const nudge = margin + transform;
-    // A sub-pixel nudge sits inside the tolerance band by definition; flagging it
-    // would be noise. The documented window is 1px <= |nudge| <= 3px.
-    if (!nudge || Math.abs(nudge) < 1 || Math.abs(nudge) > 3) continue;
-
     const isText = ['line-height', 'font-size', 'letter-spacing', 'font-family'].some(
       (prop) => block.decls[prop],
     );
     if (!isText) continue;
 
+    // Chrome moves the text for all of these spellings; matching only
+    // `margin-top: 2px` reported `ok` on a real 2px displacement.
+    const entries = block.order || Object.entries(block.decls);
     const fontSize = Number.parseFloat(block.decls['font-size'] || '16') || 16;
+    // Both spellings move the same text, so they compose rather than compete: a
+    // zero margin does not cancel `translateY(2px)`, and a translate that pulls
+    // back a margin nets out. Reading margin first (`??`) made
+    // `margin:0;transform:translateY(2px)` — and the ubiquitous `margin:0 auto`
+    // centring idiom — come back `ok` on a real 2px move.
+    const margin = marginTopOf(entries, declaredFontPx(block.decls));
+    const transform = translateYOffsets(cascadeValue(entries, 'transform'));
+
+    if (margin.unreadable) {
+      // A later `margin-top: var(--x)` / `1rem` / `50%` wins the cascade but
+      // cannot be resolved, so a nudge cannot be ruled out. Answering `ok` here
+      // asserted an offset we never measured — `unknown` is the honest answer.
+      // A translate that already lands inside the window is still reported, so
+      // the block is not flagged twice.
+      if (Math.abs(transform.sum) < 1 || Math.abs(transform.sum) > 3) {
+        findings.push({
+          id: 'rule/nudge-unreadable',
+          layer: 'heuristic',
+          forcedVerdict: 'unknown',
+          pixel: false,
+          evidence: `${block.selector}: margin-top:${margin.raw} wins the cascade but is not a length this pass can resolve, so a hard-coded nudge cannot be ruled out`,
+          suggested: {
+            kind: 'inspect',
+            value: 'inline the computed px value, or check the declaration by hand',
+          },
+        });
+        continue;
+      }
+    }
+
+    const nudge = margin.value + transform.sum;
+    // A sub-pixel nudge sits inside the tolerance band by definition; flagging it
+    // would be noise. The documented window is 1px <= |offset| <= 3px per
+    // contribution, and the composition is reported too (at most 6px for two
+    // sources): a margin plus a translate, or two stacked translations, that each
+    // land inside the window are still hacks, not layout. One 24px margin stays
+    // out of the window, which is the point; a large offset that a translate
+    // cancels back into the window is reported at its honest net value.
+    const inWindow = (px) => Math.abs(px) >= 1 && Math.abs(px) <= 3;
+    const contributions = [margin.value, ...transform.parts].filter((px) => px !== 0);
+    const allOptical = contributions.length > 0 && contributions.every((px) => Math.abs(px) <= 3);
+    const anyVisible = contributions.some((px) => Math.abs(px) >= 1);
+    if (!nudge) continue;
+    if (!inWindow(nudge) && !(allOptical && anyVisible)) continue;
+
     findings.push({
       id: 'rule/hardcoded-vertical-nudge',
       layer: 'heuristic',

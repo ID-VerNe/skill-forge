@@ -2835,28 +2835,73 @@ test('margin and transform add up, and a cancel nets out', () => {
   near(nudge('.x{font-size:16px;margin-top:2px;transform:translateY(-2px)}'), 0, 0.01);
 });
 
-test('a later unreadable margin clears the earlier px offset', () => {
+test('a later unreadable margin is never quietly treated as zero', () => {
+  const finding = (css) =>
+    checkCss(css, { target: 'cascade.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge' || x.id === 'rule/nudge-unreadable',
+    );
   // `auto` computes to zero on a block box, so it cancels rather than defers.
-  // The rest win the cascade but cannot be evaluated; keeping the stale 2px
-  // reported a nudge Chrome does not draw.
-  for (const later of ['auto', 'calc(0px)', '1em', 'var(--x)']) {
+  for (const later of ['auto', 'calc(0px)']) {
+    const css = `.x{font-size:16px;margin-top:2px;margin-top:${later}}`;
+    assert.equal(finding(css), undefined, css);
+    assert.equal(checkCss(css, { target: 'cascade.css' }).verdict, 'ok', css);
+  }
+  // px math is evaluated rather than shrugged off: `calc(2px)` *is* `2px`, and
+  // clearing it to zero reported `ok` on a real 2px margin.
+  for (const later of ['calc(2px)', 'calc(1px + 1px)', 'min(2px,4px)', 'clamp(2px,2px,2px)']) {
+    const css = `.x{font-size:16px;margin-top:0;margin-top:${later}}`;
+    const f = finding(css);
+    assert.ok(f, css);
+    assert.equal(f.id, 'rule/hardcoded-vertical-nudge', css);
+    near(f.measured.dx, 2, 0.01);
+  }
+  // `em` resolves against the px font size declared in the same block, so a
+  // 16px margin is layout and not a nudge.
+  assert.equal(finding('.x{font-size:16px;margin-top:2px;margin-top:1em}'), undefined);
+  // What genuinely cannot be resolved answers `unknown`, never `ok`. The last
+  // two are invalid CSS (a declaration cannot trail a function call, and a
+  // length cannot be divided by zero): reading `calc(2px)+1px` as an expression
+  // invented a 3px nudge out of a value the browser drops.
+  for (const later of ['var(--x)', '1rem', '50%', 'calc(0.125rem)', 'calc(2px)+1px', 'calc(1px/0)']) {
     const css = `.x{font-size:16px;margin-top:2px;margin-top:${later}}`;
     const report = checkCss(css, { target: 'cascade.css' });
-    assert.equal(
-      report.findings.some((x) => x.id === 'rule/hardcoded-vertical-nudge'),
-      false,
-      css,
-    );
-    assert.equal(report.verdict, 'ok', css);
+    const f = finding(css);
+    assert.ok(f, css);
+    assert.equal(f.id, 'rule/nudge-unreadable', css);
+    assert.equal(f.verdict, 'unknown', css);
+    assert.equal(report.verdict, 'unknown', css);
   }
 });
 
+test('two stacked optical-sized offsets are reported at their total', () => {
+  const nudge = (css) => {
+    const f = checkCss(css, { target: 'stacked.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge',
+    );
+    return f ? f.measured.dx : 0;
+  };
+  // Each contribution is inside the 1..3px window on its own, so the total is a
+  // stack of two hacks rather than layout — reporting it beats reporting `ok`.
+  near(nudge('.x{font-size:16px;margin-top:2px;transform:translateY(2px)}'), 4, 0.01);
+  near(nudge('.x{font-size:16px;transform:translate3d(0,2px,0) translate(0,2px)}'), 4, 0.01);
+  // A large margin is layout, and stays out of the window even with a translate.
+  near(nudge('.x{font-size:16px;margin-top:20px;transform:translateY(2px)}'), 0, 0.01);
+  near(nudge('.x{font-size:16px;margin-top:4px}'), 0, 0.01);
+});
+
 test('two-argument translate contributes its Y offset', () => {
-  const f = checkCss('.x{font-size:16px;transform:translate(0,2px)}', {
-    target: 'translate.css',
-  }).findings.find((x) => x.id === 'rule/hardcoded-vertical-nudge');
-  assert.ok(f, 'translate(0,2px) is a 2px Y move');
-  near(f.measured.dx, 2, 0.01);
+  const y = (css) => {
+    const f = checkCss(css, { target: 'translate.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge',
+    );
+    return f ? f.measured.dx : 0;
+  };
+  near(y('.x{font-size:16px;transform:translate(0,2px)}'), 2, 0.01);
+  // The X argument may be a nested call, whose inner comma must not end the
+  // argument list: `translate(calc(min(1px,2px)),2px)` is still a 2px Y move.
+  near(y('.x{font-size:16px;transform:translate(calc(1px + 1px),2px)}'), 2, 0.01);
+  near(y('.x{font-size:16px;transform:translate(calc(min(1px,2px)),2px)}'), 2, 0.01);
+  near(y('.x{font-size:16px;transform:translate(2px)}'), 0, 0.01);
 });
 
 test('a % stroke-width on a nested <svg> itself uses its own viewBox', () => {
@@ -2865,8 +2910,10 @@ test('a % stroke-width on a nested <svg> itself uses its own viewBox', () => {
       + `<svg x="0" y="0" width="24" height="24" viewBox="0 0 48 48" stroke="#000" `
       + `fill="none" stroke-width="${width}"><line x1="4" y1="24" x2="44" y2="24"/></svg>`
       + '</svg>';
-  // Chrome draws 320px² for both: 16.666% of the 48-unit inner viewBox is 8
-  // units, which the outer 2x scale renders as 16px over a 40-unit line.
+  // Chrome draws 320px² for both: 16.666% of the 48-unit inner viewBox is an
+  // 8-unit band. The inner scale (24px over 48 units) halves it to 4 root units
+  // and the root scale (48px over 24 units) doubles that to 8px, across a 40px
+  // line. Reading the parent 24-unit basis halves the band and reports 160px².
   const pct = analyzeSvg(nested('16.666666%'));
   const explicit = analyzeSvg(nested('8'));
   assert.deepEqual(pct.unresolved, []);

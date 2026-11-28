@@ -701,12 +701,26 @@ an unknown one), and `margin-top:2px;transform:translateY(-2px)` nets out to zer
 because the text lands where it started. Reading only the first source that
 produced a value reported `ok` on a real 2px move.
 
-A winning declaration whose length cannot be evaluated clears the earlier offset
-instead of inheriting it: `margin-top:auto` computes to `0` on a block box (it
-cancels), while `margin-top:1em`, `calc(0px)` or `var(--x)` overrides the earlier
-`2px` but leaves the offset unknowable, so no offset is claimed. The window
-itself (`1px ≤ |nudge| ≤ 3px`) applies to the composed total: beyond 3px the shift
-is layout, not optical correction.
+Lengths are resolved by a px-only evaluator, not by string matching. `calc(2px)`
+**is** `2px`, and `calc(1px + 1px)`, `min(2px, 4px)` and
+`clamp(2px, 2px, 2px)` are all evaluated; `em` resolves against the px
+`font-size` the same block declares. Treatment as zero for the rest — a choice
+made for `var()`, `rem`, `%` and a `calc()` over any of them — is not available,
+because it asserts an offset nobody measured:
+
+| Winning declaration | Answer |
+|---|---|
+| `2px`, `calc(2px)`, `min(2px, 4px)` | the number, compared normally |
+| `1em` with `font-size:16px` in the block | `16px` — layout, not a nudge |
+| `auto` | `0` on a block box; it genuinely cancels |
+| `var(--gap)`, `1rem`, `50%` | **`unknown`** (`rule/nudge-unreadable`): a nudge cannot be ruled out, so inline the computed px value |
+
+The reporting window is `1px ≤ |offset| ≤ 3px` **per contribution**. A single
+`margin-top: 4px` is layout and stays silent, and so is a `24px` margin that a
+`translateY(-22px)` cancels into the window — that one is reported at its honest
+net `2px`. But two contributions that are *each* inside the window are reported
+at their sum (at most `6px`): `margin-top:2px` plus `translateY(2px)` is a 4px
+nudge, two stacked hacks rather than layout, and answering `ok` there hid both.
 
 ## 7. `#6` concentric radii
 
@@ -780,9 +794,9 @@ Verdicts: `≤ tol` → `ok`, `≤ 3·tol` → `nudge`, beyond → `off`.
 Heuristic-layer findings cap at `nudge`, so `off` is always backed by exact math.
 
 Categorical findings — `no-ink`, `unresolved-graphics`, `text-box-in-flex`,
-`unparsed-css`, and the keyline refusals — carry a *forced* verdict and never a
-pixel number. They print as `—`, because inventing `+1px` for a rule that is not
-about pixels invites an agent to "compensate" by one pixel.
+`nudge-unreadable`, `unparsed-css`, and the keyline refusals — carry a *forced*
+verdict and never a pixel number. They print as `—`, because inventing `+1px` for
+a rule that is not about pixels invites an agent to "compensate" by one pixel.
 
 `--policy` may only rescale comparisons that are actually pixel measurements.
 Forced and categorical verdicts pass through untouched: a policy must not be
