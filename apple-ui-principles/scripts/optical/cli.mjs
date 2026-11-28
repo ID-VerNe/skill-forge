@@ -13,11 +13,13 @@ import { checkIconFile, checkIconSet } from './icon.mjs';
 import { checkCss, checkTsx } from './rule.mjs';
 import { capMidpointDelta, readFontMetrics } from './font.mjs';
 import { exitCodeFor, summarise, tolFor, buildReport } from './report.mjs';
+import { syncInstalls, formatSync } from '../sync-installs.mjs';
 
 const USAGE = `optical — optical alignment checks
 
 Usage
   node cli.mjs check <path...> [options]
+  node cli.mjs check --self-heal [--home <dir>] [--skill-dir <dir>]
   node cli.mjs font <font.ttf|.otf> --size <px> [--line-height <n>]
 
 Options
@@ -25,6 +27,17 @@ Options
   --json                                    machine-readable output
   --explain                                 include evidence for every finding
   --policy <file>                           load a custom tolerance policy
+  --self-heal                               re-point installed copies at this repo
+  --home <dir>                              with --self-heal: the home to repair
+  --skill-dir <dir>                         with --self-heal: the copy to sync from
+
+--self-heal repairs the copies other agents installed from this directory.
+Junctions resolve by path, so they are live after every "git pull"; the Gemini
+CLI install is a tree of hardlinks, and git breaks those silently whenever it
+replaces a file. The repair is idempotent, only touches positions that already
+exist, and reports on stderr so --json stays parseable. Give it no paths to heal
+without running a check. It exits 2 when it cannot finish, and 64 when it was
+pointed at a copy instead of the repository.
 
 Exit codes
   0 ok/nudge   1 off   2 unknown   64 usage error
@@ -61,6 +74,9 @@ function parseArgs(argv) {
     policy: null,
     size: null,
     lineHeight: null,
+    selfHeal: false,
+    home: null,
+    skillDir: null,
     paths: [],
   };
 
@@ -70,7 +86,16 @@ function parseArgs(argv) {
       opts.command = arg;
     } else if (arg === '--json') opts.json = true;
     else if (arg === '--explain') opts.explain = true;
-    else if (arg === '--mode') {
+    else if (arg === '--self-heal') opts.selfHeal = true;
+    else if (arg === '--home') {
+      opts.home = argv[i + 1];
+      if (!opts.home) throw usage('--home needs a directory');
+      i += 1;
+    } else if (arg === '--skill-dir') {
+      opts.skillDir = argv[i + 1];
+      if (!opts.skillDir) throw usage('--skill-dir needs a directory');
+      i += 1;
+    } else if (arg === '--mode') {
       const value = argv[i + 1];
       if (!MODES.has(value)) throw usage(`unknown --mode: ${value}`);
       opts.mode = value;
@@ -98,6 +123,11 @@ function parseArgs(argv) {
     } else {
       opts.paths.push(arg);
     }
+  }
+  // Silently accepting these would let `check x.css --home /tmp` look like it
+  // repointed something. They only mean anything alongside --self-heal.
+  if (!opts.selfHeal && (opts.home !== null || opts.skillDir !== null)) {
+    throw usage('--home and --skill-dir only apply to --self-heal');
   }
   return opts;
 }
@@ -240,6 +270,29 @@ async function runFont(opts) {
   return 0;
 }
 
+/**
+ * Repair the agent-side installs before doing anything else.
+ *
+ * A failure here exits 2 (`unknown`) instead of producing a verdict. Half a
+ * heal leaves the environment in a state this run cannot characterise, and the
+ * one thing this tool must never do is answer `ok` about a copy of itself that
+ * is not the one on disk. Cheap to repeat: the repair is idempotent.
+ */
+function runSelfHeal(opts) {
+  let result;
+  try {
+    result = syncInstalls({ home: opts.home ?? undefined, skillDir: opts.skillDir ?? undefined });
+  } catch (err) {
+    const wrapped = new Error(`self-heal failed: ${err.message}`);
+    // "you ran this from the wrong place" is a usage error (64); anything else
+    // is an environment problem the run cannot characterise (2).
+    wrapped.usage = Boolean(err && err.usage);
+    throw wrapped;
+  }
+  // stderr, not stdout: `--json` consumers parse stdout and nothing else.
+  for (const line of formatSync(result)) process.stderr.write(`${line}\n`);
+}
+
 async function main() {
   let opts;
   try {
@@ -248,11 +301,23 @@ async function main() {
       process.stdout.write(`${USAGE}\n`);
       return 0;
     }
+    if (opts.command === 'font') {
+      if (opts.selfHeal) throw usage('--self-heal repairs installs; it has nothing to do with `font`');
+      if (opts.paths.length === 0) {
+        process.stdout.write(`${USAGE}\n`);
+        return 64;
+      }
+      return await runFont(opts);
+    }
+    if (opts.selfHeal) {
+      runSelfHeal(opts);
+      // No paths means "just heal": a repair pass is a complete answer by itself.
+      if (opts.paths.length === 0) return 0;
+    }
     if (opts.paths.length === 0) {
       process.stdout.write(`${USAGE}\n`);
       return 64;
     }
-    if (opts.command === 'font') return await runFont(opts);
 
     // Silently ignoring these would let `check x.svg --size 48` look like it took
     // effect. They belong to the `font` subcommand.

@@ -173,6 +173,30 @@ Two rules that make the output trustworthy:
 
 When a report holds both `off` and `unknown`, the exit code is `1` (the defect is certain and must be fixed) while the `unknown` stays listed on every run. Never read a `2` as "clean" — it means *unmeasured*.
 
+### Keeping the installed copies in sync
+
+This directory is also what the agents run from: their config stores
+(`~/.claude/skills`, `~/.qoder/skills`, `~/.gemini/config/skills`, …) hold an
+entry named `apple-ui-principles`. Directory junctions resolve by path, so they
+are live the moment the repository changes. The Gemini CLI install cannot be a
+junction — hardlinks work on files only — so it is a real tree whose files share
+inodes with the repository.
+
+That is the one fragile spot: git replaces a file by writing a new inode, which
+silently breaks the hardlink and leaves the mirror serving the old rules. No
+error, no warning. Repair it with:
+
+```bash
+node scripts/optical/cli.mjs check --self-heal
+```
+
+The repair is idempotent, reports on stderr so `--json` stays parseable, only
+touches install positions that already exist, and exits `2` rather than claiming
+a verdict if it cannot finish. With no paths it heals and stops; with paths it
+heals first, then checks. `--home` and `--skill-dir` override the two
+directories involved — the tests use them, and so can a project with an unusual
+layout.
+
 ### Baking the correction
 
 Do not scatter `translate-x-[1.5px]` through components. Fix it in the asset, then re-run until `ok`; any `flex items-center justify-center` downstream inherits the fix for free.
