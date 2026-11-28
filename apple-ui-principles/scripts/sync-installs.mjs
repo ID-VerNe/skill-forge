@@ -24,7 +24,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 /** Where each agent looks for a skill, relative to the home directory. */
 export const AGENTS = [
@@ -41,6 +41,27 @@ function samePath(a, b) {
   return fold(path.resolve(a)) === fold(path.resolve(b));
 }
 
+/** True when `child` is `parent` or lives underneath it. */
+function contains(parent, child) {
+  const rel = path.relative(path.resolve(parent), path.resolve(child));
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * `lstat`, with "not there" as `null`.
+ *
+ * Only ENOENT means absent. A permission error is not an absent install, and
+ * reporting it as one would turn "I could not look" into "nothing to do".
+ */
+function lstatOrNull(target) {
+  try {
+    return fs.lstatSync(target);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
 /**
  * Remove one directory entry without ever descending through it.
  *
@@ -49,12 +70,8 @@ function samePath(a, b) {
  * repository. Unlink the link; never touch the tree behind it.
  */
 function removeEntry(target) {
-  let info;
-  try {
-    info = fs.lstatSync(target);
-  } catch {
-    return 'absent';
-  }
+  const info = lstatOrNull(target);
+  if (!info) return 'absent';
   if (info.isSymbolicLink()) {
     fs.unlinkSync(target);
     return 'unlinked-link';
@@ -99,19 +116,29 @@ function walk(root) {
 
 /** True when `target` is a link that currently resolves to `wanted`. */
 function pointsAt(target, wanted) {
-  let info;
-  try {
-    info = fs.lstatSync(target);
-  } catch {
-    return false;
-  }
-  if (!info.isSymbolicLink()) return false;
+  const info = lstatOrNull(target);
+  if (!info || !info.isSymbolicLink()) return false;
   try {
     // native resolves junctions and returns the on-disk spelling of the path.
     return samePath(fs.realpathSync.native(target), wanted);
   } catch {
     return false; // dangling: the repo moved or was deleted
   }
+}
+
+/**
+ * True when `dir` is this project's checkout: the repository root is either the
+ * directory itself or its parent, which is the layout everywhere in this repo.
+ *
+ * Deliberately *not* "some ancestor holds a .git". A dotfiles repository rooted
+ * at $HOME would make every path under it look like a checkout — including the
+ * stale installed copies this guard exists to reject.
+ */
+function isCheckout(dir) {
+  return (
+    fs.existsSync(path.join(dir, '.git')) ||
+    fs.existsSync(path.join(path.dirname(dir), '.git'))
+  );
 }
 
 function syncJunction(installPath, skillDir) {
@@ -130,13 +157,9 @@ function syncMirror(installPath, skillDir) {
   const counts = { files: files.length, linked: 0, replaced: 0, kept: 0, pruned: 0 };
 
   let rebuilt = null;
-  try {
-    // A junction here would be a hand-made mistake; walking through it and
-    // pruning "extras" would delete repository files.
-    if (fs.lstatSync(installPath).isSymbolicLink()) rebuilt = removeEntry(installPath);
-  } catch {
-    /* the caller only calls this for an existing position */
-  }
+  // A junction here would be a hand-made mistake; walking through it and
+  // pruning "extras" would delete repository files.
+  if (lstatOrNull(installPath)?.isSymbolicLink()) rebuilt = removeEntry(installPath);
   if (rebuilt) {
     fs.mkdirSync(installPath, { recursive: true });
     counts.rebuilt = rebuilt;
@@ -160,14 +183,12 @@ function syncMirror(installPath, skillDir) {
     const src = path.join(skillDir, rel);
     const dst = path.join(installPath, rel);
     const srcInfo = fs.statSync(src);
-    let dstInfo = null;
-    try {
-      dstInfo = fs.lstatSync(dst);
-    } catch {
-      /* not there yet */
-    }
-    // Same inode and device means the hardlink survived. Anything else (a plain
-    // copy, a file git replaced) has to be relinked.
+    const dstInfo = lstatOrNull(dst);
+    // Equal inode *and* device: the hardlink survived. This is necessary, not
+    // sufficient — NTFS may reuse a file id after a delete, so a copy that
+    // happens to land on the same id reads as `kept`. Detecting that needs a
+    // content hash. A plain copy, or a file git replaced, fails the test and is
+    // relinked, which is the case that actually happens.
     if (dstInfo && !dstInfo.isSymbolicLink() && dstInfo.ino === srcInfo.ino && dstInfo.dev === srcInfo.dev) {
       counts.kept += 1;
       continue;
@@ -183,17 +204,6 @@ function syncMirror(installPath, skillDir) {
 
   const changed = counts.linked + counts.replaced + counts.pruned > 0 || Boolean(rebuilt);
   return { state: changed ? 'repaired' : 'ok', ...counts };
-}
-
-/** True when `dir` or any of its parents holds a `.git` (a directory or a worktree pointer). */
-function hasGitAncestor(dir) {
-  let current = path.resolve(dir);
-  for (;;) {
-    if (fs.existsSync(path.join(current, '.git'))) return true;
-    const parent = path.dirname(current);
-    if (parent === current) return false;
-    current = parent;
-  }
 }
 
 /**
@@ -220,11 +230,11 @@ export function syncInstalls({ skillDir, home = os.homedir(), agents = AGENTS } 
 
   // Syncing *from* an installed copy would point every other install at that
   // copy, building a chain through a mirror git can break. Refuse, unless the
-  // path is genuinely a checkout (someone cloned the repo into place, or is
-  // testing a copy): a `.git` above it makes it the source of truth.
+  // path is genuinely a checkout (someone cloned the repo into place): then it
+  // is the source of truth wherever it sits.
   for (const agent of agents) {
     const installPath = path.join(resolvedHome, agent.dir, name);
-    if (samePath(installPath, resolvedSkill) && !hasGitAncestor(resolvedSkill)) {
+    if (samePath(installPath, resolvedSkill) && !isCheckout(resolvedSkill)) {
       const err = new Error(
         `refusing to sync from an installed copy: ${resolvedSkill}. ` +
           'Run this from the repository, or pass --skill-dir.',
@@ -241,15 +251,9 @@ export function syncInstalls({ skillDir, home = os.homedir(), agents = AGENTS } 
 
   for (const agent of agents) {
     const installPath = path.join(resolvedHome, agent.dir, name);
-    let present = true;
-    try {
-      fs.lstatSync(installPath);
-    } catch {
-      present = false;
-    }
     // Absent means this agent never had the skill installed. Creating one is an
     // install, not a repair, and is out of scope.
-    if (!present) {
+    if (!lstatOrNull(installPath)) {
       results.push({ agent: agent.id, mode: agent.mode, installPath, state: 'not-installed' });
       continue;
     }
@@ -258,6 +262,15 @@ export function syncInstalls({ skillDir, home = os.homedir(), agents = AGENTS } 
     if (samePath(installPath, resolvedSkill)) {
       results.push({ agent: agent.id, mode: agent.mode, installPath, state: 'is-source' });
       continue;
+    }
+    // One of the two contains the other: replacing the install would delete the
+    // source, and pruning the mirror would delete it file by file.
+    if (contains(installPath, resolvedSkill) || contains(resolvedSkill, installPath)) {
+      const err = new Error(
+        `install position and source overlap: ${installPath} / ${resolvedSkill}`,
+      );
+      err.usage = true;
+      throw err;
     }
     const outcome =
       agent.mode === 'junction'
@@ -308,20 +321,74 @@ export function formatSync({ home, results }) {
   return lines;
 }
 
-const isMain =
-  process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+const RUNNER_USAGE = `sync-installs — point the installed copies of this skill at the repository
 
-if (isMain) {
-  const argv = process.argv.slice(2);
-  const pick = (flag) => {
-    const i = argv.indexOf(flag);
-    return i >= 0 ? argv[i + 1] : undefined;
+Usage
+  node scripts/sync-installs.mjs [--home <dir>] [--skill-dir <dir>]`;
+
+/** An invocation mistake, which exits 64 like every other usage error here. */
+function runnerUsage(message) {
+  const err = new Error(message);
+  err.usage = true;
+  return err;
+}
+
+/** Strict, because a typo must not silently fall back to the real home. */
+function parseRunnerArgs(argv) {
+  const opts = { home: undefined, skillDir: undefined, help: false };
+  const value = (i, label) => {
+    const next = argv[i + 1];
+    if (!next || next.startsWith('-')) throw runnerUsage(`${label} needs a directory`);
+    return next;
   };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const eq = arg.indexOf('=');
+    const flag = eq > 0 ? arg.slice(0, eq) : arg;
+    const inline = eq > 0 ? arg.slice(eq + 1) : undefined;
+    if (arg === '--help' || arg === '-h') {
+      opts.help = true;
+    } else if (flag === '--home' || flag === '--skill-dir') {
+      const resolved = inline !== undefined ? inline : value(i, flag);
+      if (!resolved) throw runnerUsage(`${flag} needs a directory`);
+      if (inline === undefined) i += 1;
+      if (flag === '--home') opts.home = resolved;
+      else opts.skillDir = resolved;
+    } else if (arg.startsWith('-')) {
+      throw runnerUsage(`unknown option: ${arg}`);
+    } else {
+      throw runnerUsage(`unexpected argument: ${arg}`);
+    }
+  }
+  return opts;
+}
+
+/**
+ * Node resolves the main module through its realpath, so a plain string compare
+ * says "not main" when the script is invoked through a junction — the most
+ * likely way to reach this file from an install. Compare realpaths instead.
+ */
+function isMainModule() {
+  if (!process.argv[1]) return false;
   try {
-    const result = syncInstalls({ home: pick('--home'), skillDir: pick('--skill-dir') });
-    process.stdout.write(`${formatSync(result).join('\n')}\n`);
+    const self = fs.realpathSync.native(fileURLToPath(import.meta.url));
+    return samePath(self, fs.realpathSync.native(path.resolve(process.argv[1])));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  try {
+    const opts = parseRunnerArgs(process.argv.slice(2));
+    if (opts.help) {
+      process.stdout.write(`${RUNNER_USAGE}\n`);
+    } else {
+      const result = syncInstalls({ home: opts.home, skillDir: opts.skillDir });
+      process.stdout.write(`${formatSync(result).join('\n')}\n`);
+    }
   } catch (err) {
     process.stderr.write(`sync-installs: ${err.message}\n`);
-    process.exitCode = 1;
+    process.exitCode = err && err.usage ? 64 : 1;
   }
 }

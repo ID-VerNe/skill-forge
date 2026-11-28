@@ -191,11 +191,16 @@ node scripts/optical/cli.mjs check --self-heal
 ```
 
 The repair is idempotent, reports on stderr so `--json` stays parseable, only
-touches install positions that already exist, and exits `2` rather than claiming
-a verdict if it cannot finish. With no paths it heals and stops; with paths it
-heals first, then checks. `--home` and `--skill-dir` override the two
-directories involved — the tests use them, and so can a project with an unusual
-layout.
+touches install positions that already exist, and never creates one. With no
+paths it heals and stops — under `--json` that prints
+`{"version":1,"self_heal":…}` instead of a verdict; with paths it heals first,
+then checks. Exit `2` means the repair could not finish; exit `64` means it was
+pointed at an installed copy rather than the repository. `--home` and
+`--skill-dir` override the two directories involved — the tests use them, and so
+can a project with an unusual layout.
+
+Treat the mirror as read-only. Its files share inodes with the repository, so
+editing one through the installed path rewrites the repository copy too.
 
 ### Baking the correction
 
