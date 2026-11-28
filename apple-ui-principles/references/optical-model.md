@@ -701,7 +701,7 @@ an unknown one), and `margin-top:2px;transform:translateY(-2px)` nets out to zer
 because the text lands where it started. Reading only the first source that
 produced a value reported `ok` on a real 2px move.
 
-Lengths are resolved by a px-only evaluator, not by string matching. `calc(2px)`
+Lengths are resolved by a typed evaluator, not by string matching. `calc(2px)`
 **is** `2px`, and `calc(1px + 1px)`, `min(2px, 4px)` and
 `clamp(2px, 2px, 2px)` are all evaluated; `em` resolves against the px
 `font-size` the same block declares. Treatment as zero for the rest — a choice
@@ -714,13 +714,32 @@ because it asserts an offset nobody measured:
 | `1em` with `font-size:16px` in the block | `16px` — layout, not a nudge |
 | `auto` | `0` on a block box; it genuinely cancels |
 | `var(--gap)`, `1rem`, `50%` | **`unknown`** (`rule/nudge-unreadable`): a nudge cannot be ruled out, so inline the computed px value |
+| invalid math — `calc(2px*2px)`, `calc(4px/2px)`, `calc(2px + 0)`, `calc(2px+1px)` | **`unknown`** — the browser drops the declaration and the *previous* one wins, so the offset is not the one this declaration spells |
+
+The evaluator carries `<length>`/`<number>` types and the tokeniser's whitespace
+rule, because a confident number from an expression CSS rejects is the same false
+`ok` as no evaluation at all: `calc(2px*2px)` is an area, `calc(4px/2px)` is
+unitless, `calc(2px + 0)` adds a number to a length, and a binary `+`/`-` needs
+whitespace on both sides (`calc(2px+1px)` tokenises as `2px` then `+1px`). Each of
+those is dropped at parse time, so the earlier declaration keeps applying.
+
+Arity is part of the grammar too. `margin-top` takes exactly one value and
+`margin` at most four, so `margin-top:2px 3px` is dropped rather than read as
+`2px`, and the earlier declaration wins.
+
+`-webkit-transform` is an alias of `transform` in Chromium, so both cascade as
+one property and the later declaration wins; `matrix(a,b,c,d,e,f)` and
+`matrix3d(…)` carry their Y translation in `f` and the fourth-column entry
+respectively, and are read as the unitless numbers they are. A top-level comma in
+`transform` (`translateY(2px), translateY(2px)`) invalidates the declaration, so
+no transform is applied.
 
 The reporting window is `1px ≤ |offset| ≤ 3px` **per contribution**. A single
 `margin-top: 4px` is layout and stays silent, and so is a `24px` margin that a
 `translateY(-22px)` cancels into the window — that one is reported at its honest
-net `2px`. But two contributions that are *each* inside the window are reported
-at their sum (at most `6px`): `margin-top:2px` plus `translateY(2px)` is a 4px
-nudge, two stacked hacks rather than layout, and answering `ok` there hid both.
+net `2px`. Contributions that are *each* inside the window are reported at their
+sum, with no hard cap: `margin-top:2px` plus `translateY(2px)` is a 4px nudge,
+three 2px translations are 6px, and answering `ok` on any of them hid every part.
 
 ## 7. `#6` concentric radii
 

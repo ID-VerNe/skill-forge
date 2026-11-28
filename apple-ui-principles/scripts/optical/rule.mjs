@@ -275,28 +275,64 @@ function pxLength(s) {
 const UNREADABLE = Symbol('unreadable');
 
 /**
- * Evaluate px-only length math: `calc()`, `min()`, `max()`, `clamp()`.
+ * Evaluate length math: `calc()`, `min()`, `max()`, `clamp()`.
  *
  * `calc(2px)` **is** `2px`. Treating every function as unknowable cleared a real
  * 2px margin and answered `ok`, which is the one mistake this checker must not
- * make. Operators follow CSS precedence; `em` is resolved only when the block
- * itself declares a px font size; anything else (`rem`, `%`, `vw`, `var()`)
- * stays unreadable so the caller can answer `unknown` instead of guessing.
+ * make. Evaluating it badly is the same mistake wearing a number: CSS rejects
+ * `calc(2px*2px)` (a length squared), `calc(4px/2px)` (unitless), `calc(2px + 0)`
+ * (length plus number) and `calc(2px+1px)` (a binary `+` needs whitespace), and
+ * a dropped declaration leaves the previous one winning. So the evaluator
+ * carries `<length>`/`<number>` types, enforces the whitespace rule, and returns
+ * `UNREADABLE` for anything it cannot prove valid.
+ *
+ * `em` resolves only when the block itself declares a px font size; `rem`, `%`,
+ * `vw` and `var()` need outside context and stay unreadable.
  */
 function evalLengthMath(src, emPx) {
   const s = String(src);
   let i = 0;
+  const LENGTH = 'px';
+  const NUMBER = '';
+  const mk = (v, unit) => ({ v, unit });
 
   const skip = () => {
     while (i < s.length && /\s/.test(s[i])) i += 1;
   };
 
-  const scale = (unit) => {
-    if (!unit) return 1;
-    if (/^px$/i.test(unit)) return 1;
-    if (/^em$/i.test(unit)) return emPx === null ? UNREADABLE : emPx;
+  /** Whitespace exists after `i`. */
+  const spaced = () => i < s.length && /\s/.test(s[i]);
+
+  /** Skip whitespace, then report the next operator among `chars`, if any. */
+  function nextOperator(chars) {
+    let j = i;
+    while (j < s.length && /\s/.test(s[j])) j += 1;
+    if (!chars.includes(s[j])) return null;
+    return { op: s[j], at: j, spaceBefore: j > i };
+  }
+
+  const unitOf = (unit) => {
+    if (!unit) return NUMBER;
+    if (/^px$/i.test(unit)) return LENGTH;
+    if (/^em$/i.test(unit)) return emPx === null ? UNREADABLE : LENGTH;
     return UNREADABLE;
   };
+
+  function combine(op, a, b) {
+    if (op === '+' || op === '-') {
+      // `<length> + <number>` is not a length, and neither is `<number> + <length>`.
+      if (a.unit !== b.unit) return UNREADABLE;
+      return mk(op === '+' ? a.v + b.v : a.v - b.v, a.unit);
+    }
+    if (op === '*') {
+      // `<length> * <length>` is an area, not a length.
+      if (a.unit && b.unit) return UNREADABLE;
+      return mk(a.v * b.v, a.unit || b.unit);
+    }
+    // Dividing by a length yields a number, which a margin cannot use.
+    if (b.unit) return UNREADABLE;
+    return mk(a.v / b.v, a.unit);
+  }
 
   function atom() {
     skip();
@@ -328,18 +364,24 @@ function evalLengthMath(src, emPx) {
         }
         return UNREADABLE;
       }
+      // Every argument of min()/max()/clamp() must share one type.
+      const unit = args[0].unit;
+      if (!args.every((a) => a.unit === unit)) return UNREADABLE;
       if (name === 'calc') return args.length === 1 ? args[0] : UNREADABLE;
-      if (name === 'min') return Math.min(...args);
-      if (name === 'max') return Math.max(...args);
+      if (name === 'min') return mk(Math.min(...args.map((a) => a.v)), unit);
+      if (name === 'max') return mk(Math.max(...args.map((a) => a.v)), unit);
+      // clamp(MIN, VAL, MAX) is max(MIN, min(VAL, MAX)) — not min-first.
       if (args.length !== 3) return UNREADABLE;
-      return Math.max(args[0], Math.min(args[1], args[2]));
+      return mk(Math.max(args[0].v, Math.min(args[1].v, args[2].v)), unit);
     }
     const num = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)([a-z%]*)/i.exec(s.slice(i));
     if (!num) return UNREADABLE;
     i += num[0].length;
-    const factor = scale(num[2]);
-    if (factor === UNREADABLE) return UNREADABLE;
-    return Number(num[1]) * factor;
+    const unit = unitOf(num[2]);
+    if (unit === UNREADABLE) return UNREADABLE;
+    const factor = unit === LENGTH && /^em$/i.test(num[2]) ? emPx : 1;
+    if (factor === null) return UNREADABLE;
+    return mk(Number(num[1]) * factor, unit);
   }
 
   function unary() {
@@ -347,7 +389,7 @@ function evalLengthMath(src, emPx) {
     if (s[i] === '-') {
       i += 1;
       const value = unary();
-      return value === UNREADABLE ? UNREADABLE : -value;
+      return value === UNREADABLE ? UNREADABLE : mk(-value.v, value.unit);
     }
     if (s[i] === '+') {
       i += 1;
@@ -360,13 +402,13 @@ function evalLengthMath(src, emPx) {
     let left = unary();
     if (left === UNREADABLE) return UNREADABLE;
     for (;;) {
-      skip();
-      const op = s[i];
-      if (op !== '*' && op !== '/') return left;
-      i += 1;
+      const found = nextOperator('*/');
+      if (!found) return left;
+      i = found.at + 1;
       const right = unary();
       if (right === UNREADABLE) return UNREADABLE;
-      left = op === '*' ? left * right : left / right;
+      left = combine(found.op, left, right);
+      if (left === UNREADABLE) return UNREADABLE;
     }
   }
 
@@ -374,23 +416,28 @@ function evalLengthMath(src, emPx) {
     let left = product();
     if (left === UNREADABLE) return UNREADABLE;
     for (;;) {
-      skip();
-      const op = s[i];
-      if (op !== '+' && op !== '-') return left;
-      i += 1;
+      const found = nextOperator('+-');
+      if (!found) return left;
+      // CSS requires whitespace on both sides of a binary `+`/`-`; without it
+      // the tokeniser produces `+1px` and the grammar drops the declaration.
+      if (!found.spaceBefore) return UNREADABLE;
+      i = found.at + 1;
+      if (!spaced()) return UNREADABLE;
       const right = product();
       if (right === UNREADABLE) return UNREADABLE;
-      left = op === '+' ? left + right : left - right;
+      left = combine(found.op, left, right);
+      if (left === UNREADABLE) return UNREADABLE;
     }
   }
 
   // The whole value must be exactly one function call: CSS rejects
-  // `calc(2px)+1px` — the declaration is dropped and the margin stays 0 — and
-  // parsing it as an expression turned an invalid value into a phantom 3px.
+  // `calc(2px)+1px` — the declaration is dropped and the previous one wins.
   const value = atom();
   skip();
-  if (value === UNREADABLE || i !== s.length || !Number.isFinite(value)) return UNREADABLE;
-  return value;
+  if (value === UNREADABLE || i !== s.length || !Number.isFinite(value.v)) return UNREADABLE;
+  // A margin is a length, so a bare number (`calc(2)`) is not a value here.
+  if (value.unit !== LENGTH) return UNREADABLE;
+  return value.v;
 }
 
 /** One length in px, or `UNREADABLE`. */
@@ -404,17 +451,29 @@ function lengthInPx(raw, emPx) {
   return UNREADABLE;
 }
 
-/** The first component of a shorthand, ignoring whitespace inside `calc(...)`. */
-function firstComponent(value) {
+/** Split a value into whitespace-separated components, ignoring `calc(...)` internals. */
+function components(value) {
   const s = String(value).trim();
+  const out = [];
   let depth = 0;
+  let start = 0;
   for (let i = 0; i < s.length; i += 1) {
     const ch = s[i];
     if (ch === '(') depth += 1;
     else if (ch === ')') depth = Math.max(0, depth - 1);
-    else if (depth === 0 && /\s/.test(ch)) return s.slice(0, i);
+    else if (depth === 0 && /\s/.test(ch)) {
+      if (i > start) out.push(s.slice(start, i));
+      start = i + 1;
+    }
   }
-  return s;
+  if (start < s.length) out.push(s.slice(start));
+  return out;
+}
+
+/** The first component of a shorthand, ignoring whitespace inside `calc(...)`. */
+function firstComponent(value) {
+  const parts = components(value);
+  return parts.length ? parts[0] : '';
 }
 
 /**
@@ -446,6 +505,13 @@ function marginTopOf(entries, emPx = null) {
   for (const [prop, raw] of entries) {
     if (prop !== 'margin-top' && prop !== 'margin-block-start' && prop !== 'margin') continue;
     const { value, important } = stripImportant(raw);
+    // Arity is part of the grammar: `margin-top` takes exactly one value and
+    // `margin` at most four, so `margin-top:2px 3px` is a declaration the browser
+    // drops — the *earlier* declaration keeps winning, exactly as if this one
+    // were absent. Reporting its first component invented a 2px nudge.
+    const arity = components(value).length;
+    if (arity === 0) continue;
+    if (prop === 'margin' ? arity > 4 : arity > 1) continue;
     if (!best || important || !best.important) {
       best = {
         value: marginTopToken(value, emPx),
@@ -478,12 +544,23 @@ function cascadeValue(entries, prop) {
 }
 
 /**
- * Every Y translation contributes; `translateY(1px) translateY(2px)` is 3px.
+ * The winning transform declaration.
  *
- * `translate(x, y)` moves the element on both axes, so its *second* argument is
- * a Y nudge too — recognising only `translateY`/`translate3d` reported `ok` on
- * a real 2px move.
+ * `-webkit-transform` is an *alias* of `transform` in Chromium, so the two
+ * cascade as one property and the later declaration wins. Reading `transform`
+ * alone missed an autoprefixed or legacy-only declaration and answered `ok` on a
+ * real 2px move.
  */
+function transformValueOf(entries) {
+  let best = null;
+  for (const [prop, raw] of entries) {
+    if (prop !== 'transform' && prop !== '-webkit-transform') continue;
+    const parsed = stripImportant(raw);
+    if (!best || parsed.important || !best.important) best = parsed;
+  }
+  return best ? best.value : null;
+}
+
 /** Split an argument list at top-level commas, keeping nested calls intact. */
 function splitArgs(text) {
   const args = [];
@@ -516,6 +593,15 @@ function splitArgs(text) {
  */
 function translateYOffsets(value) {
   const text = stripImportant(value).value;
+  // A top-level comma makes the whole declaration invalid (`translateY(2px),
+  // translateY(2px)`), so the browser applies no transform at all.
+  if (components(text).length === 0) return { sum: 0, parts: [] };
+  let depth = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === '(') depth += 1;
+    else if (text[i] === ')') depth -= 1;
+    else if (text[i] === ',' && depth === 0) return { sum: 0, parts: [] };
+  }
   const fn = /([a-zA-Z][a-zA-Z0-9]*)\(/g;
   const parts = [];
   let m;
@@ -531,14 +617,26 @@ function translateYOffsets(value) {
     if (depth !== 0) return { sum: parts.reduce((a, b) => a + b, 0), parts };
     const args = splitArgs(text.slice(open, i - 1));
     let index = -1;
+    let bare = false;
     if (name === 'translatey' && args.length === 1) index = 0;
     else if (name === 'translate3d' && args.length === 3) index = 1;
     else if (name === 'translate' && args.length === 2) index = 1;
+    // `matrix(a,b,c,d,e,f)` puts the translation in `f`, and `matrix3d` puts it
+    // in the fourth column — index 13. Both move the box exactly like a
+    // translate, so ignoring them answered `ok` on a real 2px shift. Their
+    // arguments are unitless <number>s by definition, not lengths.
+    else if (name === 'matrix' && args.length === 6) {
+      index = 5;
+      bare = true;
+    } else if (name === 'matrix3d' && args.length === 16) {
+      index = 13;
+      bare = true;
+    }
     if (index >= 0) {
-      // A unitless non-zero translation is invalid CSS and moves nothing;
-      // `lengthInPx` already rejects it, and resolves `calc()` when it can.
-      const amount = lengthInPx(args[index], null);
-      if (amount !== UNREADABLE) parts.push(amount);
+      // A unitless non-zero translate is invalid CSS and moves nothing;
+      // `lengthInPx` rejects it and resolves `calc()` when it can.
+      const amount = bare ? Number(args[index].trim()) : lengthInPx(args[index], null);
+      if (amount !== UNREADABLE && Number.isFinite(amount)) parts.push(amount);
     }
     fn.lastIndex = i;
   }
@@ -556,14 +654,16 @@ function nudgeFindings(blocks) {
     // Chrome moves the text for all of these spellings; matching only
     // `margin-top: 2px` reported `ok` on a real 2px displacement.
     const entries = block.order || Object.entries(block.decls);
-    const fontSize = Number.parseFloat(block.decls['font-size'] || '16') || 16;
+    // `font-size:1.5rem` has no px value here: 16px is a better basis for the
+    // relative readout than 1.5, which `parseFloat` would hand back.
+    const fontSize = pxLength(stripImportant(block.decls['font-size'] ?? '').value) ?? 16;
     // Both spellings move the same text, so they compose rather than compete: a
     // zero margin does not cancel `translateY(2px)`, and a translate that pulls
     // back a margin nets out. Reading margin first (`??`) made
     // `margin:0;transform:translateY(2px)` — and the ubiquitous `margin:0 auto`
     // centring idiom — come back `ok` on a real 2px move.
     const margin = marginTopOf(entries, declaredFontPx(block.decls));
-    const transform = translateYOffsets(cascadeValue(entries, 'transform'));
+    const transform = translateYOffsets(transformValueOf(entries));
 
     if (margin.unreadable) {
       // A later `margin-top: var(--x)` / `1rem` / `50%` wins the cascade but

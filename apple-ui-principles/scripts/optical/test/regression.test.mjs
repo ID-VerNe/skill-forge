@@ -2895,6 +2895,82 @@ test('two stacked optical-sized offsets are reported at their total', () => {
   near(nudge('.x{font-size:16px;margin-top:4px}'), 0, 0.01);
 });
 
+test('length math CSS would reject is unknown, not a confident number', () => {
+  // The evaluator carries <length>/<number> types and the binary +/- whitespace
+  // rule, because a dropped declaration leaves the previous one winning: an
+  // invalid `calc` computed as 4 was silently answering `ok` on a real 2px
+  // margin, and `calc(1px*1px)` invented a 1px nudge out of a value the browser
+  // throws away.
+  const invalid = [
+    'calc(1px*1px)',
+    'calc(2px*2px)',
+    'calc(4px/2px)',
+    'calc(1em/4px)',
+    'calc(2px + 0)',
+    'calc(0px + 0)',
+    'calc(2px -1px)',
+    'calc(0px+0px)',
+    'calc(2px+2px)',
+    'min(2px,4px,6)',
+  ];
+  for (const value of invalid) {
+    const css = `.x{font-size:16px;margin-top:2px;margin-top:${value}}`;
+    const report = checkCss(css, { target: 'math.css' });
+    const f = report.findings.find((x) => x.id === 'rule/nudge-unreadable');
+    assert.ok(f, `${value}: ${JSON.stringify(report.findings)}`);
+    assert.equal(report.verdict, 'unknown', value);
+  }
+});
+
+test('valid px math keeps CSS precedence, types and clamp order', () => {
+  const nudge = (value) => {
+    const f = checkCss(`.x{font-size:16px;margin-top:${value}}`, {
+      target: 'math.css',
+    }).findings.find((x) => x.id === 'rule/hardcoded-vertical-nudge');
+    return f ? f.measured.dx : 0;
+  };
+  near(nudge('calc(4px - 1px * 3)'), 1, 0.01); // precedence: 4-3, not (4-1)*3
+  near(nudge('calc(1px + 1px + 1px)'), 3, 0.01);
+  near(nudge('calc(6px / 2)'), 3, 0.01);
+  near(nudge('calc(2px - -1px)'), 3, 0.01); // unary minus, spaces intact
+  near(nudge('clamp(1px, 9px, 3px)'), 3, 0.01); // max(MIN, min(VAL, MAX))
+  near(nudge('calc((1px + 1px) * 2)'), 0, 0.01); // 4px is layout
+  near(nudge('calc(2px * 2)'), 0, 0.01);
+});
+
+test('the transform alias and matrix() forms move text too', () => {
+  const nudge = (decl) => {
+    const f = checkCss(`.x{font-size:16px;${decl}}`, {
+      target: 'transform.css',
+    }).findings.find((x) => x.id === 'rule/hardcoded-vertical-nudge');
+    return f ? f.measured.dx : 0;
+  };
+  // `-webkit-transform` is an alias in Chromium, so the two cascade as one
+  // property and the later declaration wins.
+  near(nudge('-webkit-transform:translateY(2px)'), 2, 0.01);
+  near(nudge('transform:translateY(2px);-webkit-transform:translateY(1px)'), 1, 0.01);
+  near(nudge('transform:matrix(1,0,0,1,0,2)'), 2, 0.01);
+  near(nudge('transform:matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,0,2,0,1)'), 2, 0.01);
+  near(nudge('transform:matrix(1,0,0,1,0,0)'), 0, 0.01);
+  // A top-level comma makes the whole declaration invalid: no transform at all.
+  near(nudge('transform:translateY(2px), translateY(2px)'), 0, 0.01);
+});
+
+test('a margin longhand with two values is a dropped declaration', () => {
+  const nudge = (css) => {
+    const f = checkCss(css, { target: 'arity.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge',
+    );
+    return f ? f.measured.dx : 0;
+  };
+  // `margin-top` takes one value; `margin-top:2px 3px` is dropped, so the
+  // earlier declaration keeps winning instead of the first value being read.
+  near(nudge('.x{font-size:16px;margin-top:2px 3px}'), 0, 0.01);
+  near(nudge('.x{font-size:16px;margin-top:2px;margin-top:2px 3px}'), 2, 0.01);
+  // `margin` takes at most four; five is dropped too.
+  near(nudge('.x{font-size:16px;margin:2px 0 0 0 0}'), 0, 0.01);
+});
+
 test('two-argument translate contributes its Y offset', () => {
   const y = (css) => {
     const f = checkCss(css, { target: 'translate.css' }).findings.find(
