@@ -126,8 +126,8 @@ node scripts/optical/cli.mjs check <path...> [--json] [--explain] [--mode <mode>
 node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 ```
 
-`--size` and `--line-height` take bare numbers only; `16px` is a usage error
-(exit `64`), not a silently truncated `16`.
+`--size` and `--line-height` take bare decimal numbers only; `16px` and `0x10`
+are usage errors (exit `64`), not values silently coerced by `Number()`.
 
 | Input | Mode | What is measured |
 |---|---|---|
@@ -136,7 +136,7 @@ node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 | `icon.svg` painting through `<style>`/`class` | — | paint is resolved: sheet normal < inline normal < sheet `!important` < inline `!important` |
 | `icon.svg` with `fill="var(--x)"` or `@import` | — | `unknown`: the value lives outside the file. Replace it with a literal to measure the icon — a themed colour does not change the area, but `none` does, and the checker cannot tell which you have |
 | `icon.svg` with `%` geometry | — | `unknown`: relative to a viewport the checker cannot see |
-| `icon.svg` with `%` `stroke-width` | — | resolved against the **nearest declared viewport** (a nested `viewBox` wins over the root); invalid negative percentages fall back to the inherited width; ink that leaves the visible user area is `unknown` |
+| `icon.svg` with `%` `stroke-width` | — | resolved against the **nearest declared viewport**, including a `<svg>`/`<symbol>`'s own declaration and its children; invalid negative percentages fall back to the inherited width and its provenance; ink leaving the visible user area is `unknown` |
 | `icon.svg` that animates, or draws outside its viewport | — | `unknown`: one frame is not the drawing, and the browser clips the rest |
 | `icon.svg` with `mask`/`filter`/`marker-*` (attribute, `style` or class) | — | `unknown`: mask and filter rewrite the painted region, a marker draws a shape of its own outside the path |
 | `icon.svg` with `fill="url(#missing)"` | — | measured as no ink: SVG leaves the element unrendered. A reference to a gradient or pattern is measured normally — colour is not area. Flatten these to shapes if the verdict matters |

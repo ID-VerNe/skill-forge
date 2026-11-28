@@ -575,31 +575,40 @@ function viewportDiagonal(inherited) {
  * same declaration once the root viewport is in the file.
  */
 function strokeWidthOf(attrs, inherited, ctx) {
-  if (attrs['stroke-width'] === undefined) return inherited.strokeWidth;
+  // Keep the *provenance* with the value. A dropped declaration — negative `%`
+  // included — inherits both the width and whether that width came from a
+  // viewport percentage. Tracking only the raw `%` text made a child with a
+  // plain `stroke-width="2"` skip the px→unit division after an invalid `%` on
+  // its parent, halving the band.
+  const fallback = {
+    width: inherited.strokeWidth,
+    fromViewport: Boolean(inherited.strokeWidthFromViewport),
+  };
+  if (attrs['stroke-width'] === undefined) return fallback;
   const raw = String(attrs['stroke-width']).trim();
   if (/%$/.test(raw)) {
     const number = raw.slice(0, -1);
     const basis = CSS_NUMBER.test(number) ? viewportDiagonal(inherited) : null;
     if (basis === null) {
       ctx.unresolved.add('stroke-width-percentage');
-      return inherited.strokeWidth;
+      return fallback;
     }
     const value = (Number(number) / 100) * basis;
     if (!Number.isFinite(value)) {
       ctx.unresolved.add('stroke-width-percentage');
-      return inherited.strokeWidth;
+      return fallback;
     }
     if (value < 0) {
       // Invalid declaration: the browser drops it and the property keeps its
       // inherited value (initially 1), exactly as a negative bare number does.
-      return inherited.strokeWidth;
+      return fallback;
     }
-    return value;
+    return { width: value, fromViewport: true };
   }
   const value = parseLength(raw);
   if (value === null) {
     ctx.unresolved.add('stroke-width-relative');
-    return inherited.strokeWidth;
+    return fallback;
   }
   if (!Number.isFinite(value)) {
     // `stroke-width="1e999"` overflows to infinity. One engine clamps it to the
@@ -607,15 +616,15 @@ function strokeWidthOf(attrs, inherited, ctx) {
     // another drops the declaration as invalid. Both writes are defensible, so
     // the width is unverifiable rather than one of them.
     ctx.unresolved.add('stroke-width-not-finite');
-    return inherited.strokeWidth;
+    return fallback;
   }
   if (value < 0) {
     // A negative width is an invalid declaration: browsers drop it, so the
     // element falls back to the inherited value rather than drawing a band of
     // absolute width in the opposite direction.
-    return inherited.strokeWidth;
+    return fallback;
   }
-  return value;
+  return { width: value, fromViewport: false };
 }
 
 /**
@@ -687,17 +696,18 @@ function fillRuleOf(attrs, inherited) {
 /** Presentation state a node hands to its children. */
 function inheritedFor(attrs, inherited, visible, matrix, ctx) {
   const color = attrs.color !== undefined ? attrs.color : inherited.color;
+  const strokeWidth = strokeWidthOf(attrs, inherited, ctx);
   return {
     matrix,
     color,
     fill: paintValue(attrs.fill, inherited.fill, 'black', color),
     stroke: paintValue(attrs.stroke, inherited.stroke, 'none', color),
-    strokeWidth: strokeWidthOf(attrs, inherited, ctx),
+    strokeWidth: strokeWidth.width,
     // A % width is already expressed in user units through the viewport
     // diagonal. With `non-scaling-stroke` the usual px→unit division must be
-    // skipped, or the same 10% is converted twice.
-    strokeWidthFromViewport:
-      inherited.strokeWidthFromViewport || /%$/.test(String(attrs['stroke-width'] ?? '')),
+    // skipped, or the same 10% is converted twice. The provenance travels with
+    // the value, so a dropped `%` cannot taint an inherited plain width.
+    strokeWidthFromViewport: strokeWidth.fromViewport,
     fillRule: fillRuleOf(attrs, inherited),
     // `fill-opacity` is inherited; `opacity` is not (it composites the group).
     fillOpacity: resolveOpacity(attrs['fill-opacity'], inherited.fillOpacity),
@@ -871,23 +881,31 @@ function collect(node, inherited, out, ctx) {
     let matrix = multiplyMatrix(own, [1, 0, 0, 1, vx, vy]);
     // Space of the viewport rect itself, before its own viewBox map.
     const outerMatrix = matrix;
+    let innerVb = null;
     if (attrs.viewBox !== undefined) {
-      const vb = parseViewBox(attrs);
-      if (!vb) {
+      innerVb = parseViewBox(attrs);
+      if (!innerVb) {
         ctx.unresolved.add(viewBoxFailure(attrs));
         return out;
       }
       matrix = multiplyMatrix(
         matrix,
-        viewBoxMatrix(vb, { x: 0, y: 0, w: vpW, h: vpH }, attrs.preserveAspectRatio),
+        viewBoxMatrix(innerVb, { x: 0, y: 0, w: vpW, h: vpH }, attrs.preserveAspectRatio),
       );
     }
-    const local = inheritedFor(attrs, inherited, visible, matrix, ctx);
-    // Children live in the inner user space: with a viewBox the viewport rect
-    // maps to the viewBox's own dimensions, so percentages must use those.
-    local.viewport = attrs.viewBox !== undefined
-      ? { w: parseViewBox(attrs).w, h: parseViewBox(attrs).h }
-      : { w: vpW, h: vpH };
+    // Both the element's own `%` properties and its children resolve against
+    // this viewport, in its own user space. Resolving the element's declaration
+    // against the *parent* basis made a symmetric icon asymmetric (and, when
+    // the band was cropped, turned a Chrome-`ok` drawing into a reported `off`).
+    const innerViewport = innerVb ? { w: innerVb.w, h: innerVb.h } : { w: vpW, h: vpH };
+    const local = inheritedFor(
+      attrs,
+      { ...inherited, viewport: innerViewport, viewportDeclared: true },
+      visible,
+      matrix,
+      ctx,
+    );
+    local.viewport = innerViewport;
     local.viewportDeclared = true;
     // The clip applies in the *inner* coordinate system, after the viewBox map.
     withClip(attrs, matrix, ctx, out, (sink) => {
@@ -962,23 +980,38 @@ function collect(node, inherited, out, ctx) {
           const value = symbolAttrs[attr];
           if (value && !/^none$/i.test(String(value).trim())) ctx.unresolved.add(attr);
         }
-        const symbolLocal = inheritedFor(symbolAttrs, local, visible, useMatrix, ctx);
         let matrix = matrixFrom(symbolAttrs, useMatrix, ctx);
         let symbolVb = null;
         if (symbolAttrs.viewBox !== undefined) {
-          const vb = parseViewBox(symbolAttrs);
-          if (!vb) {
+          symbolVb = parseViewBox(symbolAttrs);
+          if (!symbolVb) {
             ctx.unresolved.add(viewBoxFailure(symbolAttrs));
             return;
           }
-          symbolVb = vb;
           matrix = multiplyMatrix(
             matrix,
-            viewBoxMatrix(vb, { x: 0, y: 0, w: vpW, h: vpH }, symbolAttrs.preserveAspectRatio),
+            viewBoxMatrix(
+              symbolVb,
+              { x: 0, y: 0, w: vpW, h: vpH },
+              symbolAttrs.preserveAspectRatio,
+            ),
           );
         }
+        // The symbol's own `%` stroke-width resolves in its own user space,
+        // just like a nested <svg>'s. Passing the parent basis here halved the
+        // band and made a measured icon asymmetric.
+        const symbolViewport = symbolVb
+          ? { w: symbolVb.w, h: symbolVb.h }
+          : { w: vpW, h: vpH };
+        const symbolLocal = inheritedFor(
+          symbolAttrs,
+          { ...local, viewport: symbolViewport, viewportDeclared: true },
+          visible,
+          useMatrix,
+          ctx,
+        );
         symbolLocal.matrix = matrix;
-        symbolLocal.viewport = symbolVb ? { w: symbolVb.w, h: symbolVb.h } : { w: vpW, h: vpH };
+        symbolLocal.viewport = symbolViewport;
         symbolLocal.viewportDeclared = true;
         // A symbol clips to the viewport the <use> gives it, exactly like a
         // nested <svg>. Its own clip-path is in the symbol's user space, which
@@ -1039,8 +1072,8 @@ function collect(node, inherited, out, ctx) {
       } else if (!shape.d && !shape.empty) {
         ctx.unresolved.add('unparsed-shape');
       } else if (shape.d) {
-        const strokeWidth = strokeWidthOf(attrs, inherited, ctx);
-        const strokeUnits = Number.isFinite(strokeWidth) ? strokeWidth : 1;
+        const strokeInfo = strokeWidthOf(attrs, inherited, ctx);
+        const strokeUnits = Number.isFinite(strokeInfo.width) ? strokeInfo.width : 1;
         // The shape's own `color` applies to its own `currentColor`.
         const color = attrs.color !== undefined ? attrs.color : inherited.color;
         const fillPaint = paintValue(attrs.fill, inherited.fill, 'black', color);
@@ -1090,8 +1123,7 @@ function collect(node, inherited, out, ctx) {
           // must not multiply it by the matrix.
           nonScalingStroke:
             String(attrs['vector-effect'] ?? '').trim().toLowerCase() === 'non-scaling-stroke',
-          strokeWidthFromViewport:
-            inherited.strokeWidthFromViewport || /%$/.test(String(attrs['stroke-width'] ?? '')),
+          strokeWidthFromViewport: strokeInfo.fromViewport,
           // Even `fill-rule` is inherited, and an inherited `evenodd` changes the
           // area of every child path.
           fillRule: fillRuleOf(attrs, inherited),
@@ -1338,18 +1370,24 @@ function visibleUserRect(attrs, viewBox) {
  * a verdict. Anything beyond it — a 150% band, a band at y=-12 — still refuses.
  */
 function viewportEpsilon(viewBox, sx, sy) {
-  if (!(sx > 0) || !(sy > 0)) return 1e-9;
+  if (!(sx > 0) || !(sy > 0)) return { x: 1e-9, y: 1e-9 };
   const shortSidePx = Math.min(viewBox.w * sx, viewBox.h * sy);
   const tolPx = Math.min(1.5, Math.max(0.5, 0.02 * shortSidePx));
-  return tolPx / Math.min(sx, sy);
+  // The slack is in *pixels*, so each axis converts it with its own scale. Using
+  // `min(sx,sy)` for both made a 20px overflow on a 10×-scaled axis look like a
+  // 2px one when the other axis scaled by 0.01, and a clipped drawing was
+  // reported `ok`.
+  return { x: tolPx / sx, y: tolPx / sy };
 }
 
-function boxWithin(box, rect, eps = 1e-9) {
+function boxWithin(box, rect, eps = { x: 1e-9, y: 1e-9 }) {
+  const ex = typeof eps === 'number' ? eps : eps.x;
+  const ey = typeof eps === 'number' ? eps : eps.y;
   return (
-    box.minX >= rect.x - eps &&
-    box.minY >= rect.y - eps &&
-    box.maxX <= rect.x + rect.w + eps &&
-    box.maxY <= rect.y + rect.h + eps
+    box.minX >= rect.x - ex &&
+    box.minY >= rect.y - ey &&
+    box.maxX <= rect.x + rect.w + ex &&
+    box.maxY <= rect.y + rect.h + ey
   );
 }
 

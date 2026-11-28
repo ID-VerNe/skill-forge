@@ -123,7 +123,7 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
 | a `transform` that is not a bare-number list — a unit (`translate(2px,0)`, `rotate(45deg)`), a percentage, `var()`, an unknown function, wrong argument count, empty argument (`translate(10,)`), trailing junk, a trailing dot (`translate(6.,6.)`) | measured **untransformed**, with no finding — the engine drops the whole attribute, so the element sits in its parent's space. The parseable prefix is never applied: that would turn `translate(10%,8)` into `translate(8,0)`. A sign is a number (`+4`) and adjacent signed numbers are two of them (`6-6`, `.5.5`), both applied |
-| a `stroke-width` in `%` with no declared viewBox and no absolute root sides | `geometry/unresolved-graphics` (`stroke-width-percentage`) — there is no real diagonal to take the percentage of; the nominal 24×24 canvas is a comparison convention, not a viewport. With a viewport, `10%` is 10% of the **nearest viewport's** normalised diagonal, expressed in that viewport's own user space (2.4 units on a 24-unit canvas). A nested `<svg viewBox="0 0 48 48">` uses 48, not the root's 24; reading the root turned a symmetric pair of bands into a 3px false `off`. A negative percentage is an invalid declaration — the width inherits, it is not a refusal |
+| a `stroke-width` in `%` with no declared viewBox and no absolute root sides | `geometry/unresolved-graphics` (`stroke-width-percentage`) — there is no real diagonal to take the percentage of; the nominal 24×24 canvas is a comparison convention, not a viewport. With a viewport, `10%` is 10% of the **nearest viewport's** normalised diagonal, expressed in that viewport's own user space (2.4 units on a 24-unit canvas). A nested `<svg viewBox="0 0 48 48">` uses 48, not the root's 24, both for the element's own declaration and for its children; reading the root turned a symmetric pair of bands into a 3px false `off`. `<symbol>` follows the same rule. A negative percentage is an invalid declaration — the width *and its provenance* inherit, so it is neither a refusal nor a reason to skip the px→unit conversion on a descendant's plain width |
 | a `stroke-width` in `2pt` / `1em` / `1in` (`stroke-width-relative`), on the shape **or any ancestor** | `geometry/unresolved-graphics`. Absolute units are declined on purpose: `pt`, `pc`, `mm` and `in` would each need a px-per-unit constant, which is a second place to be wrong about the same number. `2px` is accepted — one px *is* one user unit. Write the others in user units |
 | a `stroke-width` that overflows to infinity (`1e999`) | `geometry/unresolved-graphics` (`stroke-width-not-finite`) — one engine clamps it to the largest length and paints over the canvas, another drops the declaration |
 | a `stroke-width` that is finite but whose band area is not (`1e308`) | `geometry/unresolved-graphics` (`non-finite-ink`) — `width × length` overflows to `Infinity` and the centroid comes back `NaN`; `NaN` compares false against every tolerance, so without this check the report reads `off` with a `NaN` displacement instead of admitting it has no measurement |
@@ -336,9 +336,11 @@ sides; an assumed 24px canvas is a comparison convention, not a viewport.
 A flattened Bézier or a `perimeter × width` stroke box can overshoot an edge by
 a few thousandths of a unit. That sliver is inside the same tolerance band used
 for verdicts (`tol = clamp(0.02 × shortSide, 0.5px, 1.5px)`, converted back to
-user units), so it is ignored here rather than reported as clipped ink. Without
-that slack the check turned 115 real icons into `unknown`. Ink beyond the band
-still refuses.
+user units **per axis**), so it is ignored here rather than reported as clipped
+ink. Without that slack the check turned 115 real icons into `unknown`; with a
+single shared denominator, a 50-unit overflow on a 10×-scaled axis was treated
+as 0.5px when the other axis scaled by 0.01, and clipped ink came back `ok`. Ink
+beyond the per-axis band still refuses.
 
 `overflow="visible"` is the one declaration that turns that clip off, and then
 the escaping ink is measured as authored. `auto` and `scroll` still clip (they
@@ -682,10 +684,14 @@ metrics (`line-height` / `font-size` / `letter-spacing`) is the fossil of a
 heuristic: the same declaration can be legitimate optical correction.
 
 The declarations are normalised before matching, so the heuristic also sees
-equivalent authoring forms: `margin: 2px 0 0` and `margin-block-start: 2px`,
-trailing `!important`, case-insensitive units (`2PX`), and repeated transforms
-(`translateY(1px) translateY(2px)` sums to `3px`). Multiple conflicting
-declarations use the last one after normalisation, matching CSS cascade order.
+equivalent authoring forms: the `margin` shorthand with one, two, three or four
+values (a two-value `margin: 2px 0` sets the top margin to `2px`),
+`margin-block-start`, a trailing `! important` with whitespace, case-insensitive
+units (`2PX`), a unitless zero, `translate3d(0, 2px, 0)`, and repeated transforms
+(`translateY(1px) translateY(2px)` sums to `3px`). Conflicting declarations are
+resolved in source order with `!important` winning over a later normal
+declaration, so `margin:2px;margin-top:0` is not a nudge while
+`margin-top:2px!important;margin-top:0` is.
 
 ## 7. `#6` concentric radii
 

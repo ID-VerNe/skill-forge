@@ -41,6 +41,17 @@ function usage(message) {
   return err;
 }
 
+/** Bare decimal numbers only: `Number('0x10')` is 16 but not a CLI number here. */
+function cliNumber(raw, label) {
+  const s = String(raw ?? '').trim();
+  if (!/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(s)) {
+    throw usage(`${label} needs a number`);
+  }
+  const value = Number(s);
+  if (!Number.isFinite(value)) throw usage(`${label} needs a number`);
+  return value;
+}
+
 function parseArgs(argv) {
   const opts = {
     command: 'check',
@@ -73,12 +84,10 @@ function parseArgs(argv) {
       if (!opts.policy) throw usage('--policy needs a file');
       i += 1;
     } else if (arg === '--size') {
-      opts.size = Number(argv[i + 1]);
-      if (!Number.isFinite(opts.size)) throw usage('--size needs a number');
+      opts.size = cliNumber(argv[i + 1], '--size');
       i += 1;
     } else if (arg === '--line-height') {
-      opts.lineHeight = Number(argv[i + 1]);
-      if (!Number.isFinite(opts.lineHeight)) throw usage('--line-height needs a number');
+      opts.lineHeight = cliNumber(argv[i + 1], '--line-height');
       i += 1;
     } else if (arg === '--tolerance') {
       throw usage('--tolerance is not a thing: thresholds are fixed. Use --policy <file>.');

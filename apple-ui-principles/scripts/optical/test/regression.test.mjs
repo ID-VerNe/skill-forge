@@ -2726,8 +2726,75 @@ test('the hardcoded-nudge rule sees every way CSS can move text 2px', () => {
   }
 });
 
-test('font --size rejects a unit rather than parsing its numeric prefix', () => {
-  const result = run('font', fixture('missing.ttf'), '--size', '16px');
-  assert.equal(result.status, 64, result.stdout + result.stderr);
-  assert.match(result.stderr, /--size needs a number/);
+test('font --size rejects a unit or a non-decimal literal', () => {
+  for (const value of ['16px', '0x10', 'Infinity']) {
+    const result = run('font', fixture('missing.ttf'), '--size', value);
+    assert.equal(result.status, 64, `${value}: ${result.stdout} ${result.stderr}`);
+    assert.match(result.stderr, /--size needs a number/);
+  }
+});
+
+// --- round 18: viewport basis, anisotropic slack, nudge spellings ----------
+
+test('a % stroke-width on <symbol> itself uses the symbol viewBox', () => {
+  const symbol = (width) =>
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24">'
+      + `<defs><symbol id="s" viewBox="0 0 48 48" stroke="#000" fill="none" stroke-width="${width}">`
+      + '<line x1="10" y1="24" x2="38" y2="24"/></symbol></defs>'
+      + '<use href="#s" x="0" y="0" width="24" height="24"/></svg>';
+  // Chrome draws 448px² for both: 33.333% of the 48-unit symbol viewBox is
+  // 16 units. Reading the parent 24-unit basis halved the band.
+  const pct = analyzeSvg(symbol('33.333333%'));
+  const explicit = analyzeSvg(symbol('16'));
+  assert.deepEqual(pct.unresolved, []);
+  near(pct.ink.area, explicit.ink.area, 0.01);
+  near(pct.ink.area * 4, 448, 1);
+  near(pct.ink.bbox.maxY * 2, 32, 0.01);
+});
+
+test('anisotropic scaling converts viewport slack per axis', () => {
+  // 100x1000 units rendered 1000x10px: sx=10, sy=0.01. A single `min(sx,sy)`
+  // denominator made the 50-unit x overflow look like 0.5px, so a drawing
+  // Chrome clips to half its width still came back `ok`.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="10" '
+      + 'viewBox="0 0 100 1000" preserveAspectRatio="none">'
+      + '<rect x="-50" y="100" width="200" height="800" fill="#000"/></svg>',
+  );
+  assert.ok(shape.unresolved.includes('ink-outside-viewport'), JSON.stringify(shape.unresolved));
+  assert.equal(checkShape(shape, { target: 'aniso.svg' }).verdict, 'unknown');
+});
+
+test('the nudge rule sees shorthand, translate3d and spaced important', () => {
+  const cases = [
+    '.x{font-size:16px;margin:2px 0}',
+    '.x{font-size:16px;margin-top:2px ! important}',
+    '.x{font-size:16px;transform:translate3d(0,2px,0)}',
+    '.x{font-size:16px;transform:translate3d(0,-2px,0)}',
+  ];
+  for (const css of cases) {
+    const f = checkCss(css, { target: 'nudge.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge',
+    );
+    assert.ok(f, css);
+    assert.equal(f.verdict, 'nudge', css);
+  }
+});
+
+test('margin cascade and unitless zero do not invent or hide a nudge', () => {
+  const nudge = (css) => {
+    const f = checkCss(css, { target: 'cascade.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge',
+    );
+    return f ? f.measured.dx : 0;
+  };
+  // Within one block, `!important` wins; otherwise the later declaration wins,
+  // no matter which property spelled it.
+  near(nudge('.x{font-size:16px;margin-top:0;margin:2px}'), 2, 0.01);
+  near(nudge('.x{font-size:16px;margin:2px;margin-top:0}'), 0, 0.01);
+  near(nudge('.x{font-size:16px;margin-top:2px!important;margin-top:0}'), 2, 0.01);
+  near(nudge('.x{font-size:16px;transform:translateY(2px)!important;transform:translateY(0)}'), 2, 0.01);
+  // A unitless zero is a valid length, and a zero nudge is not a finding.
+  near(nudge('.x{font-size:16px;margin-top:0}'), 0, 0.01);
+  near(nudge('.x{font-size:16px;transform:translateY(0)}'), 0, 0.01);
 });

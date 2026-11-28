@@ -257,40 +257,74 @@ function textBoxFindings(blocks) {
   return findings;
 }
 
-/** A CSS px length, with the case-insensitive unit and a trailing `!important`. */
-function cssPx(raw) {
-  const s = String(raw || '')
-    .trim()
-    .replace(/\s*!important\s*$/i, '')
-    .trim();
+/** Peel a trailing priority marker; CSS allows whitespace between `!` and `important`. */
+function stripImportant(raw) {
+  const s = String(raw ?? '').trim();
+  const m = /^([\s\S]*?)\s*!\s*important\s*$/i.exec(s);
+  return m ? { value: m[1].trim(), important: true } : { value: s, important: false };
+}
+
+/** A CSS length in px. Only zero may omit the unit. */
+function pxLength(s) {
+  if (/^[+-]?(?:0+(?:\.0*)?|\.0+)$/.test(s)) return 0;
   const m = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)px$/i.exec(s);
   return m ? Number(m[1]) : null;
 }
 
-/** The top margin, including the shorthand and the logical-property spelling. */
-function marginTopOf(decls) {
-  const direct = cssPx(decls['margin-top']);
-  if (direct !== null) return direct;
-  const logical = cssPx(decls['margin-block-start']);
-  if (logical !== null) return logical;
-  const parts = String(decls.margin || '')
-    .replace(/\s*!important\s*$/i, '')
-    .trim()
-    .split(/\s+/);
-  if (parts.length === 1 || parts.length >= 3) return cssPx(parts[0]);
-  return null;
+/**
+ * The physical top margin after the block's own cascade.
+ *
+ * `margin-top`, `margin-block-start` and the `margin` shorthand all write the
+ * same physical property. CSS resolves them by declaration order, with
+ * `!important` winning over a later normal declaration. Preferring whichever
+ * spelling happened to be checked first reported a 2px nudge on
+ * `margin-top:0;margin:2px`. A two-value shorthand is vertical/horizontal, so
+ * its first value is the top margin too.
+ */
+function marginTopOf(entries) {
+  let best = null;
+  for (const [prop, raw] of entries) {
+    const { value, important } = stripImportant(raw);
+    let candidate = null;
+    if (prop === 'margin-top' || prop === 'margin-block-start') {
+      candidate = pxLength(value);
+    } else if (prop === 'margin') {
+      candidate = pxLength(value.split(/\s+/)[0] || '');
+    }
+    if (candidate === null) continue;
+    if (!best || important || !best.important) best = { value: candidate, important };
+  }
+  return best ? best.value : null;
 }
 
-/** Every `translateY` contributes; `translateY(1px) translateY(2px)` is 3px. */
+/** The winning declaration for one property, including `!important` over order. */
+function cascadeValue(entries, prop) {
+  let best = null;
+  for (const [name, raw] of entries) {
+    if (name !== prop) continue;
+    const parsed = stripImportant(raw);
+    if (!best || parsed.important || !best.important) best = parsed;
+  }
+  return best ? best.value : null;
+}
+
+/** Every Y translation contributes; `translateY(1px) translateY(2px)` is 3px. */
 function translateYSum(value) {
-  const text = String(value || '').replace(/\s*!important\s*$/i, '');
-  const re = /translateY\(\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)px\s*\)/gi;
+  const text = stripImportant(value).value;
+  const num = '([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:[eE][+-]?\\d+)?)';
+  const reY = new RegExp(`translateY\\(\\s*${num}(px)?\\s*\\)`, 'gi');
+  const re3 = new RegExp(`translate3d\\(\\s*[^,()]+,\\s*${num}(px)?\\s*,`, 'gi');
   let sum = 0;
   let found = false;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    sum += Number(m[1]);
-    found = true;
+  for (const re of [reY, re3]) {
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const amount = Number(m[1]);
+      // A unitless non-zero translation is invalid CSS and moves nothing.
+      if (!m[2] && amount !== 0) continue;
+      sum += amount;
+      found = true;
+    }
   }
   return found ? sum : null;
 }
@@ -300,7 +334,8 @@ function nudgeFindings(blocks) {
   for (const block of blocks) {
     // Chrome moves the text for all of these spellings; matching only
     // `margin-top: 2px` reported `ok` on a real 2px displacement.
-    const nudge = marginTopOf(block.decls) ?? translateYSum(block.decls.transform);
+    const entries = block.order || Object.entries(block.decls);
+    const nudge = marginTopOf(entries) ?? translateYSum(cascadeValue(entries, 'transform'));
     // A sub-pixel nudge sits inside the tolerance band by definition; flagging it
     // would be noise. The documented window is 1px <= |nudge| <= 3px.
     if (!nudge || Math.abs(nudge) < 1 || Math.abs(nudge) > 3) continue;
