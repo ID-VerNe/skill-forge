@@ -3002,3 +3002,102 @@ test('a % stroke-width on a nested <svg> itself uses its own viewBox', () => {
   near(pct.ink.area, explicit.ink.area, 0.01);
   near(pct.ink.area * 4, 320, 1);
 });
+
+// --- round 22: unary signs, length exponents, logical margin, matrix numbers -
+
+test('a unary sign must hug its operand', () => {
+  // `calc(- 2px)` is a delimiter plus a dimension: the grammar rejects it and the
+  // declaration is dropped, so an earlier `margin-top:2px` keeps winning.
+  // Reading it as -2px answered `ok` on a real 2px nudge.
+  const finding = (css) =>
+    checkCss(css, { target: 'unary.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge' || x.id === 'rule/nudge-unreadable',
+    );
+  assert.equal(finding('.x{font-size:16px;margin-top:calc(- 2px)}').id, 'rule/nudge-unreadable');
+  const stacked = '.x{font-size:16px;margin-top:2px;margin-top:calc(- 1px + 1px)}';
+  assert.equal(finding(stacked).id, 'rule/nudge-unreadable');
+  assert.equal(checkCss(stacked, { target: 'unary.css' }).verdict, 'unknown');
+  assert.equal(finding('.x{font-size:16px;margin-top:calc(--2px)}').id, 'rule/nudge-unreadable');
+  assert.equal(finding('.x{font-size:16px;margin-top:calc(2px - - 1px)}').id, 'rule/nudge-unreadable');
+  // Hugging forms stay valid.
+  const nudge = (css) => {
+    const f = checkCss(css, { target: 'unary.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge',
+    );
+    return f ? f.measured.dx : 0;
+  };
+  near(nudge('.x{font-size:16px;margin-top:calc(2px*-1)}'), -2, 0.01);
+  near(nudge('.x{font-size:16px;margin-top:calc(2px - -1px)}'), 3, 0.01);
+});
+
+test('length exponents make px/px*px a length, as CSS allows', () => {
+  // length / length is a number and number × length is a length again, so this is
+  // 2px. Rejecting every length/length reported `unknown` on a valid value.
+  const f = checkCss('.x{font-size:16px;margin-top:calc(2px/2px*2px)}', {
+    target: 'exp.css',
+  }).findings.find((x) => x.id === 'rule/hardcoded-vertical-nudge');
+  assert.ok(f, 'calc(2px/2px*2px) is 2px');
+  near(f.measured.dx, 2, 0.01);
+  // A length squared is still an area, and a bare number is still not a length.
+  for (const bad of ['calc(2px*2px)', 'calc(4px/2px)', 'calc(2)']) {
+    const css = `.x{font-size:16px;margin-top:${bad}}`;
+    assert.equal(
+      checkCss(css, { target: 'exp.css' }).findings.find((x) => x.id === 'rule/nudge-unreadable')?.id,
+      'rule/nudge-unreadable',
+      bad,
+    );
+  }
+});
+
+test('deep or oversized math is refused instead of overflowing the stack', () => {
+  // `checkCss` is exported, so an unhandled RangeError would reach library
+  // callers. The guard turns pathological input into a verdict instead.
+  const deep = `.x{font-size:16px;margin-top:${'calc('.repeat(5000)}2px}`;
+  const report = checkCss(deep, { target: 'deep.css' });
+  assert.equal(report.verdict, 'unknown');
+  assert.ok(report.findings.length > 0);
+  const wide = `.x{font-size:16px;margin-top:calc(2px + ${'1px + '.repeat(4000)}1px)}`;
+  assert.doesNotThrow(() => checkCss(wide, { target: 'wide.css' }));
+});
+
+test('matrix() arguments may be calc() numbers, not just literals', () => {
+  // `matrix()` takes <number>s, and `calc(2)` is a valid <number>. Reading the
+  // argument with `Number()` yielded NaN, dropped the parameter and answered
+  // `ok` on a real 2px shift.
+  const nudge = (decl) => {
+    const f = checkCss(`.x{font-size:16px;${decl}}`, {
+      target: 'matrix.css',
+    }).findings.find((x) => x.id === 'rule/hardcoded-vertical-nudge');
+    return f ? f.measured.dx : 0;
+  };
+  near(nudge('transform:matrix(1,0,0,1,0,calc(2))'), 2, 0.01);
+  near(nudge('transform:matrix(1,0,0,1,0,min(2,4))'), 2, 0.01);
+  near(
+    nudge('transform:matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,0,clamp(1,2,3),0,1)'),
+    2,
+    0.01,
+  );
+  // A length where a number belongs invalidates the whole transform.
+  near(nudge('transform:matrix(1,0,0,1,0,calc(2px))'), 0, 0.01);
+});
+
+test('the logical margin-block shorthand and transform:var()', () => {
+  const nudge = (css) => {
+    const f = checkCss(css, { target: 'logical.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge',
+    );
+    return f ? f.measured.dx : 0;
+  };
+  // `margin-block:2px` writes margin-block-start: the modern spelling of the
+  // same nudge — reading only `margin-top`/`margin` answered `ok`.
+  near(nudge('.x{font-size:16px;margin-block:2px}'), 2, 0.01);
+  near(nudge('.x{font-size:16px;margin-block:2px 4px}'), 2, 0.01);
+  near(nudge('.x{font-size:16px;margin-block:2px 0 0}'), 0, 0.01); // arity 3: dropped
+  // `transform: var(--t)` hides the offset in another file: unknown, not zero.
+  const css = '.x{font-size:16px;transform:var(--t)}';
+  const report = checkCss(css, { target: 'logical.css' });
+  assert.equal(report.verdict, 'unknown', JSON.stringify(report.findings));
+  assert.equal(report.findings[0].id, 'rule/nudge-unreadable');
+  // A window-sized translate is still reported as a nudge, not flagged twice.
+  near(nudge('.x{font-size:16px;margin-top:var(--x);transform:translateY(2px)}'), 2, 0.01);
+});

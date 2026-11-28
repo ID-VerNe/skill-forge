@@ -274,44 +274,65 @@ function pxLength(s) {
 /** A declaration that wins the cascade but whose length we cannot evaluate. */
 const UNREADABLE = Symbol('unreadable');
 
+/** CSS whitespace only: JS `\s` also matches NBSP, which CSS does not treat as space. */
+const CSS_WS = /[ \t\n\r\f]/;
+
+/** Bounds for the hand-rolled evaluator: no stack overflow, no runaway input. */
+const MAX_NESTING = 64;
+const MAX_MATH_LENGTH = 4096;
+
 /**
  * Evaluate length math: `calc()`, `min()`, `max()`, `clamp()`.
  *
  * `calc(2px)` **is** `2px`. Treating every function as unknowable cleared a real
  * 2px margin and answered `ok`, which is the one mistake this checker must not
  * make. Evaluating it badly is the same mistake wearing a number: CSS rejects
- * `calc(2px*2px)` (a length squared), `calc(4px/2px)` (unitless), `calc(2px + 0)`
- * (length plus number) and `calc(2px+1px)` (a binary `+` needs whitespace), and
- * a dropped declaration leaves the previous one winning. So the evaluator
- * carries `<length>`/`<number>` types, enforces the whitespace rule, and returns
- * `UNREADABLE` for anything it cannot prove valid.
+ * `calc(2px*2px)` (an area), `calc(2px + 0)` (a length plus a number) and
+ * `calc(2px+1px)` (a binary `+` needs whitespace), and a dropped declaration
+ * leaves the previous one winning.
+ *
+ * So values carry a *length exponent*: `0` is a `<number>`, `1` a `<length>`,
+ * and multiplication adds while division subtracts, which is what lets
+ * `calc(2px / 2px * 2px)` be a length. Unary signs must hug their operand, as the
+ * tokeniser requires; `calc(- 2px)` is a delimiter followed by a dimension and
+ * therefore invalid. Anything unprovable returns `UNREADABLE`.
  *
  * `em` resolves only when the block itself declares a px font size; `rem`, `%`,
  * `vw` and `var()` need outside context and stay unreadable.
  */
-function evalLengthMath(src, emPx) {
+function evalMath(src, emPx) {
   const s = String(src);
+  if (s.length > MAX_MATH_LENGTH) return UNREADABLE;
+  const NUMBER = 0;
+  const LENGTH = 1;
+  const mk = (v, exp) => ({ v, exp });
+
+  // Reject absurd nesting before recursing into it.
+  let nest = 0;
+  let deepest = 0;
+  for (let k = 0; k < s.length; k += 1) {
+    if (s[k] === '(') {
+      nest += 1;
+      if (nest > deepest) deepest = nest;
+    } else if (s[k] === ')') nest -= 1;
+  }
+  if (deepest > MAX_NESTING) return UNREADABLE;
+
   let i = 0;
-  const LENGTH = 'px';
-  const NUMBER = '';
-  const mk = (v, unit) => ({ v, unit });
-
   const skip = () => {
-    while (i < s.length && /\s/.test(s[i])) i += 1;
+    while (i < s.length && CSS_WS.test(s[i])) i += 1;
   };
-
-  /** Whitespace exists after `i`. */
-  const spaced = () => i < s.length && /\s/.test(s[i]);
+  const spaced = () => i < s.length && CSS_WS.test(s[i]);
 
   /** Skip whitespace, then report the next operator among `chars`, if any. */
   function nextOperator(chars) {
     let j = i;
-    while (j < s.length && /\s/.test(s[j])) j += 1;
+    while (j < s.length && CSS_WS.test(s[j])) j += 1;
     if (!chars.includes(s[j])) return null;
     return { op: s[j], at: j, spaceBefore: j > i };
   }
 
-  const unitOf = (unit) => {
+  const expOf = (unit) => {
     if (!unit) return NUMBER;
     if (/^px$/i.test(unit)) return LENGTH;
     if (/^em$/i.test(unit)) return emPx === null ? UNREADABLE : LENGTH;
@@ -320,18 +341,17 @@ function evalLengthMath(src, emPx) {
 
   function combine(op, a, b) {
     if (op === '+' || op === '-') {
-      // `<length> + <number>` is not a length, and neither is `<number> + <length>`.
-      if (a.unit !== b.unit) return UNREADABLE;
-      return mk(op === '+' ? a.v + b.v : a.v - b.v, a.unit);
+      // `<length> ± <number>` is neither, in both directions.
+      if (a.exp !== b.exp) return UNREADABLE;
+      return mk(op === '+' ? a.v + b.v : a.v - b.v, a.exp);
     }
     if (op === '*') {
-      // `<length> * <length>` is an area, not a length.
-      if (a.unit && b.unit) return UNREADABLE;
-      return mk(a.v * b.v, a.unit || b.unit);
+      const exp = a.exp + b.exp;
+      // length × length is an area and length⁻¹ is not a value at all.
+      return exp > 1 ? UNREADABLE : mk(a.v * b.v, exp);
     }
-    // Dividing by a length yields a number, which a margin cannot use.
-    if (b.unit) return UNREADABLE;
-    return mk(a.v / b.v, a.unit);
+    const exp = a.exp - b.exp;
+    return exp < 0 ? UNREADABLE : mk(a.v / b.v, exp);
   }
 
   function atom() {
@@ -364,36 +384,37 @@ function evalLengthMath(src, emPx) {
         }
         return UNREADABLE;
       }
-      // Every argument of min()/max()/clamp() must share one type.
-      const unit = args[0].unit;
-      if (!args.every((a) => a.unit === unit)) return UNREADABLE;
+      // Every argument must share one type, and `calc()` takes exactly one.
+      const { exp } = args[0];
+      if (!args.every((a) => a.exp === exp)) return UNREADABLE;
       if (name === 'calc') return args.length === 1 ? args[0] : UNREADABLE;
-      if (name === 'min') return mk(Math.min(...args.map((a) => a.v)), unit);
-      if (name === 'max') return mk(Math.max(...args.map((a) => a.v)), unit);
+      if (name === 'min') return mk(Math.min(...args.map((a) => a.v)), exp);
+      if (name === 'max') return mk(Math.max(...args.map((a) => a.v)), exp);
       // clamp(MIN, VAL, MAX) is max(MIN, min(VAL, MAX)) — not min-first.
       if (args.length !== 3) return UNREADABLE;
-      return mk(Math.max(args[0].v, Math.min(args[1].v, args[2].v)), unit);
+      return mk(Math.max(args[0].v, Math.min(args[1].v, args[2].v)), exp);
     }
     const num = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)([a-z%]*)/i.exec(s.slice(i));
     if (!num) return UNREADABLE;
     i += num[0].length;
-    const unit = unitOf(num[2]);
-    if (unit === UNREADABLE) return UNREADABLE;
-    const factor = unit === LENGTH && /^em$/i.test(num[2]) ? emPx : 1;
+    const exp = expOf(num[2]);
+    if (exp === UNREADABLE) return UNREADABLE;
+    const factor = /^em$/i.test(num[2]) ? emPx : 1;
     if (factor === null) return UNREADABLE;
-    return mk(Number(num[1]) * factor, unit);
+    return mk(Number(num[1]) * factor, exp);
   }
 
   function unary() {
     skip();
-    if (s[i] === '-') {
+    const sign = s[i];
+    if (sign === '-' || sign === '+') {
       i += 1;
+      // A unary sign belongs to its operand's token: `- 2px` is a delimiter plus
+      // a dimension, which the grammar rejects, and `--2px` is an ident.
+      if (i >= s.length || CSS_WS.test(s[i]) || s[i] === '-' || s[i] === '+') return UNREADABLE;
       const value = unary();
-      return value === UNREADABLE ? UNREADABLE : mk(-value.v, value.unit);
-    }
-    if (s[i] === '+') {
-      i += 1;
-      return unary();
+      if (value === UNREADABLE) return UNREADABLE;
+      return sign === '-' ? mk(-value.v, value.exp) : value;
     }
     return atom();
   }
@@ -435,8 +456,20 @@ function evalLengthMath(src, emPx) {
   const value = atom();
   skip();
   if (value === UNREADABLE || i !== s.length || !Number.isFinite(value.v)) return UNREADABLE;
-  // A margin is a length, so a bare number (`calc(2)`) is not a value here.
-  if (value.unit !== LENGTH) return UNREADABLE;
+  return value;
+}
+
+/** One `<length>` in px, or `UNREADABLE`. */
+function evalLengthValue(src, emPx) {
+  const value = evalMath(src, emPx);
+  if (value === UNREADABLE || value.exp !== 1) return UNREADABLE;
+  return value.v;
+}
+
+/** One `<number>`, or `UNREADABLE` — the argument type of `matrix()`/`matrix3d()`. */
+function evalNumberValue(src) {
+  const value = evalMath(src, null);
+  if (value === UNREADABLE || value.exp !== 0) return UNREADABLE;
   return value.v;
 }
 
@@ -445,7 +478,7 @@ function lengthInPx(raw, emPx) {
   const s = String(raw ?? '').trim();
   const px = pxLength(s);
   if (px !== null) return px;
-  if (/^(?:calc|min|max|clamp)\(/i.test(s)) return evalLengthMath(s, emPx);
+  if (/^(?:calc|min|max|clamp)\(/i.test(s)) return evalLengthValue(s, emPx);
   const em = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)em$/i.exec(s);
   if (em) return emPx === null ? UNREADABLE : Number(em[1]) * emPx;
   return UNREADABLE;
@@ -461,7 +494,7 @@ function components(value) {
     const ch = s[i];
     if (ch === '(') depth += 1;
     else if (ch === ')') depth = Math.max(0, depth - 1);
-    else if (depth === 0 && /\s/.test(ch)) {
+    else if (depth === 0 && CSS_WS.test(ch)) {
       if (i > start) out.push(s.slice(start, i));
       start = i + 1;
     }
@@ -503,7 +536,16 @@ function marginTopToken(value, emPx) {
 function marginTopOf(entries, emPx = null) {
   let best = null;
   for (const [prop, raw] of entries) {
-    if (prop !== 'margin-top' && prop !== 'margin-block-start' && prop !== 'margin') continue;
+    // `margin-block` is the logical shorthand for block-start/block-end, so its
+    // first value is the top margin — the modern spelling of `margin`.
+    if (
+      prop !== 'margin-top'
+      && prop !== 'margin-block-start'
+      && prop !== 'margin-block'
+      && prop !== 'margin'
+    ) {
+      continue;
+    }
     const { value, important } = stripImportant(raw);
     // Arity is part of the grammar: `margin-top` takes exactly one value and
     // `margin` at most four, so `margin-top:2px 3px` is a declaration the browser
@@ -511,7 +553,8 @@ function marginTopOf(entries, emPx = null) {
     // were absent. Reporting its first component invented a 2px nudge.
     const arity = components(value).length;
     if (arity === 0) continue;
-    if (prop === 'margin' ? arity > 4 : arity > 1) continue;
+    const limit = prop === 'margin' ? 4 : prop === 'margin-block' ? 2 : 1;
+    if (arity > limit) continue;
     if (!best || important || !best.important) {
       best = {
         value: marginTopToken(value, emPx),
@@ -530,17 +573,6 @@ function declaredFontPx(decls) {
   const raw = decls['font-size'];
   if (raw === undefined) return null;
   return pxLength(stripImportant(raw).value);
-}
-
-/** The winning declaration for one property, including `!important` over order. */
-function cascadeValue(entries, prop) {
-  let best = null;
-  for (const [name, raw] of entries) {
-    if (name !== prop) continue;
-    const parsed = stripImportant(raw);
-    if (!best || parsed.important || !best.important) best = parsed;
-  }
-  return best ? best.value : null;
 }
 
 /**
@@ -593,14 +625,17 @@ function splitArgs(text) {
  */
 function translateYOffsets(value) {
   const text = stripImportant(value).value;
+  // `transform: var(--t)` is valid CSS whose value lives elsewhere; reading it as
+  // "no translation" answered `ok` on a real 2px move.
+  if (/var\(/i.test(text)) return { sum: 0, parts: [], unreadable: true };
   // A top-level comma makes the whole declaration invalid (`translateY(2px),
   // translateY(2px)`), so the browser applies no transform at all.
-  if (components(text).length === 0) return { sum: 0, parts: [] };
+  if (components(text).length === 0) return { sum: 0, parts: [], unreadable: false };
   let depth = 0;
   for (let i = 0; i < text.length; i += 1) {
     if (text[i] === '(') depth += 1;
     else if (text[i] === ')') depth -= 1;
-    else if (text[i] === ',' && depth === 0) return { sum: 0, parts: [] };
+    else if (text[i] === ',' && depth === 0) return { sum: 0, parts: [], unreadable: false };
   }
   const fn = /([a-zA-Z][a-zA-Z0-9]*)\(/g;
   const parts = [];
@@ -614,7 +649,7 @@ function translateYOffsets(value) {
       if (text[i] === '(') depth += 1;
       else if (text[i] === ')') depth -= 1;
     }
-    if (depth !== 0) return { sum: parts.reduce((a, b) => a + b, 0), parts };
+    if (depth !== 0) return { sum: parts.reduce((a, b) => a + b, 0), parts, unreadable: false };
     const args = splitArgs(text.slice(open, i - 1));
     let index = -1;
     let bare = false;
@@ -635,12 +670,12 @@ function translateYOffsets(value) {
     if (index >= 0) {
       // A unitless non-zero translate is invalid CSS and moves nothing;
       // `lengthInPx` rejects it and resolves `calc()` when it can.
-      const amount = bare ? Number(args[index].trim()) : lengthInPx(args[index], null);
+      const amount = bare ? evalNumberValue(args[index]) : lengthInPx(args[index], null);
       if (amount !== UNREADABLE && Number.isFinite(amount)) parts.push(amount);
     }
     fn.lastIndex = i;
   }
-  return { sum: parts.reduce((a, b) => a + b, 0), parts };
+  return { sum: parts.reduce((a, b) => a + b, 0), parts, unreadable: false };
 }
 
 function nudgeFindings(blocks) {
@@ -665,19 +700,25 @@ function nudgeFindings(blocks) {
     const margin = marginTopOf(entries, declaredFontPx(block.decls));
     const transform = translateYOffsets(transformValueOf(entries));
 
-    if (margin.unreadable) {
-      // A later `margin-top: var(--x)` / `1rem` / `50%` wins the cascade but
-      // cannot be resolved, so a nudge cannot be ruled out. Answering `ok` here
-      // asserted an offset we never measured — `unknown` is the honest answer.
-      // A translate that already lands inside the window is still reported, so
-      // the block is not flagged twice.
-      if (Math.abs(transform.sum) < 1 || Math.abs(transform.sum) > 3) {
+    // A source that wins the cascade but cannot be resolved (`margin-top:
+    // var(--x)`, `1rem`, `50%`, invalid math, `transform: var(--t)`) means a
+    // nudge cannot be ruled out. Answering `ok` there asserted an offset nobody
+    // measured — `unknown` is the honest answer. A translate that already lands
+    // inside the window is still reported as a nudge, so the block is not
+    // flagged twice.
+    if (margin.unreadable || transform.unreadable) {
+      const known = transform.unreadable ? 0 : Math.abs(transform.sum);
+      if (known < 1 || known > 3) {
         findings.push({
           id: 'rule/nudge-unreadable',
           layer: 'heuristic',
           forcedVerdict: 'unknown',
           pixel: false,
-          evidence: `${block.selector}: margin-top:${margin.raw} wins the cascade but is not a length this pass can resolve, so a hard-coded nudge cannot be ruled out`,
+          evidence: `${block.selector}: ${
+            margin.unreadable
+              ? `margin-top:${margin.raw}`
+              : 'transform' 
+          } wins the cascade but is not a value this pass can resolve, so a hard-coded nudge cannot be ruled out`,
           suggested: {
             kind: 'inspect',
             value: 'inline the computed px value, or check the declaration by hand',
@@ -690,11 +731,11 @@ function nudgeFindings(blocks) {
     const nudge = margin.value + transform.sum;
     // A sub-pixel nudge sits inside the tolerance band by definition; flagging it
     // would be noise. The documented window is 1px <= |offset| <= 3px per
-    // contribution, and the composition is reported too (at most 6px for two
-    // sources): a margin plus a translate, or two stacked translations, that each
-    // land inside the window are still hacks, not layout. One 24px margin stays
-    // out of the window, which is the point; a large offset that a translate
-    // cancels back into the window is reported at its honest net value.
+    // contribution, and contributions that each land inside it are reported at
+    // their sum: a margin plus a translate, or several stacked translations, are
+    // still hacks, not layout. One 24px margin stays out of the window, which is
+    // the point; a large offset that a translate cancels back into the window is
+    // reported at its honest net value.
     const inWindow = (px) => Math.abs(px) >= 1 && Math.abs(px) <= 3;
     const contributions = [margin.value, ...transform.parts].filter((px) => px !== 0);
     const allOptical = contributions.length > 0 && contributions.every((px) => Math.abs(px) <= 3);

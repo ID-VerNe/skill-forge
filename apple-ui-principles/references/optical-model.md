@@ -716,23 +716,31 @@ because it asserts an offset nobody measured:
 | `var(--gap)`, `1rem`, `50%` | **`unknown`** (`rule/nudge-unreadable`): a nudge cannot be ruled out, so inline the computed px value |
 | invalid math — `calc(2px*2px)`, `calc(4px/2px)`, `calc(2px + 0)`, `calc(2px+1px)` | **`unknown`** — the browser drops the declaration and the *previous* one wins, so the offset is not the one this declaration spells |
 
-The evaluator carries `<length>`/`<number>` types and the tokeniser's whitespace
-rule, because a confident number from an expression CSS rejects is the same false
-`ok` as no evaluation at all: `calc(2px*2px)` is an area, `calc(4px/2px)` is
-unitless, `calc(2px + 0)` adds a number to a length, and a binary `+`/`-` needs
-whitespace on both sides (`calc(2px+1px)` tokenises as `2px` then `+1px`). Each of
-those is dropped at parse time, so the earlier declaration keeps applying.
+The evaluator carries a **length exponent** rather than a string type, because a
+confident number from an expression CSS rejects is the same false `ok` as no
+evaluation at all. `0` is a `<number>`, `1` a `<length>`; multiplication adds the
+exponent and division subtracts it, so `calc(2px / 2px * 2px)` is a length (`2px`)
+while `calc(2px*2px)` is an area and `calc(4px/2px)` is a bare number. Adding a
+length to a number (`calc(2px + 0)`) is invalid, and a binary `+`/`-` needs
+whitespace on both sides: `calc(2px+1px)` tokenises as `2px` then `+1px`. A unary
+sign belongs to its operand's token, so `calc(- 2px)` is a delimiter followed by a
+dimension and `calc(--2px)` is an ident — both are dropped at parse time, and the
+earlier declaration keeps applying.
 
-Arity is part of the grammar too. `margin-top` takes exactly one value and
-`margin` at most four, so `margin-top:2px 3px` is dropped rather than read as
-`2px`, and the earlier declaration wins.
+Arity is part of the grammar too. `margin-top` takes exactly one value, `margin`
+at most four and `margin-block` at most two, so `margin-top:2px 3px` is dropped
+rather than read as `2px`. `margin-block` is the logical shorthand for
+`margin-block-start`/`-end`, so its first value is the top margin — the modern
+spelling of the same nudge.
 
 `-webkit-transform` is an alias of `transform` in Chromium, so both cascade as
 one property and the later declaration wins; `matrix(a,b,c,d,e,f)` and
 `matrix3d(…)` carry their Y translation in `f` and the fourth-column entry
-respectively, and are read as the unitless numbers they are. A top-level comma in
-`transform` (`translateY(2px), translateY(2px)`) invalidates the declaration, so
-no transform is applied.
+respectively, read as the unitless `<number>`s they are (a `calc()` number such as
+`calc(2)` included). A top-level comma in `transform`
+(`translateY(2px), translateY(2px)`) invalidates the declaration, so no transform
+is applied, while `transform: var(--t)` is valid CSS whose value lives outside the
+file — that one is `unknown`, not a zero.
 
 The reporting window is `1px ≤ |offset| ≤ 3px` **per contribution**. A single
 `margin-top: 4px` is layout and stays silent, and so is a `24px` margin that a
