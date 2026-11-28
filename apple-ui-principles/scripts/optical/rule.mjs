@@ -463,7 +463,7 @@ function marginTopOf(entries, emPx = null) {
 function declaredFontPx(decls) {
   const raw = decls['font-size'];
   if (raw === undefined) return null;
-  return pxLength(String(raw).trim());
+  return pxLength(stripImportant(raw).value);
 }
 
 /** The winning declaration for one property, including `!important` over order. */

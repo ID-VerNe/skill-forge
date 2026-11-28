@@ -2856,8 +2856,14 @@ test('a later unreadable margin is never quietly treated as zero', () => {
     near(f.measured.dx, 2, 0.01);
   }
   // `em` resolves against the px font size declared in the same block, so a
-  // 16px margin is layout and not a nudge.
+  // 16px margin is layout and not a nudge. A priority marker on `font-size` is
+  // part of the declaration, not the length, so it must not defeat the lookup.
   assert.equal(finding('.x{font-size:16px;margin-top:2px;margin-top:1em}'), undefined);
+  near(
+    finding('.x{font-size:16px!important;margin-top:.125em}')?.measured.dx ?? 0,
+    2,
+    0.01,
+  );
   // What genuinely cannot be resolved answers `unknown`, never `ok`. The last
   // two are invalid CSS (a declaration cannot trail a function call, and a
   // length cannot be divided by zero): reading `calc(2px)+1px` as an expression
