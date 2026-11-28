@@ -249,6 +249,21 @@ export function syncInstalls({ skillDir, home = os.homedir(), agents = AGENTS } 
 
   const results = [];
 
+  // Check every position before touching any of them. Deciding this inside the
+  // loop below would leave the earlier agents already relinked when the last
+  // one turns out to overlap the source — a rejected run must be a no-op.
+  for (const agent of agents) {
+    const installPath = path.join(resolvedHome, agent.dir, name);
+    if (!lstatOrNull(installPath) || samePath(installPath, resolvedSkill)) continue;
+    if (contains(installPath, resolvedSkill) || contains(resolvedSkill, installPath)) {
+      const err = new Error(
+        `install position and source overlap: ${installPath} / ${resolvedSkill}`,
+      );
+      err.usage = true;
+      throw err;
+    }
+  }
+
   for (const agent of agents) {
     const installPath = path.join(resolvedHome, agent.dir, name);
     // Absent means this agent never had the skill installed. Creating one is an
@@ -262,15 +277,6 @@ export function syncInstalls({ skillDir, home = os.homedir(), agents = AGENTS } 
     if (samePath(installPath, resolvedSkill)) {
       results.push({ agent: agent.id, mode: agent.mode, installPath, state: 'is-source' });
       continue;
-    }
-    // One of the two contains the other: replacing the install would delete the
-    // source, and pruning the mirror would delete it file by file.
-    if (contains(installPath, resolvedSkill) || contains(resolvedSkill, installPath)) {
-      const err = new Error(
-        `install position and source overlap: ${installPath} / ${resolvedSkill}`,
-      );
-      err.usage = true;
-      throw err;
     }
     const outcome =
       agent.mode === 'junction'
@@ -389,6 +395,7 @@ if (isMainModule()) {
     }
   } catch (err) {
     process.stderr.write(`sync-installs: ${err.message}\n`);
-    process.exitCode = err && err.usage ? 64 : 1;
+    // Same split as the CLI: 64 is a bad invocation, 2 is "could not do it".
+    process.exitCode = err && err.usage ? 64 : 2;
   }
 }

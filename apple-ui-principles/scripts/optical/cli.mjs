@@ -177,6 +177,15 @@ async function loadPolicy(path) {
   };
 }
 
+const FILE_KINDS = { '.svg': 'svg', '.css': 'css', '.tsx': 'tsx', '.jsx': 'jsx' };
+
+/** Reject a file the checker has no reader for, before anything is measured. */
+function assertSupported(path) {
+  const kind = FILE_KINDS[extname(path).toLowerCase()];
+  if (!kind) throw usage(`unsupported file type: ${path}`);
+  return kind;
+}
+
 /** A directory and a `--mode` that needs a file answer different questions. */
 function assertModeFits(info, opts) {
   if (info.isDirectory()) {
@@ -207,6 +216,7 @@ async function validateTargets(opts) {
       throw err;
     }
     assertModeFits(info, opts);
+    if (!info.isDirectory()) assertSupported(resolved);
   }
 }
 
@@ -214,12 +224,11 @@ async function checkPath(path, opts) {
   const info = await stat(path);
   assertModeFits(info, opts);
   if (info.isDirectory()) return checkIconSet(path);
-  const ext = extname(path).toLowerCase();
-  if (ext === '.svg') return checkIconFile(path, { mode: opts.mode });
+  const kind = assertSupported(path);
+  if (kind === 'svg') return checkIconFile(path, { mode: opts.mode });
   const text = await readFile(path, 'utf8');
-  if (ext === '.css') return checkCss(text, { target: basename(path) });
-  if (ext === '.tsx' || ext === '.jsx') return checkTsx(text, { target: basename(path) });
-  throw usage(`unsupported file type: ${path}`);
+  if (kind === 'css') return checkCss(text, { target: basename(path) });
+  return checkTsx(text, { target: basename(path) });
 }
 
 /**

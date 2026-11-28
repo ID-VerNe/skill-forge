@@ -199,6 +199,21 @@ test('a source nested inside an install position is refused, not pruned', () => 
   assert.equal(readFileSync(join(nested, 'SKILL.md'), 'utf8'), 'nested\n');
 });
 
+test('an overlap rejection leaves every install untouched', () => {
+  const { skill, home } = sandbox();
+  const stale = staleJunction(home); // a perfectly repairable position
+  const base = join(home, '.gemini', 'config', 'skills', 'apple-ui-principles');
+  const nested = join(base, 'checkout', 'apple-ui-principles');
+  write(join(nested, 'SKILL.md'), 'nested\n');
+
+  const result = heal('--home', home, '--skill-dir', nested);
+
+  assert.equal(result.status, 64);
+  // The overlap is found on the last agent; the first must not be fixed already.
+  assert.equal(fs.lstatSync(stale).isSymbolicLink(), false);
+  assert.equal(readFileSync(join(stale, 'SKILL.md'), 'utf8'), 'september copy\n');
+});
+
 test('heal output goes to stderr so --json stays parseable', () => {
   const { skill, home } = sandbox();
   staleJunction(home);
@@ -240,6 +255,19 @@ test('a rejected invocation has no side effects', () => {
   // The flag is refused, so the installs must not have been touched first.
   assert.equal(fs.lstatSync(stale).isSymbolicLink(), false);
   assert.equal(readFileSync(join(stale, 'SKILL.md'), 'utf8'), 'september copy\n');
+});
+
+test('an unsupported file type is refused before the installs are touched', () => {
+  const { root, skill, home } = sandbox();
+  const stale = staleJunction(home);
+  const junk = join(root, 'asset.bin');
+  write(junk, 'not a stylesheet\n');
+
+  const result = run('check', junk, '--self-heal', '--home', home, '--skill-dir', skill);
+
+  assert.equal(result.status, 64);
+  assert.match(result.stderr, /unsupported file type/);
+  assert.equal(fs.lstatSync(stale).isSymbolicLink(), false);
 });
 
 test('an option is never consumed as a directory value', () => {
