@@ -643,6 +643,15 @@ function translateYOffsets(value) {
   }
 
   const arity = { translatey: [1], translate3d: [3], translate: [1, 2], matrix: [6], matrix3d: [16] };
+  // Anything outside the standard function set makes the declaration invalid,
+  // and we cannot tell a typo from a function we do not know — so it is a value
+  // we cannot read, not a translation of zero.
+  const known = new Set([
+    ...Object.keys(arity),
+    'rotate', 'rotate3d', 'rotatex', 'rotatey', 'rotatez',
+    'scale', 'scale3d', 'scalex', 'scaley', 'scalez',
+    'skew', 'skewx', 'skewy', 'perspective', 'translatez', 'translatex',
+  ]);
   // `matrix(a,b,c,d,e,f)` puts the translation in `f`, `matrix3d` in the fourth
   // column — index 13. Both move the box exactly like a translate.
   const yIndex = { translatey: 0, translate3d: 1, translate: 1, matrix: 5, matrix3d: 13 };
@@ -662,6 +671,7 @@ function translateYOffsets(value) {
     if (level !== 0) return { ...none, parts };
     const args = splitArgs(text.slice(open, i - 1));
     fn.lastIndex = i;
+    if (!known.has(name)) return { ...none, unreadable: true };
     const allowed = arity[name];
     if (!allowed) continue; // rotate(), skew(), perspective() … carry no Y offset
     // One malformed transform function invalidates the whole declaration, so the

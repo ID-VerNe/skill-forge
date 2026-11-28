@@ -3180,3 +3180,18 @@ test('one malformed transform function invalidates the whole declaration', () =>
   near(nudge('transform:translateY(2px) rotate(45deg)'), 2, 0.01);
   near(nudge('transform:translateY(2px) perspective(10px)'), 2, 0.01);
 });
+
+test('a transform function outside the standard set is unreadable', () => {
+  // A typo'd or unknown function invalidates the declaration, and this pass
+  // cannot tell that apart from a function it simply does not model — so it
+  // refuses instead of reading the list as "everything except the translate".
+  assert.equal(
+    checkCss('.x{font-size:16px;transform:bogus(2px) translateY(2px)}', { target: 'fn.css' })
+      .verdict,
+    'unknown',
+  );
+  // Known functions that carry no Y offset still pass through.
+  for (const decl of ['transform:translateZ(2px)', 'transform:rotate(45deg)', 'transform:scale(2)']) {
+    assert.equal(checkCss(`.x{font-size:16px;${decl}}`, { target: 'fn.css' }).verdict, 'ok', decl);
+  }
+});
