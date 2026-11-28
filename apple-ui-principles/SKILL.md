@@ -149,7 +149,7 @@ are usage errors (exit `64`), not values silently coerced by `Number()`.
 | `icon.svg` with `vector-effect="non-scaling-stroke"` | — | the authored width is **px**, not user units: on a 48px canvas over a 24-unit viewBox, `stroke-width="2"` is one user unit |
 | `icons/` (dir) | `keyline` | fill-ratio outliers across the set (needs ≥3 icons of one family) |
 | `styles.css` | rule | `text-box` in flex/grid, hard-coded nudges |
-| `styles.css` with `margin-top: var(--gap)` / `1rem` / `50%` / invalid math (`calc(2px*2px)`, `calc(2px+1px)`, `calc(- 2px)`) / `transform: var(--t)` on a text block | rule | `unknown` (`rule/nudge-unreadable`): the declaration wins the cascade but is not a value this pass can resolve, so a nudge cannot be ruled out. `calc(2px)`, `min()`, `clamp()`, `em` against a px `font-size`, `matrix()` and `-webkit-transform` *are* evaluated — only genuinely unknowable values and expressions CSS would drop refuse. Inline the computed px value to get a verdict |
+| `styles.css` with `margin-top: var(--gap)` / `1rem` / `50%` / invalid math (`calc(2px*2px)`, `calc(2px+1px)`, `calc(- 2px)`) / `transform: var(--t)` on a text block | rule | `unknown` (`rule/nudge-unreadable`): the declaration wins the cascade but is not a value this pass can resolve, so a nudge cannot be ruled out. `calc(2px)`, `min()`, `clamp()`, `em` against a px `font-size`, `matrix()` and `-webkit-transform` *are* evaluated — only genuinely unknowable values and expressions CSS would drop refuse. A measurable margin in the same block is still reported as `nudge`, with the unreadable half left out. Inline the computed px value to get a verdict |
 | `Button.tsx` | rule | same, plus concentric radii from the element tree |
 
 | Verdict | Exit | Meaning | Response |

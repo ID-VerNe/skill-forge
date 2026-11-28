@@ -714,6 +714,7 @@ because it asserts an offset nobody measured:
 | `1em` with `font-size:16px` in the block | `16px` — layout, not a nudge |
 | `auto` | `0` on a block box; it genuinely cancels |
 | `var(--gap)`, `1rem`, `50%` | **`unknown`** (`rule/nudge-unreadable`): a nudge cannot be ruled out, so inline the computed px value |
+| `margin-top:2px` **plus** `transform: var(--t)` | `nudge 2` — the margin half was measured, so it is named; only when nothing is readable does the block become `unknown` |
 | invalid math — `calc(2px*2px)`, `calc(4px/2px)`, `calc(2px + 0)`, `calc(2px+1px)` | **`unknown`** — the browser drops the declaration and the *previous* one wins, so the offset is not the one this declaration spells |
 
 The evaluator carries a **length exponent** rather than a string type, because a
@@ -750,9 +751,23 @@ file — that one is `unknown`, not a zero.
 
 One malformed function invalidates the **whole** declaration, not just itself:
 `translateY(2px) matrix(1,0,0,1,0,calc(2px))` applies no transform at all, because
-`calc(2px)` is a length where `matrix()` wants a number. Functions that simply
-carry no Y offset (`rotate()`, `skewX()`, `perspective()`) are not malformed and
-do not cancel a translate beside them.
+`calc(2px)` is a length where `matrix()` wants a number.
+
+The Y-carrying functions (`translate`, `translateY`, `translate3d`, `matrix`,
+`matrix3d`) have their arity and argument types checked. The rest are matched by
+**name only**: `rotate()`, `skewX()`, `perspective()` are known to carry no Y
+offset and do not cancel a translate beside them, but an extra argument inside one
+of them (`rotate(45deg, 0)`) is not caught — that declaration is dropped by the
+browser and this pass still reports the translate. A name outside the standard set
+(`bogus(2px)`, `attr(…)`) is treated as **`unknown`**, not as "no translation",
+because a typo and a function this pass does not model look the same from here.
+
+A known limit worth stating plainly: a `translateY()` argument this pass cannot
+resolve — `translateY(0.125rem)`, `translateY(0.125em)`, `translateY(2vw)`,
+`translateY(50%)` — is read as **no translation**, not as `unknown`. Those are
+relative to a font size, a viewport or the box itself, and treating the very common
+`translateY(-50%)` centring as unknown would drown the report. A margin in the same
+position is `unknown`; the two paths differ on purpose.
 
 The reporting window is `1px ≤ |offset| ≤ 3px` **per contribution**. A single
 `margin-top: 4px` is layout and stays silent, and so is a `24px` margin that a
