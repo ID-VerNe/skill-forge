@@ -1,0 +1,2018 @@
+// Icon-layer checks: #1 ink bounding box, #2 area centroid, #3 keyline set.
+//
+// The model is deliberately literal: we measure ink, not layout boxes. A path
+// that renders outside its own viewBox is a real defect and must not be
+// normalised away.
+//
+// The governing rule is that a missing measurement is never a zero. If any part
+// of the drawing cannot be resolved (clip paths, masks, dangling <use>, empty
+// canvases), the report says `unknown` instead of producing a number.
+
+import { readFile, readdir } from 'node:fs/promises';
+import { basename, join } from 'node:path';
+import {
+  flattenPath,
+  netShape,
+  netShapeEvenOdd,
+  bboxOfPoints,
+  enclosesArea,
+  parseTransform,
+  INVALID_TRANSFORM,
+  applyMatrix,
+  multiplyMatrix,
+  shapeToPath,
+  parseLength,
+  CSS_NUMBER,
+  numberList,
+  parsePreserveAspectRatio,
+  viewBoxMatrix,
+  IDENTITY,
+} from './geom.mjs';
+import { buildReport, tolFor } from './report.mjs';
+import {
+  cascade,
+  isDroppedPaint,
+  isInvisiblePaint,
+  isRuntimePaint,
+  paintKind,
+  parseStyle,
+} from './stylesheet.mjs';
+
+const round = (n, d = 3) => Math.round(n * 10 ** d) / 10 ** d;
+
+/** CSS keywords are case-insensitive; `fill="None"` is not a paint. */
+const keywordIs = (value, keyword) =>
+  value !== undefined && value !== null && String(value).trim().toLowerCase() === keyword;
+
+const SHAPES = new Set(['path', 'rect', 'circle', 'ellipse', 'polygon', 'polyline', 'line']);
+const NON_RENDERING = new Set([
+  'defs',
+  'clippath',
+  'mask',
+  'symbol',
+  'pattern',
+  'marker',
+  'lineargradient',
+  'radialgradient',
+  'filter',
+  'style',
+  'title',
+  'desc',
+  'metadata',
+]);
+// Properties that put ink where this module cannot follow it: a mask or filter
+// rewrites the painted region, and a marker draws a shape of its own outside the
+// path it decorates (arrowheads routinely stick out past the ink box).
+const UNRESOLVABLE = ['mask', 'filter', 'marker', 'marker-start', 'marker-mid', 'marker-end'];
+// Elements that paint, but not as geometry we can measure.
+const UNMEASURABLE_INK = new Set([
+  'text',
+  'tspan',
+  'textpath',
+  'image',
+  'foreignobject',
+  'video',
+  'canvas',
+  'switch',
+]);
+const MAX_USE_DEPTH = 3;
+/** Group nesting beyond this is a refusal, not a stack overflow. */
+const MAX_NESTING = 200;
+/** Elements whose presence means the drawing is not one fixed shape. */
+const ANIMATION = new Set([
+  'animate',
+  'animatetransform',
+  'animatemotion',
+  'animatecolor',
+  'set',
+  'mpath',
+]);
+/** Attributes whose animation changes what the ink is or where it sits. */
+const GEOMETRY_ANIMATION = new Set([
+  'transform',
+  'x',
+  'y',
+  'width',
+  'height',
+  'cx',
+  'cy',
+  'r',
+  'rx',
+  'ry',
+  'd',
+  'points',
+  'stroke-width',
+  'stroke-dasharray',
+  'stroke-dashoffset',
+  'stroke-linecap',
+  'stroke-linejoin',
+  // `fill`, `stroke`, `fill-rule` and the opacity properties belong here too,
+  // but only some of their values change the ink — see `movesInk` below.
+  'fill',
+  'stroke',
+  'fill-rule',
+  'fill-opacity',
+  'stroke-opacity',
+  'color',
+  'visibility',
+  'display',
+  'clip-path',
+  'filter',
+  'mask',
+  'offset',
+  'path',
+]);
+
+/** Split a value list on separators that are *outside* parentheses. */
+function splitValues(raw) {
+  const s = String(raw);
+  const out = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0 && /[\s;,]/.test(ch)) {
+      if (i > start) out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (s.length > start) out.push(s.slice(start));
+  return out.filter(Boolean);
+}
+
+/**
+ * Does animating this attribute change what the ink *is*?
+ *
+ * The set above says "this attribute matters"; not every value does. A colour
+ * cycle from `#000` to `#f00` repaints without moving or resizing anything, so
+ * the geometry still stands and refusing it would make the checker useless on
+ * the most common SVG animation there is. Anything that reaches zero paint does
+ * change the ink, and so does `evenodd` turning holes into solid.
+ *
+ * The endpoint list is split into individual values rather than pattern-matched:
+ * `#00000000` and `rgba(0,0,0,0)` say "transparent" without using the word, and
+ * `.0` / `0%` are zero opacity just as much as `0`.
+ */
+function movesInk(target, values) {
+  const tokens = splitValues(values);
+  if (target === 'fill' || target === 'stroke') {
+    return tokens.some((token) => keywordIs(token, 'none') || isInvisiblePaint(token));
+  }
+  if (target === 'fill-rule') return /\bevenodd\b/.test(values);
+  if (target === 'opacity' || target === 'fill-opacity' || target === 'stroke-opacity') {
+    return tokens.some((token) => {
+      const n = token.endsWith('%') ? Number(token.slice(0, -1)) / 100 : Number(token);
+      return Number.isFinite(n) && n <= 0;
+    });
+  }
+  return GEOMETRY_ANIMATION.has(target);
+}
+
+/**
+ * Index of the `>` that closes a tag, ignoring any that sit inside a quoted
+ * attribute value.
+ *
+ * `data-name="a>b"` is legal XML. Scanning to the first `>` cut the tag there,
+ * so `d` and `class` after it vanished — and a shape with no `d` is not ink, so
+ * the file measured as if that glyph had never been drawn.
+ */
+function findTagEnd(text, from) {
+  let quote = null;
+  for (let i = from; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '>') {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** Minimal XML scanner: enough for icon markup, strict enough to fail loudly. */
+function parseXml(text) {
+  const root = { tag: '#root', attrs: {}, children: [] };
+  const stack = [root];
+  let i = 0;
+  while (i < text.length) {
+    const lt = text.indexOf('<', i);
+    if (lt === -1) break;
+    if (text.startsWith('<!--', lt)) {
+      const end = text.indexOf('-->', lt + 4);
+      i = end === -1 ? text.length : end + 3;
+      continue;
+    }
+    if (text.startsWith('<![CDATA[', lt)) {
+      const end = text.indexOf(']]>', lt + 9);
+      i = end === -1 ? text.length : end + 3;
+      continue;
+    }
+    if (text.startsWith('<?', lt) || text.startsWith('<!', lt)) {
+      const end = text.indexOf('>', lt);
+      i = end === -1 ? text.length : end + 1;
+      continue;
+    }
+    const gt = findTagEnd(text, lt + 1);
+    if (gt === -1) break;
+    const raw = text.slice(lt + 1, gt).trim();
+    if (raw.startsWith('/')) {
+      if (stack.length > 1) stack.pop();
+      i = gt + 1;
+      continue;
+    }
+    const selfClosing = raw.endsWith('/');
+    const body = selfClosing ? raw.slice(0, -1).trim() : raw;
+    const space = body.search(/[\s]/);
+    // `xmlns:svg="…/svg"` makes `<svg:rect>` the same element as `<rect>`; some
+    // exporters write the prefix on every node. Keeping it meant `SHAPES` did not
+    // match, the element fell through to the container branch, and its geometry
+    // vanished without a word: a 400-unit rect measured as 16.
+    const rawTag = (space === -1 ? body : body.slice(0, space)).toLowerCase();
+    const tag = rawTag.replace(/^[^:]+:/, '');
+    const attrText = space === -1 ? '' : body.slice(space);
+    const attrs = {};
+    const attrRe = /([\w:.-]+)\s*=\s*("([^"]*)"|'([^']*)')/g;
+    let m = attrRe.exec(attrText);
+    while (m) {
+      attrs[m[1]] = m[3] !== undefined ? m[3] : m[4];
+      m = attrRe.exec(attrText);
+    }
+    const node = { tag, attrs, children: [] };
+    stack[stack.length - 1].children.push(node);
+    if (!selfClosing) stack.push(node);
+    i = gt + 1;
+  }
+  return root;
+}
+
+/**
+ * Read a `viewBox`, or `null` when the attribute is present but unusable.
+ *
+ * Two failure modes used to hide here. `" 0 0 512 512"` is legal — the leading
+ * space produces an empty first field under a naive split, the parse failed, and
+ * the code quietly invented a 24x24 canvas, reporting a perfectly centred icon
+ * as 1016% off. And when `viewBox` really is malformed the element does not
+ * render at all, so falling back to any canvas is fiction. Absent is the only
+ * case that gets a default, and then width/height describe the user space.
+ */
+function parseViewBox(attrs) {
+  if (attrs.viewBox !== undefined) {
+    // The same CSS number lexer as everywhere else. `Number('0x18')` is 24, so a
+    // `viewBox="0 0 0x18 0x18"` used to be read as a 24x24 canvas that Chrome
+    // does not have (it ignores the attribute and falls back to user units);
+    // `"0 0 24. 24"` likewise.
+    const parts = numberList(attrs.viewBox);
+    if (parts && parts.length === 4 && parts[2] > 0 && parts[3] > 0) {
+      return { x: parts[0], y: parts[1], w: parts[2], h: parts[3] };
+    }
+    return null;
+  }
+  const w = absolutePx(attrs.width);
+  const h = absolutePx(attrs.height);
+  // `width="100%"` sizes the canvas against a host we cannot see. Defaulting to
+  // 24x24 there is not a convention, it is an invented canvas.
+  if (attrs.width !== undefined && w === null) return null;
+  if (attrs.height !== undefined && h === null) return null;
+  return { x: 0, y: 0, w: w !== null && w > 0 ? w : 24, h: h !== null && h > 0 ? h : 24 };
+}
+
+/** Which part of the canvas was unusable, for the unresolved reason. */
+function viewBoxFailure(attrs) {
+  return attrs.viewBox !== undefined ? 'invalid-viewBox' : 'relative-canvas';
+}
+
+/**
+ * Resolve a length against a percentage basis. Returns `null` when the unit is
+ * relative to something we cannot see (em, ch, viewport units). `fallback` is
+ * what an absent attribute means — 0 for x/y, the viewport size for width/height.
+ */
+function resolveLength(value, basis, fallback = basis) {
+  if (value === undefined || value === null) return fallback;
+  const text = String(value).trim();
+  const pct = /^(.+)%$/.exec(text);
+  if (pct) {
+    // No trim around the `%`: CSS does not allow `50 %`, and accepting it would
+    // size a `<use>` from a declaration the engine drops.
+    return CSS_NUMBER.test(pct[1]) ? (Number(pct[1]) / 100) * basis : null;
+  }
+  const body = /px$/i.test(text) ? text.slice(0, -2) : text;
+  // `+6` is a number and Chrome honours `<use x="+6">`; refusing it refused a
+  // perfectly readable icon. `16.` is not a number to the CSS lexer.
+  return CSS_NUMBER.test(body) ? Number(body) : null;
+}
+
+/**
+ * Absolute length in px, or null when it depends on external context.
+ *
+ * `1in` is absolute — CSS pins it to 96px — so it must not fall through to the
+ * "no size declared" branch, which would quietly assume a 24px render.
+ */
+const ABSOLUTE_UNITS = { px: 1, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, pt: 96 / 72, pc: 16 };
+
+function absolutePx(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  const m = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([a-z]+)?$/i.exec(text);
+  if (!m) return null;
+  const unit = (m[2] || 'px').toLowerCase();
+  const factor = ABSOLUTE_UNITS[unit];
+  // An unknown unit (`2em`, `50vh`) is not "no size declared" — it is a size this
+  // pass cannot read, and returning null for both let `width="2em"` fall through
+  // to the 24px assumption.
+  if (factor === undefined) return null;
+  return Number(m[1]) * factor;
+}
+
+/**
+ * Attributes after cascade. `node.effective` is filled in once per document by
+ * `applyStylesheets`; nodes outside that pass (a `<use>` clone) fall back to
+ * their own presentation attributes plus inline style.
+ */
+function effectiveAttrs(node) {
+  if (node.effective) return node.effective;
+  const merged = { ...node.attrs };
+  for (const [prop, value] of Object.entries(parseStyle(node.attrs.style).decls)) {
+    // A paint value CSS cannot parse is dropped by the browser, which leaves the
+    // property at its inherited or initial value. Keeping the junk string meant
+    // "not none, therefore paint" — six spellings of an invisible shape reported
+    // as `ok`. Dropping the inline declaration lets the presentation attribute
+    // apply, which is what the cascade does; dropping the attribute as well is
+    // what "the declaration never happened" means for the paint itself.
+    if ((prop === 'fill' || prop === 'stroke') && isDroppedPaint(value)) continue;
+    merged[prop] = value;
+  }
+  for (const prop of ['fill', 'stroke']) {
+    if (merged[prop] !== undefined && isDroppedPaint(merged[prop])) delete merged[prop];
+  }
+  return merged;
+}
+
+function indexIds(node, map) {
+  // Iterative: an exported file can nest thousands of groups, and a recursive
+  // walk would blow the stack before any guard could run.
+  const stack = [node];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current.attrs && current.attrs.id) map.set(current.attrs.id, current);
+    for (const child of current.children || []) stack.push(child);
+  }
+}
+
+/** `<style>` bodies, with the attributes of the element that carried them. */
+function extractSheets(text) {
+  const out = [];
+  // `<!-- <style>.a{fill:none}</style> -->` is documentation, not a rule. Strip
+  // comments before scanning, or a commented-out stylesheet still paints.
+  const visible = String(text).replace(/<!--[\s\S]*?-->/g, '');
+  const re = /<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi;
+  const attrRe = /([\w:.-]+)\s*=\s*("([^"]*)"|'([^']*)')/g;
+  let m = re.exec(visible);
+  while (m) {
+    const attrs = {};
+    let a = attrRe.exec(m[1]);
+    while (a) {
+      attrs[a[1].toLowerCase()] = a[3] !== undefined ? a[3] : a[4];
+      a = attrRe.exec(m[1]);
+    }
+    attrRe.lastIndex = 0;
+    // A CDATA wrapper is transport, not CSS.
+    const css = m[2].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '');
+    // `media="print"` is a media query, and the screen is what the icon is shown
+    // on. The sheet's declarations do not apply at all — silently applying them
+    // painted a shape the render leaves empty.
+    const media = String(attrs.media || '').trim().toLowerCase();
+    out.push({ css, type: attrs.type || 'text/css', media });
+    m = re.exec(visible);
+  }
+  return out;
+}
+
+/**
+ * An animated icon has no single ink box: a spinner's centroid depends on the
+ * frame. Reporting the first frame as if it were the drawing is a number that
+ * cannot be re-derived, which is exactly what `off` promises it can be.
+ *
+ * Only animations that move ink (or turn it off) disqualify a file. A colour
+ * cycle leaves every measurement intact, and refusing those would cost coverage
+ * for nothing.
+ */
+function noteAnimation(root, ctx) {
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    const tag = String(node.tag).toLowerCase();
+    if (ANIMATION.has(tag)) {
+      const attrs = node.attrs || {};
+      const target = String(attrs.attributeName || '').trim().toLowerCase();
+      const values = `${attrs.from || ''} ${attrs.to || ''} ${attrs.values || ''}`.toLowerCase();
+      // `animateTransform` / `animateMotion` move the element whatever they are
+      // pointed at. `animate` / `set` are only as dangerous as their target.
+      const matters =
+        tag !== 'animate' && tag !== 'set' ? true : target === '' ? true : movesInk(target, values);
+      if (matters) {
+        ctx.unresolved.add('animated-ink');
+        return;
+      }
+    }
+    for (const child of node.children || []) stack.push(child);
+  }
+}
+
+function applyStylesheets(text, root, ctx) {
+  // An external sheet can repaint anything; there is nothing to resolve it
+  // against, so say so instead of measuring the file as if it were unpainted.
+  if (/<\?xml-stylesheet\b/i.test(String(text))) ctx.unresolved.add('external-stylesheet');
+  const sheets = extractSheets(text);
+  if (sheets.length === 0) return;
+  const { effective, unresolved } = cascade(sheets, root);
+  for (const id of unresolved) ctx.unresolved.add(id);
+  for (const [node, attrs] of effective) node.effective = attrs;
+}
+
+function matrixFrom(attrs, base, ctx) {
+  if (!attrs.transform) return base;
+  const parsed = parseTransform(attrs.transform);
+  // A list the engine rejects is dropped whole, so the element sits in its
+  // untransformed space. Units (`2px`, `45deg`, `10%`) and `var()` are all in that
+  // class: the `transform` attribute takes bare numbers, measured on Chrome for
+  // all six spellings.
+  if (parsed === INVALID_TRANSFORM) return base;
+  return multiplyMatrix(base, parsed);
+}
+
+/**
+ * `fill-opacity` accepts a percentage as well as a number, so `parseFloat` reads
+ * `50%` as fifty — fully opaque — instead of half. Only zero matters for area,
+ * but a wrong opacity flips `filled` in both directions.
+ */
+function resolveOpacity(raw, fallback) {
+  if (raw === undefined || raw === null) return fallback;
+  const text = String(raw).trim();
+  const pct = /^(-?\d*\.?\d+)%$/.exec(text);
+  const value = pct ? Number(pct[1]) / 100 : parseLength(text);
+  if (value === null || !Number.isFinite(value)) return fallback;
+  // Clamped, not merely compared. `opacity="-1"` is out of range and every engine
+  // clamps it to 0 — the shape disappears. Reading the raw value meant `-1 !== 0`,
+  // so the ink stayed on the canvas and the file came back `ok`.
+  return Math.min(Math.max(value, 0), 1);
+}
+
+function fillOpacityOf(attrs, inherited) {
+  return resolveOpacity(attrs['fill-opacity'], inherited.fillOpacity ?? 1);
+}
+
+function strokeOpacityOf(attrs, inherited) {
+  return resolveOpacity(attrs['stroke-opacity'], inherited.strokeOpacity ?? 1);
+}
+
+// Elements a `fill: url(#…)` reference may legitimately point at. Anything else
+// — a `<mask>`, a `<clipPath>`, a missing id — makes the paint declaration
+// invalid, and an invalid paint is `none`, not the colour of the shape it was
+// meant to be.
+const PAINT_SERVER = new Set([
+  'lineargradient',
+  'radialgradient',
+  'pattern',
+  'solidcolor',
+  'meshgradient',
+  'meshpatch',
+  'meshrow',
+]);
+
+/**
+ * What a `fill="url(#…)"` reference actually paints.
+ *
+ * Three answers, because there are three situations. A **missing** id paints
+ * nothing — SVG leaves the element unrendered, so counting the shape as painted
+ * invented a region nobody drew. A reference to a real paint server paints the
+ * shape's own region; only the colour or pattern changes, and colour is not
+ * measured. Anything else (`url(#someClipPath)`) is markup no engine honours,
+ * but guessing "nothing" would silently delete ink if the tag is one of the
+ * renderers this list does not know — so it is refused instead.
+ *
+ * `url(#g) red` carries a fallback paint and is treated as painted.
+ */
+function paintReference(paint, ctx) {
+  if (paint === undefined || paint === null) return 'paint';
+  const match = /^url\(\s*['"]?#([^)'"\s]+)['"]?\s*\)([\s\S]*)$/i.exec(String(paint).trim());
+  if (!match) return 'paint';
+  const fallback = match[2].trim();
+  // `url(#g) red` falls back to the colour, so a broken reference still paints.
+  // `url(#g) none` falls back to *not* painting, and reading it as painted put a
+  // 20×20 block of ink on the canvas for a shape the render leaves empty.
+  if (fallback !== '') {
+    return keywordIs(fallback, 'none') || isInvisiblePaint(fallback) ? 'absent' : 'paint';
+  }
+  const target = ctx.ids.get(match[1]);
+  if (!target) return 'absent';
+  if (!PAINT_SERVER.has(String(target.tag).toLowerCase())) return 'unknown';
+  // A paint server that exists is not a paint server that paints: an empty
+  // `<pattern>` and a gradient whose stops are all transparent cover nothing, and
+  // counting the shape as solid reported `ok` on a blank canvas.
+  return paintServerPaints(target, ctx) ? 'paint' : 'absent';
+}
+
+/** Does this paint server put any colour on the canvas? */
+function paintServerPaints(target, ctx, depth = 0) {
+  if (depth > 4) return true; // stop chasing `href` chains and assume it paints
+  const tag = String(target.tag).toLowerCase();
+  if (tag === 'pattern') {
+    return (target.children || []).some((child) => child.tag !== '#comment');
+  }
+  if (tag === 'lineargradient' || tag === 'radialgradient') {
+    const stops = (target.children || []).filter((child) => String(child.tag).toLowerCase() === 'stop');
+    if (stops.length === 0) {
+      // A gradient with no stops of its own takes them from `href`; with none
+      // anywhere it has nothing to paint.
+      const attrs = effectiveAttrs(target);
+      const href = String(attrs.href || attrs['xlink:href'] || '').trim();
+      const linked = /^#(.+)$/.exec(href);
+      const next = linked ? ctx.ids.get(linked[1]) : null;
+      return next ? paintServerPaints(next, ctx, depth + 1) : false;
+    }
+    return stops.some((stop) => {
+      const attrs = effectiveAttrs(stop);
+      if (resolveOpacity(attrs['stop-opacity'], 1) <= 0) return false;
+      const colour = attrs['stop-color'];
+      if (colour !== undefined && (keywordIs(colour, 'none') || isInvisiblePaint(colour))) return false;
+      return true;
+    });
+  }
+  return true;
+}
+
+/**
+ * The normalised diagonal a `stroke-width="10%"` is a percentage of.
+ *
+ * SVG defines the percentage against `sqrt((vb.w² + vb.h²) / 2)` — in **user
+ * units**, so a 48px canvas over a 24-unit viewBox still gives 24 units and 10%
+ * is a 2.4-unit band. Refusing every percentage because the viewport "is not
+ * fixed" was wrong whenever the file declares an absolute canvas and a viewBox;
+ * Chrome measures it, and the file carries every number needed to do the same.
+ * Without either, the basis really is unknowable and the caller still refuses.
+ */
+function viewportDiagonal(inherited) {
+  // Percentages resolve against the **nearest** viewport, and `inherited.viewport`
+  // is expressed in that viewport's own user space. Reading `ctx.root` instead
+  // gave a nested `<svg viewBox="0 0 48 48">` the root's 24-unit diagonal: a
+  // `16.666%` band became 4 units instead of 8, and a symmetric pair of bands
+  // came back `off` by 3px. The nominal 24x24 canvas is a comparison convention,
+  // not a viewport, so an undeclared one still refuses.
+  if (!inherited.viewportDeclared) return null;
+  const { w, h } = inherited.viewport || {};
+  if (!(w > 0) || !(h > 0)) return null;
+  return Math.hypot(w, h) / Math.SQRT2;
+}
+
+/**
+ * `stroke-width` is in user units, or a percentage of the viewport diagonal.
+ * The percentage has to resolve on ancestors too, since `stroke-width`
+ * inherits: a `<g stroke-width="10%">` is as measurable as a `<path>` with the
+ * same declaration once the root viewport is in the file.
+ */
+function strokeWidthOf(attrs, inherited, ctx) {
+  // Keep the *provenance* with the value. A dropped declaration — negative `%`
+  // included — inherits both the width and whether that width came from a
+  // viewport percentage. Tracking only the raw `%` text made a child with a
+  // plain `stroke-width="2"` skip the px→unit division after an invalid `%` on
+  // its parent, halving the band.
+  const fallback = {
+    width: inherited.strokeWidth,
+    fromViewport: Boolean(inherited.strokeWidthFromViewport),
+  };
+  if (attrs['stroke-width'] === undefined) return fallback;
+  const raw = String(attrs['stroke-width']).trim();
+  if (/%$/.test(raw)) {
+    const number = raw.slice(0, -1);
+    const basis = CSS_NUMBER.test(number) ? viewportDiagonal(inherited) : null;
+    if (basis === null) {
+      ctx.unresolved.add('stroke-width-percentage');
+      return fallback;
+    }
+    const value = (Number(number) / 100) * basis;
+    if (!Number.isFinite(value)) {
+      ctx.unresolved.add('stroke-width-percentage');
+      return fallback;
+    }
+    if (value < 0) {
+      // Invalid declaration: the browser drops it and the property keeps its
+      // inherited value (initially 1), exactly as a negative bare number does.
+      return fallback;
+    }
+    return { width: value, fromViewport: true };
+  }
+  const value = parseLength(raw);
+  if (value === null) {
+    ctx.unresolved.add('stroke-width-relative');
+    return fallback;
+  }
+  if (!Number.isFinite(value)) {
+    // `stroke-width="1e999"` overflows to infinity. One engine clamps it to the
+    // largest representable length and paints a band that covers the canvas,
+    // another drops the declaration as invalid. Both writes are defensible, so
+    // the width is unverifiable rather than one of them.
+    ctx.unresolved.add('stroke-width-not-finite');
+    return fallback;
+  }
+  if (value < 0) {
+    // A negative width is an invalid declaration: browsers drop it, so the
+    // element falls back to the inherited value rather than drawing a band of
+    // absolute width in the opposite direction.
+    return fallback;
+  }
+  return { width: value, fromViewport: false };
+}
+
+/**
+ * Resolve the CSS-wide keywords a paint declaration may carry.
+ *
+ * `fill` and `stroke` are inherited properties, so `inherit`, `unset` and
+ * `revert` all resolve to the parent's value; only `initial` restores the
+ * property's initial value. Treating the keyword as a colour kept the child
+ * painted: `<g fill="none"><rect fill="inherit"/>` has no ink, and the checker
+ * measured the rectangle as solid because `inherit` is not the string `none`.
+ */
+function paintValue(raw, inheritedValue, initial, color) {
+  const value =
+    raw === undefined
+      ? inheritedValue
+      : paintKind(raw) !== 'inherit'
+        ? raw
+        : String(raw).trim().toLowerCase() === 'initial'
+          ? initial
+          : inheritedValue;
+  // `currentColor` is not a colour, it is a reference to the inherited `color`.
+  // Treating it as "some colour, so it paints" reported `ok` on a blank canvas
+  // whenever the file (or a `text-transparent` class upstream) made `color`
+  // transparent. When `color` is set outside the file the assumption stays — but
+  // it is now stated in `SKILL.md` instead of hidden.
+  if (value !== undefined && keywordIs(value, 'currentcolor')) {
+    return color === undefined ? value : color;
+  }
+  return value;
+}
+
+/** Does a `<text>` element paint any glyph ink at all? */
+function textPaintsAnything(attrs, inherited) {
+  const fill = paintValue(attrs.fill, inherited.fill, 'black', inherited.color);
+  const stroke = paintValue(attrs.stroke, inherited.stroke, 'none', inherited.color);
+  const fillOff =
+    fill === undefined ||
+    keywordIs(fill, 'none') ||
+    isInvisiblePaint(fill) ||
+    fillOpacityOf(attrs, inherited) <= 0;
+  const strokeOff =
+    stroke === undefined ||
+    keywordIs(stroke, 'none') ||
+    isInvisiblePaint(stroke) ||
+    strokeOpacityOf(attrs, inherited) <= 0;
+  return !(fillOff && strokeOff);
+}
+
+/**
+ * `fill-rule` has exactly two valid values.
+ *
+ * Anything else is a dropped declaration, which means the property keeps the
+ * value it inherits — not the junk string. `fill-rule` is inherited, so
+ * `<g fill-rule="evenodd"><path fill-rule="nonsense">` must subtract the hole:
+ * reading the junk as a rule measured 400 where the render paints 300.
+ */
+const FILL_RULES = new Set(['nonzero', 'evenodd']);
+
+function fillRuleOf(attrs, inherited) {
+  const raw = attrs['fill-rule'];
+  if (raw === undefined) return inherited.fillRule;
+  const value = String(raw).trim().toLowerCase();
+  // `initial` is the initial value; `inherit`/`unset`/`revert` are the parent's,
+  // which `inherited.fillRule` already carries.
+  if (value === 'initial') return 'nonzero';
+  return FILL_RULES.has(value) ? value : inherited.fillRule;
+}
+
+/** Presentation state a node hands to its children. */
+function inheritedFor(attrs, inherited, visible, matrix, ctx) {
+  const color = attrs.color !== undefined ? attrs.color : inherited.color;
+  const strokeWidth = strokeWidthOf(attrs, inherited, ctx);
+  return {
+    matrix,
+    color,
+    fill: paintValue(attrs.fill, inherited.fill, 'black', color),
+    stroke: paintValue(attrs.stroke, inherited.stroke, 'none', color),
+    strokeWidth: strokeWidth.width,
+    // A % width is already expressed in user units through the viewport
+    // diagonal. With `non-scaling-stroke` the usual px→unit division must be
+    // skipped, or the same 10% is converted twice. The provenance travels with
+    // the value, so a dropped `%` cannot taint an inherited plain width.
+    strokeWidthFromViewport: strokeWidth.fromViewport,
+    fillRule: fillRuleOf(attrs, inherited),
+    // `fill-opacity` is inherited; `opacity` is not (it composites the group).
+    fillOpacity: resolveOpacity(attrs['fill-opacity'], inherited.fillOpacity),
+    // `stroke-opacity` inherits the same way, and a fully transparent stroke
+    // paints nothing — counting its band invents ink the render does not have.
+    strokeOpacity: strokeOpacityOf(attrs, inherited),
+    visible,
+    viewport: inherited.viewport,
+    viewportDeclared: inherited.viewportDeclared,
+    level: (inherited.level || 0) + 1,
+  };
+}
+
+/**
+ * Resolve `clip-path: url(#id)` to an axis-aligned rect in root user space, or
+ * `null` when the clip is anything other than a plain rectangle.
+ *
+ * A rotated or skewed space is refused. Transforming the rect's four corners and
+ * taking their bounding box produces a **superset** of the clip, and a superset
+ * cannot cut anything — so the test below concludes "the ink fits" for ink the
+ * render actually clips away. That is a wrong number, not a conservative one:
+ * refusing is the only honest answer without a real polygon intersection.
+ */
+function resolveClipRect(raw, ctx, matrix) {
+  // CSS function names are case-insensitive and `url()` takes an optional
+  // quoted string: `url('#c')` and `URL(#c)` both crop, but neither matched, so
+  // both were refused as unreadable.
+  const m = /^\s*url\(\s*(['"]?)#([^'")\s]+)\1\s*\)\s*$/i.exec(String(raw).trim());
+  if (!m) return null;
+  const target = ctx.ids.get(m[2]);
+  if (!target || String(target.tag).toLowerCase() !== 'clippath') return null;
+  const targetAttrs = effectiveAttrs(target);
+  if ((targetAttrs.clipPathUnits || 'userSpaceOnUse') !== 'userSpaceOnUse') return null;
+  if (targetAttrs.transform) return null;
+
+  const shapes = (target.children || []).filter((c) => c.tag !== '#comment');
+  if (shapes.length !== 1) return null;
+  const child = shapes[0];
+  if (child.tag !== 'rect') return null;
+  const a = effectiveAttrs(child);
+  if (a.transform) return null;
+  // A clip rect that is itself clipped is not the shape it claims to be.
+  if (a['clip-path'] && !/^none$/i.test(a['clip-path'].trim())) return null;
+  // A rounded clip removes ink at the corners, so it is not a no-op rectangle.
+  const rx = a.rx === undefined ? 0 : parseLength(a.rx);
+  const ry = a.ry === undefined ? 0 : parseLength(a.ry);
+  if (rx === null || ry === null || rx !== 0 || ry !== 0) return null;
+
+  // Percentages here are relative to the clipping element's viewport. Reading
+  // `width="80%"` as 80 units produced both false offsets and false refusals —
+  // resolve or refuse, never approximate.
+  const x = a.x === undefined ? 0 : parseLength(a.x);
+  const y = a.y === undefined ? 0 : parseLength(a.y);
+  const w = a.width === undefined ? 0 : parseLength(a.width);
+  const h = a.height === undefined ? 0 : parseLength(a.height);
+  if (x === null || y === null || w === null || h === null) return null;
+  if (!(w > 0) || !(h > 0)) return null;
+
+  const corners = [
+    applyMatrix(matrix, x, y),
+    applyMatrix(matrix, x + w, y),
+    applyMatrix(matrix, x + w, y + h),
+    applyMatrix(matrix, x, y + h),
+  ];
+  // Axis-aligned or flipped only: anything with rotation or skew turns the rect
+  // into a parallelogram, and its bounding box is bigger than the clip.
+  const scale = Math.max(Math.hypot(matrix[0], matrix[1]), Math.hypot(matrix[2], matrix[3]), 1e-12);
+  if (Math.abs(matrix[1]) > 1e-9 * scale || Math.abs(matrix[2]) > 1e-9 * scale) return null;
+  const box = bboxOfPoints(corners);
+  return box;
+}
+
+/** Union bbox of already-collected shape records, strokes included. */
+function bboxOfShapes(shapes, steps, ctx) {
+  let box = null;
+  for (const shape of shapes) {
+    const flat = flattenPath(shape.d, steps);
+    // A partially parsed path contributes only the fragments svgpath could read,
+    // so the box it produces is smaller than the ink it paints. Measuring the
+    // fragments would call ink "inside the viewport" that plainly is not — and
+    // returning `null` here drops the shape, so the reason has to be recorded
+    // or the loss would be silent.
+    if (flat.parseError) {
+      if (ctx) ctx.unresolved.add('unparsed-path');
+      return null;
+    }
+    // Same rule as the ink box itself: a subpath that encloses nothing paints
+    // nothing. Including it here made a stray `M0 0` look like ink that escapes
+    // the clip, and the whole file came back `clip-path-cuts-ink` for a shape the
+    // render draws in full. A stroked line *is* ink, so it stays.
+    const mapped = flat.map((sub) => sub.map(([x, y]) => applyMatrix(shape.matrix, x, y)));
+    const painting = shape.stroked ? mapped : mapped.filter((sub) => enclosesArea(sub));
+    if (painting.length === 0) continue;
+    const localBox = bboxOfPoints(painting.flat());
+    // A stroke widens the shape by half its width, measured along the *transformed*
+    // normal: under `scale(4,1)` the band is 4× wider across x than across y. The
+    // padding therefore has to be per-axis — the single mean scale used to be
+    // lenient in one direction and strict in the other.
+    const pad = shape.stroked
+      ? strokePadding(shape.matrix, shape.strokeWidth, shape.nonScalingStroke)
+      : { x: 0, y: 0 };
+    box = bboxUnion(box, bboxExpandBy(localBox, pad.x, pad.y));
+  }
+  return box;
+}
+
+function rectContains(rect, box, eps = 1e-6) {
+  return (
+    box.minX >= rect.minX - eps &&
+    box.minY >= rect.minY - eps &&
+    box.maxX <= rect.maxX + eps &&
+    box.maxY <= rect.maxY + eps
+  );
+}
+
+function collect(node, inherited, out, ctx) {
+  const tag = String(node.tag).toLowerCase();
+  if (NON_RENDERING.has(tag)) return out;
+
+  // Deeply nested groups are legal markup; recursing through thousands of them
+  // is not. Refuse the file instead of letting V8 refuse it for us.
+  if ((inherited.level || 0) > MAX_NESTING) {
+    ctx.unresolved.add('nesting-too-deep');
+    return out;
+  }
+
+  const attrs = effectiveAttrs(node);
+  // `display:none` removes the subtree outright; `visibility:hidden` does not —
+  // a descendant may set `visibility:visible` and reappear.
+  if (keywordIs(attrs.display, 'none')) return out;
+  if (resolveOpacity(attrs.opacity, 1) === 0) return out;
+
+  const visible =
+    attrs.visibility === undefined
+      ? inherited.visible
+      : !keywordIs(attrs.visibility, 'hidden') && !keywordIs(attrs.visibility, 'collapse');
+
+  // Ink we can see but cannot measure. Silently treating these as empty would
+  // report "the canvas has nothing in it", which is a different — and false —
+  // statement. Ink that is not painted is a different case again: `<text
+  // fill="none">` draws nothing, and refusing it made a file with one invisible
+  // label unmeasurable.
+  if (UNMEASURABLE_INK.has(tag)) {
+    if (!visible) return out;
+    if (tag === 'text' && !textPaintsAnything(attrs, inherited)) return out;
+    ctx.unresolved.add(`unsupported-ink:${tag}`);
+    return out;
+  }
+
+  for (const attr of UNRESOLVABLE) {
+    if (attrs[attr] && !/^none$/i.test(attrs[attr])) ctx.unresolved.add(attr);
+  }
+
+  // A root <svg> transform is not part of the artwork's coordinate system: the
+  // outer canvas is whatever the host draws it into.
+  const own = node === ctx.root ? inherited.matrix : matrixFrom(attrs, inherited.matrix, ctx);
+
+  // --- a nested <svg> opens a viewport ------------------------------------
+  if (tag === 'svg' && node !== ctx.root) {
+    // Percentages resolve against the nearest enclosing viewport, not the root.
+    const basisW = inherited.viewport.w;
+    const basisH = inherited.viewport.h;
+    const vpW = resolveLength(attrs.width, basisW);
+    const vpH = resolveLength(attrs.height, basisH);
+    const vx = resolveLength(attrs.x, basisW, 0);
+    const vy = resolveLength(attrs.y, basisH, 0);
+    if (vpW === null || vpH === null || vx === null || vy === null) {
+      ctx.unresolved.add('viewport-relative-units');
+      return out;
+    }
+    let matrix = multiplyMatrix(own, [1, 0, 0, 1, vx, vy]);
+    // Space of the viewport rect itself, before its own viewBox map.
+    const outerMatrix = matrix;
+    let innerVb = null;
+    if (attrs.viewBox !== undefined) {
+      innerVb = parseViewBox(attrs);
+      if (!innerVb) {
+        ctx.unresolved.add(viewBoxFailure(attrs));
+        return out;
+      }
+      matrix = multiplyMatrix(
+        matrix,
+        viewBoxMatrix(innerVb, { x: 0, y: 0, w: vpW, h: vpH }, attrs.preserveAspectRatio),
+      );
+    }
+    // Both the element's own `%` properties and its children resolve against
+    // this viewport, in its own user space. Resolving the element's declaration
+    // against the *parent* basis made a symmetric icon asymmetric (and, when
+    // the band was cropped, turned a Chrome-`ok` drawing into a reported `off`).
+    const innerViewport = innerVb ? { w: innerVb.w, h: innerVb.h } : { w: vpW, h: vpH };
+    const local = inheritedFor(
+      attrs,
+      { ...inherited, viewport: innerViewport, viewportDeclared: true },
+      visible,
+      matrix,
+      ctx,
+    );
+    local.viewport = innerViewport;
+    local.viewportDeclared = true;
+    // The clip applies in the *inner* coordinate system, after the viewBox map.
+    withClip(attrs, matrix, ctx, out, (sink) => {
+      withViewport({ x: 0, y: 0, w: vpW, h: vpH }, outerMatrix, ctx, sink, (inner) => {
+        for (const child of node.children || []) collect(child, local, inner, ctx);
+      }, clipsViewport(attrs));
+    });
+    return out;
+  }
+
+  // --- <use> instantiates its target ---------------------------------------
+  if (tag === 'use') {
+    const href = attrs.href || attrs['xlink:href'] || '';
+    const id = href.startsWith('#') ? href.slice(1) : '';
+    const target = id ? ctx.ids.get(id) : null;
+    if (!target) {
+      ctx.unresolved.add('use-without-target');
+      return out;
+    }
+    if (ctx.depth >= MAX_USE_DEPTH) {
+      ctx.unresolved.add('use-nested-too-deep');
+      return out;
+    }
+
+    const x = resolveLength(attrs.x, inherited.viewport.w, 0);
+    const y = resolveLength(attrs.y, inherited.viewport.h, 0);
+    if (x === null || y === null) {
+      ctx.unresolved.add('use-relative-units');
+      return out;
+    }
+    // `transform` wraps the element; x/y translate its own coordinate system.
+    const useMatrix = multiplyMatrix(own, [1, 0, 0, 1, x, y]);
+    const targetTag = String(target.tag).toLowerCase();
+
+    // `width`/`height` on a <use> only size a viewport-establishing target and
+    // are ignored otherwise. That is well-defined, not ambiguous: generators emit
+    // them on plain <g> references all the time, and refusing those turned a
+    // measurable icon into an `unknown` for a pair of attributes with no effect.
+
+    const inner = { ...ctx, depth: ctx.depth + 1 };
+    const local = inheritedFor(attrs, inherited, visible, useMatrix, ctx);
+
+    // `clip-path` on a <use> is resolved in the space *after* its own `x`/`y`
+    // translate: the attributes act like a transform on the element, and a clip
+    // is resolved in the element's own local space. Measured, not assumed.
+    withClip(attrs, useMatrix, ctx, out, (sink) => {
+      if (targetTag === 'symbol') {
+        // <symbol> is non-rendering on its own but renders when instantiated.
+        const vpW = resolveLength(attrs.width, inherited.viewport.w);
+        const vpH = resolveLength(attrs.height, inherited.viewport.h);
+        if (vpW === null || vpH === null) {
+          ctx.unresolved.add('use-viewport');
+          return;
+        }
+        const symbolAttrs = effectiveAttrs(target);
+        if (
+          keywordIs(symbolAttrs.display, 'none') ||
+          keywordIs(symbolAttrs.visibility, 'hidden') ||
+          keywordIs(symbolAttrs.visibility, 'collapse') ||
+          resolveOpacity(symbolAttrs.opacity, 1) === 0
+        ) {
+          return;
+        }
+        // A symbol carries presentation attributes of its own — sprite sets put
+        // `fill`, `stroke` and `fill-rule` there precisely so the children can
+        // omit them. Dropping them changed the area of every referenced path.
+        //
+        // It also carries `mask` / `filter` / `clip-path`, which `collect` can
+        // never report because `<symbol>` is non-rendering on its own. Re-check
+        // them here, at the one point where a symbol becomes visible.
+        for (const attr of UNRESOLVABLE) {
+          const value = symbolAttrs[attr];
+          if (value && !/^none$/i.test(String(value).trim())) ctx.unresolved.add(attr);
+        }
+        let matrix = matrixFrom(symbolAttrs, useMatrix, ctx);
+        let symbolVb = null;
+        if (symbolAttrs.viewBox !== undefined) {
+          symbolVb = parseViewBox(symbolAttrs);
+          if (!symbolVb) {
+            ctx.unresolved.add(viewBoxFailure(symbolAttrs));
+            return;
+          }
+          matrix = multiplyMatrix(
+            matrix,
+            viewBoxMatrix(
+              symbolVb,
+              { x: 0, y: 0, w: vpW, h: vpH },
+              symbolAttrs.preserveAspectRatio,
+            ),
+          );
+        }
+        // The symbol's own `%` stroke-width resolves in its own user space,
+        // just like a nested <svg>'s. Passing the parent basis here halved the
+        // band and made a measured icon asymmetric.
+        const symbolViewport = symbolVb
+          ? { w: symbolVb.w, h: symbolVb.h }
+          : { w: vpW, h: vpH };
+        const symbolLocal = inheritedFor(
+          symbolAttrs,
+          { ...local, viewport: symbolViewport, viewportDeclared: true },
+          visible,
+          useMatrix,
+          ctx,
+        );
+        symbolLocal.matrix = matrix;
+        symbolLocal.viewport = symbolViewport;
+        symbolLocal.viewportDeclared = true;
+        // A symbol clips to the viewport the <use> gives it, exactly like a
+        // nested <svg>. Its own clip-path is in the symbol's user space, which
+        // is the one its viewBox establishes — `matrix`, not `useMatrix`.
+        withClip(symbolAttrs, matrix, ctx, sink, (clipped) => {
+          withViewport({ x: 0, y: 0, w: vpW, h: vpH }, useMatrix, ctx, clipped, (viewport) => {
+            for (const child of target.children || []) collect(child, symbolLocal, viewport, inner);
+          }, clipsViewport(symbolAttrs));
+        });
+        return;
+      }
+      if (targetTag === 'svg') {
+        // Let the nested-viewport branch apply the viewBox exactly once. The
+        // <use> width/height override the target's own; the target's **x/y are
+        // kept**, because they belong to it — `<svg x="9" y="9">` instanced by a
+        // `<use>` lands at 9,9, and the `<use>`'s own x/y add on top. Zeroing them
+        // moved the artwork to the origin: a centred icon came back `off` by 90px
+        // with a `viewBox="-9 -9 24 24"` suggestion that would have broken it.
+        //
+        // `style` is dropped: it has already been cascaded into these
+        // attributes, and keeping it lets `effectiveAttrs` run the declarations
+        // a second time against the flattened result — which resurrects a value
+        // an `!important` stylesheet rule had just overruled.
+        const { style: _style, ...flat } = effectiveAttrs(target);
+        const overrides = { ...flat };
+        if (attrs.width !== undefined) overrides.width = attrs.width;
+        if (attrs.height !== undefined) overrides.height = attrs.height;
+        // The clone must not carry the target's cached cascade: its attributes
+        // are already flattened into `overrides`, and the cache would win.
+        collect({ ...target, attrs: overrides, effective: undefined }, local, sink, inner);
+        return;
+      }
+      if (NON_RENDERING.has(targetTag)) {
+        ctx.unresolved.add('use-target-not-renderable');
+        return;
+      }
+      collect(target, local, sink, inner);
+    });
+    return out;
+  }
+
+  // --- a shape is ink ------------------------------------------------------
+  if (SHAPES.has(tag)) {
+    if (visible) {
+      if (attrs['clip-path'] && !/^none$/i.test(attrs['clip-path'].trim())) {
+        // Clipping a shape to itself needs the intersection of two outlines.
+        ctx.unresolved.add('clip-path');
+        return out;
+      }
+      const shape =
+        tag === 'path'
+          ? { d: attrs.d || '', unparsed: false, empty: !attrs.d }
+          : shapeToPath(tag, attrs);
+      if (shape.unparsed) {
+        // A percentage geometry is not a shape at the origin — it is a shape we
+        // cannot place. Dropping it silently would shrink the ink box.
+        ctx.unresolved.add('unparsed-length');
+      } else if (!shape.d && !shape.empty) {
+        ctx.unresolved.add('unparsed-shape');
+      } else if (shape.d) {
+        const strokeInfo = strokeWidthOf(attrs, inherited, ctx);
+        const strokeUnits = Number.isFinite(strokeInfo.width) ? strokeInfo.width : 1;
+        // The shape's own `color` applies to its own `currentColor`.
+        const color = attrs.color !== undefined ? attrs.color : inherited.color;
+        const fillPaint = paintValue(attrs.fill, inherited.fill, 'black', color);
+        const strokePaint = paintValue(attrs.stroke, inherited.stroke, 'none', color);
+        // A colour function this pass does not model. The shape may paint, or it
+        // may not; that is a gap, not a measurement. `var()`/`env()` already carry
+        // a more specific reason above.
+        for (const paint of [fillPaint, strokePaint]) {
+          if (paint === undefined || isRuntimePaint(paint)) continue;
+          if (paintKind(paint) === 'unknown') ctx.unresolved.add('unparsed-paint');
+        }
+        // `var()` / `env()` name a value defined outside this file. Inheriting
+        // the fallback colour would invent ink; ignoring the declaration would
+        // delete it. Neither is a measurement, so refuse the drawing.
+        if (isRuntimePaint(fillPaint) || isRuntimePaint(strokePaint)) {
+          ctx.unresolved.add('runtime-paint');
+        }
+        // A paint reference decides whether there is ink at all, so resolve it
+        // before the shape is recorded.
+        const fillRef = paintReference(fillPaint, ctx);
+        const strokeRef = paintReference(strokePaint, ctx);
+        for (const which of [fillRef, strokeRef]) {
+          if (which === 'unknown') ctx.unresolved.add('paint-server');
+        }
+        out.push({
+          d: shape.d,
+          matrix: own,
+          // `transparent` and zero-alpha colours are declarations of no paint:
+          // the shape is there and covers nothing.
+          filled:
+            !keywordIs(fillPaint, 'none') &&
+            !isInvisiblePaint(fillPaint) &&
+            fillOpacityOf(attrs, inherited) !== 0 &&
+            fillRef !== 'absent',
+          // `stroke-width: 0` and `stroke-opacity: 0` both draw nothing; the
+          // band would otherwise be invented from a stroke the render omits.
+          stroked:
+            strokePaint !== undefined &&
+            !keywordIs(strokePaint, 'none') &&
+            !isInvisiblePaint(strokePaint) &&
+            strokeOpacityOf(attrs, inherited) !== 0 &&
+            strokeUnits !== 0 &&
+            strokeRef !== 'absent',
+          strokeWidth: strokeUnits,
+          // `vector-effect="non-scaling-stroke"` keeps the band at its authored
+          // width however the ancestors scale the shape — the area loop below
+          // must not multiply it by the matrix.
+          nonScalingStroke:
+            String(attrs['vector-effect'] ?? '').trim().toLowerCase() === 'non-scaling-stroke',
+          strokeWidthFromViewport: strokeInfo.fromViewport,
+          // Even `fill-rule` is inherited, and an inherited `evenodd` changes the
+          // area of every child path.
+          fillRule: fillRuleOf(attrs, inherited),
+        });
+      }
+    }
+    return out;
+  }
+
+  // --- anything else with children is a container --------------------------
+  const bound = inheritedFor(attrs, inherited, visible, own, ctx);
+  withClip(attrs, own, ctx, out, (sink) => {
+    for (const child of node.children || []) collect(child, bound, sink, ctx);
+  });
+  return out;
+}
+
+/**
+ * Every nested `<svg>` and `<symbol>` clips by default; `overflow` is the one
+ * declaration that turns that off. `auto` and `scroll` still clip (with
+ * scrollbars), so only the literal `visible` opts out.
+ */
+function clipsViewport(attrs) {
+  const raw = attrs.overflow;
+  if (raw === undefined || raw === null) return true;
+  return String(raw).trim().toLowerCase() !== 'visible';
+}
+
+/**
+ * A viewport clips what it contains — `overflow: hidden` is the default for a
+ * nested `<svg>` and for `<symbol>`. Measuring ink the browser would cut off
+ * produces an `off` nobody can reproduce by looking at the render, so refuse
+ * when the drawing leaves the viewport.
+ *
+ * `overflow="visible"` turns the clip off, and the drawing is measured as
+ * authored. Refusing it reported ink the user can plainly see as unmeasurable —
+ * the conservative direction, but it made the whole icon disappear from the
+ * report for a declaration that says exactly what to do.
+ *
+ * `outerMatrix` maps the viewport's own space to root space; the rect is that
+ * viewport. Under a rotated ancestor the rect becomes its AABB, which is a
+ * superset — lenient in the direction that matters least, but stated in
+ * `optical-model.md` rather than hidden.
+ */
+function withViewport(rect, outerMatrix, ctx, out, emit, clips = true) {
+  const captured = [];
+  emit(captured);
+  if (captured.length === 0) return;
+  if (!clips) {
+    out.push(...captured);
+    return;
+  }
+  const box = bboxOfShapes(captured, ctx.steps, ctx);
+  if (!box) return;
+  // All four corners: under a rotation the two diagonal ones would both land on
+  // the same diagonal of the rotated rect and collapse the viewport to a line,
+  // turning every drawing inside it into spurious `unknown`.
+  const viewRect = bboxOfPoints([
+    applyMatrix(outerMatrix, rect.x, rect.y),
+    applyMatrix(outerMatrix, rect.x + rect.w, rect.y),
+    applyMatrix(outerMatrix, rect.x, rect.y + rect.h),
+    applyMatrix(outerMatrix, rect.x + rect.w, rect.y + rect.h),
+  ]);
+  if (!rectContains(viewRect, box)) {
+    ctx.unresolved.add('ink-outside-viewport');
+    return;
+  }
+  out.push(...captured);
+}
+
+/**
+ * Resolve `clip-path` when it provably does not remove any ink.
+ *
+ * Icon exporters wrap everything in a clip the exact size of the canvas, so
+ * refusing every clip makes the checker blind on most real icon sets. A clip
+ * that would actually cut the drawing still becomes `unknown`: the remainder
+ * needs a boolean intersection of arbitrary outlines.
+ *
+ * `space` maps the user space the clip is resolved in to root space — each
+ * caller passes the one that applies to its element (`optical-model.md` records
+ * how each was pinned down, because two of the three are not where they look).
+ */
+function withClip(attrs, space, ctx, out, emit) {
+  const clipRaw = attrs['clip-path'];
+  if (!clipRaw || /^none$/i.test(String(clipRaw).trim())) {
+    emit(out);
+    return;
+  }
+  const rect = resolveClipRect(clipRaw, ctx, space);
+  if (!rect) {
+    ctx.unresolved.add('clip-path');
+    return;
+  }
+  const captured = [];
+  emit(captured);
+  if (captured.length === 0) return;
+  const box = bboxOfShapes(captured, ctx.steps, ctx);
+  if (box && !rectContains(rect, box)) {
+    ctx.unresolved.add('clip-path-cuts-ink');
+    return;
+  }
+  out.push(...captured);
+}
+
+function bboxUnion(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return {
+    minX: Math.min(a.minX, b.minX),
+    minY: Math.min(a.minY, b.minY),
+    maxX: Math.max(a.maxX, b.maxX),
+    maxY: Math.max(a.maxY, b.maxY),
+  };
+}
+
+function bboxExpand(box, by) {
+  return bboxExpandBy(box, by, by);
+}
+
+function bboxExpandBy(box, x, y) {
+  if (!box || (x === 0 && y === 0)) return box;
+  return {
+    minX: box.minX - x,
+    minY: box.minY - y,
+    maxX: box.maxX + x,
+    maxY: box.maxY + y,
+  };
+}
+
+/**
+ * How far a stroke of `width` reaches past the path, per axis, in root space.
+ *
+ * A round band of radius `r` becomes an ellipse under a linear map, and its
+ * extent along each root axis is `r` times the length of that axis row of the
+ * matrix. A non-scaling stroke keeps `r` no matter what the ancestors do.
+ */
+function strokePadding(matrix, width, nonScaling) {
+  const r = width / 2;
+  if (nonScaling) return { x: r, y: r };
+  return { x: r * Math.hypot(matrix[0], matrix[2]), y: r * Math.hypot(matrix[1], matrix[3]) };
+}
+
+/**
+ * Rendered px per user unit, per axis.
+ *
+ * `width="100"` with a 24-unit viewBox means every measurement is in 24ths, not
+ * pixels — reporting that as `px` inflates or deflates every verdict. The scale
+ * is only claimed when *both* dimensions are absolute; a lone `width="48"` or
+ * `height="100%"` leaves the rendered box unknowable.
+ *
+ * When the rendered size is not in the file, the icon is assumed to be **rendered
+ * at the nominal 24px** (short side). That keeps verdicts comparable across
+ * grids: a 2% imbalance on a 24-unit icon and on a 512-unit Font Awesome glyph
+ * are the same optical error, and both should read the same way. Assuming
+ * "1 unit = 1px" instead made every 512-unit glyph look catastrophically
+ * off-centre, because the tolerance clamp then bit at 0.3% of the canvas.
+ *
+ * `preserveAspectRatio="none"` stretches the axes independently, so there is no
+ * single number: x and y are reported separately and `unitScale` is `null`.
+ */
+/** A root `width`/`height` that switches rendering off, if one is declared. */
+function zeroSided(attrs) {
+  for (const name of ['width', 'height']) {
+    if (attrs[name] === undefined) continue;
+    const value = absolutePx(attrs[name]);
+    // A `%` or em length is not a canvas this pass knows; that is the caller's
+    // `relative-canvas` case, not a dead one.
+    if (value === null) continue;
+    if (value === 0) return 'zero-canvas';
+    // `width="-2"` is not "smaller than zero", it is an invalid declaration: the
+    // browser drops it and the element renders at its default 100%. Treating the
+    // negative as a scale flipped the sign of every reported pixel — a real `off`
+    // came back as `ok` with `dx=+0.167px`.
+    if (!(value > 0) || !Number.isFinite(value)) return 'invalid-canvas';
+  }
+  return null;
+}
+
+/**
+ * The part of the user space the root viewport actually shows.
+ *
+ * `preserveAspectRatio="…slice"` scales by the **larger** of the two px-per-unit
+ * ratios so the viewBox covers the viewport, then crops the overflow. Nothing in
+ * the ink model knew about that crop: three bands at y=0, 6 and 20 in a 24-unit
+ * viewBox rendered into a 48x24 viewport came back as "box centred, mass 2.7px
+ * low" while the screen showed only the middle band, 8px off centre. The crop is
+ * also how a false `ok` can be manufactured — keep only the bands outside the
+ * visible strip and the model measures ink that was never drawn.
+ *
+ * @returns {null} when nothing is cropped (`meet` fits inside by definition);
+ *   `undefined` when the file does not pin the viewport, which the caller has to
+ *   refuse rather than assume; `{x,y,w,h}` in user units otherwise.
+ */
+function visibleUserRect(attrs, viewBox) {
+  const { mode, align } = parsePreserveAspectRatio(attrs.preserveAspectRatio);
+  // Strict grammar: `xMidYMid SLICE`, `xmidymid slice` and a trailing `defer`
+  // are dropped by the engine, which renders `meet` and crops nothing. Reading
+  // them as slice invented a crop and reported visible ink as unknown.
+  const w = absolutePx(attrs.width);
+  const h = absolutePx(attrs.height);
+  // Without both sides the viewport's aspect ratio is not in the file, so which
+  // part gets cropped is not either. The caller refuses; guessing here would be
+  // exactly the "invented canvas" this pass avoids everywhere else.
+  if (w === null || h === null || !(w > 0) || !(h > 0)) {
+    // With `slice` the crop depends on an aspect ratio the file does not pin.
+    return mode === 'slice' ? undefined : null;
+  }
+  if (!(viewBox.w > 0) || !(viewBox.h > 0)) return undefined;
+  if (mode === 'none') return { x: viewBox.x, y: viewBox.y, w: viewBox.w, h: viewBox.h };
+
+  // `meet` letterboxes: the visible user-space rect is *larger* than the
+  // viewBox. Checking it too catches ink a wide band pushes outside the canvas —
+  // `stroke-width="150%"` rendered 1344px² of ink where the model counted 2016
+  // and still said `ok`. `slice` picks the larger ratio instead.
+  const scale =
+    mode === 'slice'
+      ? Math.max(w / viewBox.w, h / viewBox.h)
+      : Math.min(w / viewBox.w, h / viewBox.h);
+  const visibleW = w / scale;
+  const visibleH = h / scale;
+  // Which side the overflow lands on follows the alignment; `xMidYMid` is the
+  // default when the keyword is missing or unreadable.
+  const frac = (axis) => {
+    const part = axis === 'x' ? align.slice(1, 4) : align.slice(5, 8);
+    return part === 'Min' ? 0 : part === 'Max' ? 1 : 0.5;
+  };
+  return {
+    x: viewBox.x + (viewBox.w - visibleW) * frac('x'),
+    y: viewBox.y + (viewBox.h - visibleH) * frac('y'),
+    w: visibleW,
+    h: visibleH,
+  };
+}
+
+/**
+ * Slack for the viewport clip check, in user units.
+ *
+ * The ink box comes from a flattened path and a `perimeter × width` stroke
+ * approximation, both of which overshoot a curved edge by a few hundredths of
+ * a unit. Treating that as clipped ink turned 115 real icons (octicons,
+ * semi-icons, Chrome's own close button) from measurable into `unknown`. The
+ * checker already has a documented optical tolerance band; the same band is the
+ * right place to ignore a sliver the renderer would clip but that cannot move
+ * a verdict. Anything beyond it — a 150% band, a band at y=-12 — still refuses.
+ */
+function viewportEpsilon(viewBox, sx, sy) {
+  if (!(sx > 0) || !(sy > 0)) return { x: 1e-9, y: 1e-9 };
+  const shortSidePx = Math.min(viewBox.w * sx, viewBox.h * sy);
+  const tolPx = Math.min(1.5, Math.max(0.5, 0.02 * shortSidePx));
+  // The slack is in *pixels*, so each axis converts it with its own scale. Using
+  // `min(sx,sy)` for both made a 20px overflow on a 10×-scaled axis look like a
+  // 2px one when the other axis scaled by 0.01, and a clipped drawing was
+  // reported `ok`.
+  return { x: tolPx / sx, y: tolPx / sy };
+}
+
+function boxWithin(box, rect, eps = { x: 1e-9, y: 1e-9 }) {
+  const ex = typeof eps === 'number' ? eps : eps.x;
+  const ey = typeof eps === 'number' ? eps : eps.y;
+  return (
+    box.minX >= rect.x - ex &&
+    box.minY >= rect.y - ey &&
+    box.maxX <= rect.x + rect.w + ex &&
+    box.maxY <= rect.y + rect.h + ey
+  );
+}
+
+function rootUnitScale(attrs, viewBox) {
+  const nominal = 24;
+  const { mode: parMode } = parsePreserveAspectRatio(attrs.preserveAspectRatio);
+  const stretches = parMode === 'none';
+  // `preserveAspectRatio="none"` has no single scale, and that is true of the
+  // assumed branch too: the axes get 24px each rather than sharing one factor.
+  const reference = viewBox.w > 0 && viewBox.h > 0 ? nominal / Math.min(viewBox.w, viewBox.h) : 1;
+  const assumed = stretches
+    ? {
+        x: viewBox.w > 0 ? nominal / viewBox.w : reference,
+        y: viewBox.h > 0 ? nominal / viewBox.h : reference,
+        uniform: null,
+        source: 'assumed',
+      }
+    : { x: reference, y: reference, uniform: reference, source: 'assumed' };
+  if (attrs.width === undefined && attrs.height === undefined) return assumed;
+  const w = absolutePx(attrs.width);
+  const h = absolutePx(attrs.height);
+  // A single side is not enough: the missing one defaults to `100%` of the host,
+  // which is not in the file. Falling back to the nominal 24px is the same guess
+  // made when neither is present, and it is labelled `assumed`.
+  if (w === null || h === null) return assumed;
+  if (!(viewBox.w > 0) || !(viewBox.h > 0)) return assumed;
+
+  const rawX = w / viewBox.w;
+  const rawY = h / viewBox.h;
+  if (parMode === 'none') {
+    const uniform = Math.abs(rawX - rawY) < 1e-9 ? rawX : null;
+    return { x: rawX, y: rawY, uniform, source: 'declared' };
+  }
+  // `slice` fills the viewport (larger ratio wins), `meet` fits inside it.
+  const scale = parMode === 'slice' ? Math.max(rawX, rawY) : Math.min(rawX, rawY);
+  return { x: scale, y: scale, uniform: scale, source: 'declared' };
+}
+
+/**
+ * @returns {{viewBox: object, ink: object, strokeOnly: boolean, noInk: boolean, unresolved: string[], unitScale: number, unitSource: string}}
+ */
+export function analyzeSvg(text, { steps = 24 } = {}) {
+  const doc = parseXml(text);
+  const svg = doc.children.find((c) => c.tag === 'svg') || doc.children[0] || { attrs: {}, children: [] };
+  const viewBox = parseViewBox(svg.attrs || {});
+  const ids = new Map();
+  indexIds(svg, ids);
+
+  // An unparseable viewBox means the element does not render, so there is no
+  // canvas to measure against and no honest verdict to give. So does a zero
+  // width or height: SVG 1.1 §7.7 "a value of zero disables rendering of the
+  // element". Scaling by it would flatten every coordinate to the origin and
+  // report a perfectly centred dot.
+  const deadCanvas = !viewBox ? null : zeroSided(svg.attrs || {});
+  if (!viewBox || deadCanvas) {
+    return {
+      viewBox: viewBox || { x: 0, y: 0, w: 24, h: 24 },
+      ink: { bbox: null, area: 0, centroid: { cx: 0, cy: 0 } },
+      strokeOnly: false,
+      noInk: true,
+      unresolved: deadCanvas
+        ? [deadCanvas]
+        : [svg.attrs && svg.attrs.viewBox !== undefined ? 'invalid-viewBox' : 'relative-canvas'],
+      unitScale: null,
+      unitScaleX: null,
+      unitScaleY: null,
+      unitSource: 'assumed',
+    };
+  }
+
+  const unit = rootUnitScale(svg.attrs || {}, viewBox);
+  const unitScale = unit.uniform;
+  const unitScaleX = unit.x;
+  const unitScaleY = unit.y;
+  const unitSource = unit.source;
+  const ctx = { ids, unresolved: new Set(), depth: 0, root: svg, steps };
+  // Paint may live in an internal stylesheet, so resolve the cascade before
+  // anything reads an attribute.
+  applyStylesheets(text, svg, ctx);
+  noteAnimation(svg, ctx);
+  const shapes = collect(
+    svg,
+    {
+      matrix: IDENTITY,
+      fill: 'black',
+      stroke: undefined,
+      strokeWidth: 1,
+      strokeWidthFromViewport: false,
+      viewportDeclared:
+        svg.attrs.viewBox !== undefined ||
+          (absolutePx(svg.attrs.width) !== null && absolutePx(svg.attrs.height) !== null),
+      fillRule: 'nonzero',
+      fillOpacity: 1,
+      visible: true,
+      viewport: { w: viewBox.w, h: viewBox.h },
+    },
+    [],
+    ctx,
+  );
+
+  let filledArea = 0;
+  let filledCx = 0;
+  let filledCy = 0;
+  let bbox = null;
+
+  let strokeArea = 0;
+  let strokeMx = 0;
+  let strokeMy = 0;
+  let strokeBox = null;
+
+  for (const shape of shapes) {
+    const raw = flattenPath(shape.d, steps);
+    // svgpath reports a lossy parse on the instance; a `.map()` here would drop
+    // that signal along with the array identity.
+    if (raw.parseError) {
+      ctx.unresolved.add('unparsed-path');
+      continue;
+    }
+    const subpaths = raw.map((sub) => sub.map(([x, y]) => applyMatrix(shape.matrix, x, y)));
+    if (subpaths.length === 0) {
+      // `d` held something, yet nothing came back: the parser gave up part-way.
+      // Keeping the fragments it did emit would measure half a path.
+      if (String(shape.d).trim() !== '') ctx.unresolved.add('unparsed-path');
+      continue;
+    }
+    // A stray `M0 0` or a bare line inside an otherwise solid path spans a
+    // bounding box and paints nothing. Unioning it into the ink box pulled the box
+    // back to the origin: a 4..20 square came back as 0..20, `off` by 2 units, with
+    // a suggested `viewBox="-2 -2 24 24"` that would have broken a correct icon.
+    const enclosing = subpaths.filter((sub) => enclosesArea(sub));
+    const fillBox = enclosing.length > 0 ? bboxOfPoints(enclosing.flat()) : null;
+    // The stroke has its own version of the same problem, and filtering only the
+    // fill side left it in place: `M0 0 M4 4H20V20H4Z` with a 2-unit stroke still
+    // came back as (-1,-1)-(21,21) and `off`, because the box used for padding was
+    // built from *all* points. A lone moveto draws no segment, so there is no band to
+    // pad — not even with a round cap. A zero-length *segment*
+    // (`M12 12 L12 12`) is different: that one does paint a dot, and it survives
+    // the `length > 1` test below.
+    const strokable = subpaths.filter((sub) => sub.length > 1);
+    const strokeLocalBox = strokable.length > 0 ? bboxOfPoints(strokable.flat()) : null;
+
+    if (shape.filled) {
+      const net = shape.fillRule === 'evenodd' ? netShapeEvenOdd(subpaths) : netShape(subpaths);
+      // `scale(1e308)` overflows the coordinates: the area is `NaN`, which is not
+      // `> 0`, so the shape was dropped without a reason and the rest of the file
+      // reported `ok`. A number that is not a number is not a measurement.
+      if (!Number.isFinite(net.area) || !Number.isFinite(net.cx) || !Number.isFinite(net.cy)) {
+        ctx.unresolved.add('non-finite-ink');
+        bbox = bboxUnion(bbox, fillBox);
+      } else if (net.selfIntersecting) {
+        // A subpath crossing itself paints an area the shoelace formula cannot
+        // express. The outline is still real ink, so its box counts even though
+        // its area does not.
+        ctx.unresolved.add('self-intersecting');
+        bbox = bboxUnion(bbox, fillBox);
+      } else if (net.overlapping) {
+        // Partially overlapping outlines need a boolean XOR; refuse rather than
+        // report a centroid that may sit outside the artwork.
+        ctx.unresolved.add('overlapping-subpaths');
+        bbox = bboxUnion(bbox, fillBox);
+      } else if (net.area > 0) {
+        filledArea += net.area;
+        filledCx += net.cx * net.area;
+        filledCy += net.cy * net.area;
+        bbox = bboxUnion(bbox, fillBox);
+      }
+    }
+
+    if (shape.stroked) {
+      let width = shape.strokeWidth;
+      // `vector-effect="non-scaling-stroke"` keeps the band at its authored width
+      // **in px**, not in user units: under a 48px canvas with a 24-unit viewBox,
+      // `stroke-width="2"` is one user unit, not two. Dividing by the root scale
+      // is the whole correction, and it only exists when the scale is uniform —
+      // under `preserveAspectRatio="none"` the two axes disagree and a scalar
+      // width cannot describe the band.
+      if (shape.nonScalingStroke) {
+        if (!(unitScale > 0)) {
+          ctx.unresolved.add('non-scaling-stroke-scale');
+          width = null;
+        } else if (!shape.strokeWidthFromViewport) {
+          // A % width already went through the viewport diagonal, so its user-unit
+          // value is final. Dividing again converted it a second time.
+          width /= unitScale;
+        }
+      }
+      // Nothing after this point in the loop body, so skipping the rest of the
+      // iteration is the whole refusal: the band stays unmeasured and
+      // `non-scaling-stroke-scale` keeps the report from reading as `ok`.
+      if (width === null) continue;
+      // The band area is `perimeter × width`, and a linear map scales area by
+      // |det|. The perimeter used here is the **authored** one: the root-space
+      // outline is already stretched along the path's own direction, so pairing it
+      // with a scale factor counted the scale twice — `scale(4,1)` on a 10-unit
+      // square with a 2-unit stroke reported 500 where the band is 4×(40×2)=320.
+      // A non-scaling stroke is the other way round: it keeps its authored width
+      // in root space, so the root-space length is the one to multiply.
+      const perimeter = shape.nonScalingStroke ? subpaths : raw;
+      const det = shape.nonScalingStroke
+        ? 1
+        : Math.abs(shape.matrix[0] * shape.matrix[3] - shape.matrix[1] * shape.matrix[2]);
+      let bandLength = 0;
+      for (const sub of perimeter) {
+        for (let i = 1; i < sub.length; i += 1) {
+          const [x0, y0] = sub[i - 1];
+          const [x1, y1] = sub[i];
+          const len = Math.hypot(x1 - x0, y1 - y0);
+          bandLength += len;
+          const weight = len * width * det;
+          strokeArea += weight;
+          // The centroid has to be reported in root space, so the local segments
+          // are mapped before they are weighted.
+          if (shape.nonScalingStroke) {
+            strokeMx += ((x0 + x1) / 2) * weight;
+            strokeMy += ((y0 + y1) / 2) * weight;
+          } else {
+            const [mx, my] = applyMatrix(shape.matrix, (x0 + x1) / 2, (y0 + y1) / 2);
+            strokeMx += mx * weight;
+            strokeMy += my * weight;
+          }
+        }
+      }
+      // A zero-length segment (`M12 12 L12 12`) does paint — a round or square cap
+      // puts a dot there, 78.42 unit² for the 10-unit round one Chrome draws — but
+      // the model's `perimeter × width` gives it 0, and the cap style that decides
+      // the dot's shape is not tracked at all. Saying "no ink" would be a claim;
+      // this is a gap.
+      if (bandLength === 0) ctx.unresolved.add('zero-length-stroke');
+      const pad = strokePadding(shape.matrix, width, shape.nonScalingStroke);
+      if (strokeLocalBox) {
+        strokeBox = bboxUnion(strokeBox, bboxExpandBy(strokeLocalBox, pad.x, pad.y));
+      }
+    }
+  }
+
+  const totalArea = filledArea + strokeArea;
+  const finalBox = bboxUnion(bbox, strokeBox);
+
+  // The root viewport crops the user space under `slice`. Ink outside the visible
+  // strip was never on screen, so a box or a centroid built from it describes a
+  // drawing that does not exist. Refuse rather than clip: cropping a polygon is
+  // doable, cropping a *stroked* one to a rect is not expressible as
+  // `perimeter × width`, and half-clipping would be worse than saying so.
+  if (finalBox) {
+    // `overflow="visible"` turns the root clip off too. Refusing here would have
+    // thrown away a number that is directly recomputable from the ink box — and
+    // contradicted optical-model.md, which says visible ink is measured as
+    // authored. A class setting works because the cascade fills `svg.effective`.
+    const overflow = (svg.effective && svg.effective.overflow) ?? svg.attrs.overflow;
+    const rootVisible = String(overflow ?? '').trim().toLowerCase() === 'visible';
+    if (!rootVisible) {
+      const visible = visibleUserRect(svg.attrs || {}, viewBox);
+      const eps = viewportEpsilon(viewBox, unitScaleX, unitScaleY);
+      if (visible === undefined || (visible && !boxWithin(finalBox, visible, eps))) {
+        ctx.unresolved.add(
+          parsePreserveAspectRatio(svg.attrs.preserveAspectRatio).mode === 'slice'
+            ? 'root-slice-clip'
+            : 'ink-outside-viewport',
+        );
+      }
+    }
+  }
+
+  // `stroke-width="1e308"` is a finite number with an infinite consequence: the
+  // band area overflows, the centroid becomes NaN, and a NaN compares false
+  // against every tolerance — so the report used to come back `off` with
+  // `area: Infinity, cx: NaN` rather than with a gap. A non-finite number is not
+  // a measurement; say so instead of shipping the NaN.
+  if (!Number.isFinite(totalArea) || !Number.isFinite(filledArea) || !Number.isFinite(strokeArea)) {
+    ctx.unresolved.add('non-finite-ink');
+  }
+
+  if (totalArea <= 1e-9 || !finalBox || !Number.isFinite(totalArea)) {
+    return {
+      viewBox,
+      ink: { bbox: null, area: 0, centroid: { cx: 0, cy: 0 } },
+      strokeOnly: false,
+      noInk: true,
+      unitScale,
+      unitScaleX,
+      unitScaleY,
+      unitSource,
+      unresolved: [...ctx.unresolved],
+    };
+  }
+
+  const cx = totalArea > 0 ? (filledCx + strokeMx) / totalArea : 0;
+  const cy = totalArea > 0 ? (filledCy + strokeMy) / totalArea : 0;
+
+  // Cheap self-check: a centroid outside its own ink box means the model was fed
+  // something it does not understand.
+  if (
+    finalBox &&
+    (cx < finalBox.minX - 1e-3 ||
+      cx > finalBox.maxX + 1e-3 ||
+      cy < finalBox.minY - 1e-3 ||
+      cy > finalBox.maxY + 1e-3)
+  ) {
+    ctx.unresolved.add('centroid-outside-ink');
+  }
+
+  return {
+    viewBox,
+    ink: {
+      bbox: finalBox,
+      area: totalArea,
+      centroid: { cx, cy },
+    },
+    strokeOnly: filledArea === 0 && strokeArea > 0,
+    noInk: totalArea <= 1e-9 || !finalBox,
+    unitScale,
+    unitScaleX,
+    unitScaleY,
+    unitSource,
+    unresolved: [...ctx.unresolved],
+  };
+}
+
+function boxCenter(box) {
+  return { x: (box.minX + box.maxX) / 2, y: (box.minY + box.maxY) / 2 };
+}
+
+/**
+ * @param {object} shape result of analyzeSvg
+ * @param {{mode?: string, target?: string}} opts
+ */
+export function checkShape(shape, { mode = 'standalone', target = '<inline>' } = {}) {
+  const { viewBox, ink } = shape;
+  const findings = [];
+  const meta = {
+    strokeOnly: shape.strokeOnly,
+    ink: shape.ink,
+    viewBox: shape.viewBox,
+    unitScale: shape.unitScale ?? null,
+    unitScaleX: shape.unitScaleX ?? 1,
+    unitScaleY: shape.unitScaleY ?? 1,
+    unitSource: shape.unitSource || 'assumed',
+  };
+
+  // A canvas that failed to parse has no ink for a reason already reported;
+  // adding "the canvas may be empty" would point the reader at the wrong thing.
+  const canvasInvalid = (shape.unresolved || []).some(
+    (id) => id === 'invalid-viewBox' || id === 'relative-canvas' || id === 'invalid-canvas',
+  );
+  if (shape.noInk && !canvasInvalid) {
+    // "No ink" and "no measurable ink" point the reader at different things: an
+    // empty canvas is the artwork's problem, an unresolved shape is the checker's.
+    const blocked = (shape.unresolved || []).length > 0;
+    findings.push({
+      id: 'geometry/no-ink',
+      layer: 'exact',
+      forcedVerdict: 'unknown',
+      pixel: false,
+      evidence: blocked
+        ? 'nothing could be measured: the ink on this canvas did not resolve (see the unresolved findings)'
+        : 'no renderable ink was found (empty canvas, unresolved shapes, or only non-rendering nodes)',
+      suggested: blocked
+        ? { kind: 'inspect', value: 'resolve the listed features, then re-run' }
+        : { kind: 'inspect', value: 'check the source; the canvas may be empty or use unsupported syntax' },
+    });
+  }
+
+  if (shape.unresolved?.length) {
+    findings.push({
+      id: 'geometry/unresolved-graphics',
+      layer: 'exact',
+      forcedVerdict: 'unknown',
+      pixel: false,
+      evidence: `ink cannot be measured while these features are present: ${shape.unresolved.join(', ')}`,
+      suggested: {
+        kind: 'inspect',
+        value: canvasInvalid
+          ? 'give the root an absolute width/height or a valid viewBox; the canvas is unknown'
+          : 'flatten the artwork (expand clip paths / masks) and re-run',
+      },
+    });
+  }
+
+  if (shape.noInk || shape.unresolved?.length) {
+    return buildReport({ target, mode, findings, meta: { ...meta, blocked: true } });
+  }
+
+  const vbCenter = { x: viewBox.x + viewBox.w / 2, y: viewBox.y + viewBox.h / 2 };
+  const inkCenter = boxCenter(ink.bbox);
+  // Measurements are taken in viewBox user units; offsets, tolerance basis and
+  // suggestions are reported in rendered px.
+  const sx = shape.unitScaleX ?? 1;
+  const sy = shape.unitScaleY ?? 1;
+  const basis = Math.min((viewBox.w || 24) * sx, (viewBox.h || 24) * sy);
+  // The evidence is written in viewBox units; say how they became px.
+  const scaleNote =
+    sx === 1 && sy === 1
+      ? ''
+      : sx === sy
+        ? ` [user units ×${round(sx, 4)} = ${shape.unitSource === 'assumed' ? '24px nominal' : 'px'}]`
+        : ` [user units ×${round(sx, 4)} = px horizontally, ×${round(sy, 4)} vertically]`;
+
+  const dInkX = inkCenter.x - vbCenter.x;
+  const dInkY = inkCenter.y - vbCenter.y;
+
+  // `value` is px, but a viewBox origin is in user units. Publish the user-unit
+  // figure whenever the two differ and there is something to add.
+  const deltaInUserUnits =
+    (sx !== 1 || sy !== 1) && (Math.abs(dInkX) > 1e-9 || Math.abs(dInkY) > 1e-9);
+
+  findings.push({
+    id: 'geometry/ink-bbox',
+    layer: 'exact',
+    offset: dInkX * sx,
+    offsetY: dInkY * sy,
+    basis,
+    evidence:
+      `ink bbox=(${round(ink.bbox.minX)},${round(ink.bbox.minY)})-` +
+      `(${round(ink.bbox.maxX)},${round(ink.bbox.maxY)}) centre=(${round(inkCenter.x)},${round(inkCenter.y)}) ` +
+      `viewBox centre=(${round(vbCenter.x)},${round(vbCenter.y)})${scaleNote}`,
+    suggested: {
+      // The viewBox attribute below is the corrected one; `value` is the same
+      // correction sized in px, matching every other reported number. The two only
+      // coincide when a user unit happens to be a pixel, so `delta` carries the
+      // user-unit figure that actually goes into the origin whenever they differ —
+      // adding `value` to a 512-unit origin would move the artwork by half a unit.
+      kind: 'viewBox-origin',
+      value: `${round(dInkX * sx, 2)}px / ${round(dInkY * sy, 2)}px`,
+      ...(deltaInUserUnits ? { delta: `${round(dInkX, 3)} / ${round(dInkY, 3)}` } : {}),
+      viewBox: `${round(viewBox.x + dInkX, 3)} ${round(viewBox.y + dInkY, 3)} ${round(viewBox.w, 3)} ${round(viewBox.h, 3)}`,
+    },
+  });
+
+  const shiftX = inkCenter.x - ink.centroid.cx;
+  const shiftY = inkCenter.y - ink.centroid.cy;
+
+  findings.push({
+    id: 'geometry/centroid',
+    layer: 'exact',
+    offset: -shiftX * sx,
+    offsetY: -shiftY * sy,
+    // A centroid offset is judged against the object's girth, not one axis: a
+    // tall thin glyph and a wide flat one of the same mass are equally sensitive
+    // to drift, and under `preserveAspectRatio="none"` the two axes have
+    // different px scales, so the smaller extent is the honest one.
+    basis: Math.max(
+      Math.min(
+        (ink.bbox.maxX - ink.bbox.minX) * sx,
+        (ink.bbox.maxY - ink.bbox.minY) * sy,
+      ),
+      1,
+    ),
+    evidence:
+      `area=${round(ink.area)} centroid=(${round(ink.centroid.cx)},${round(ink.centroid.cy)}) ` +
+      `ink centre=(${round(inkCenter.x)},${round(inkCenter.y)})${scaleNote}`,
+    suggested: {
+      // Translating the artwork moves the centroid and the box together, so it
+      // cannot change this number: the mass distribution itself has to change.
+      kind: 'redraw',
+      value:
+        Math.abs(shiftY * sy) < 0.005
+          ? `move the visual mass ${round(shiftX * sx, 2)}px`
+          : `move the visual mass ${round(shiftX * sx, 2)}px / ${round(shiftY * sy, 2)}px`,
+    },
+  });
+
+  if (mode === 'inline') {
+    findings.push({
+      id: 'geometry/inline-context',
+      layer: 'exact',
+      forcedVerdict: 'unknown',
+      pixel: false,
+      evidence: 'inline mode needs a sibling text node to measure the optical gutter; none provided',
+      suggested: { kind: 'rerun', value: '--mode standalone' },
+    });
+  }
+
+  return buildReport({ target, mode, findings, meta });
+}
+
+export async function checkIconFile(path, { mode = 'auto' } = {}) {
+  const text = await readFile(path, 'utf8');
+  const shape = analyzeSvg(text);
+  const resolved = mode === 'auto' ? 'standalone' : mode;
+  return checkShape(shape, { mode: resolved, target: basename(path) });
+}
+
+/**
+ * Keyline normalisation across a set. Areas are compared in linear units
+ * (sqrt of the fill ratio) so the number reads as "this icon is N px smaller
+ * than the set's optical norm".
+ */
+export async function checkIconSet(dir, { threshold = 0.2 } = {}) {
+  const entries = (await readdir(dir)).filter((f) => f.toLowerCase().endsWith('.svg')).sort();
+  const rows = [];
+  for (const file of entries) {
+    const text = await readFile(join(dir, file), 'utf8');
+    const shape = analyzeSvg(text);
+    const boxArea = (shape.viewBox.w || 1) * (shape.viewBox.h || 1);
+    const ratio = shape.ink.area / boxArea;
+    const unitX = shape.unitScaleX ?? 1;
+    const unitY = shape.unitScaleY ?? 1;
+    rows.push({
+      file,
+      ratio,
+      linear: Math.sqrt(Math.max(ratio, 0)),
+      // The fill ratio is unitless, but the overshoot below is a length, so the
+      // reference size must be in rendered px.
+      size: Math.min(shape.viewBox.w * unitX, shape.viewBox.h * unitY),
+      strokeOnly: shape.strokeOnly,
+      noInk: shape.noInk,
+      unresolved: shape.unresolved.length > 0,
+    });
+  }
+
+  if (rows.length === 0) {
+    // An empty directory is not a consistent icon set; answering `ok` would make
+    // a mistyped path look like a passing audit.
+    return buildReport({
+      target: basename(dir),
+      mode: 'keyline',
+      findings: [
+        {
+          id: 'geometry/keyline-empty',
+          layer: 'heuristic',
+          forcedVerdict: 'unknown',
+          pixel: false,
+          offset: 0,
+          evidence: 'no .svg files in this directory, so there is no set to normalise',
+          suggested: { kind: 'inspect', value: 'check the path' },
+        },
+      ],
+    });
+  }
+
+  const blind = rows.filter((r) => r.noInk || r.unresolved);
+  if (blind.length > 0) {
+    return buildReport({
+      target: basename(dir),
+      mode: 'keyline',
+      findings: [
+        {
+          id: 'geometry/keyline-incomplete',
+          layer: 'heuristic',
+          forcedVerdict: 'unknown',
+          pixel: false,
+          evidence: `${blind.length}/${rows.length} icons could not be measured (${blind
+            .map((r) => r.file)
+            .join(', ')}); a norm computed without them would be fiction`,
+          suggested: { kind: 'inspect', value: 'fix or flatten the flagged icons first' },
+        },
+      ],
+      meta: { set: rows.map((r) => r.file) },
+    });
+  }
+
+  // A stroke-only icon's fill ratio is dominated by its line width; comparing it
+  // with solid glyphs produces a "norm" that belongs to neither. Refuse instead.
+  const stroked = rows.filter((r) => r.strokeOnly).length;
+  if (stroked > 0 && stroked < rows.length) {
+    return buildReport({
+      target: basename(dir),
+      mode: 'keyline',
+      findings: [
+        {
+          id: 'geometry/keyline-mixed-set',
+          layer: 'heuristic',
+          forcedVerdict: 'unknown',
+          pixel: false,
+          offset: 0,
+          evidence:
+            `${stroked}/${rows.length} icons are stroke-only and the rest are filled; ` +
+            'their fill ratios are not comparable — split the set before normalising',
+          suggested: { kind: 'split', value: 'run keyline per icon family' },
+        },
+      ],
+      meta: { set: rows.map((r) => r.file) },
+    });
+  }
+
+  if (rows.length < 3) {
+    return buildReport({
+      target: basename(dir),
+      mode: 'keyline',
+      findings: [
+        {
+          id: 'geometry/keyline-small-set',
+          layer: 'heuristic',
+          forcedVerdict: 'unknown',
+          pixel: false,
+          offset: 0,
+          evidence: `${rows.length} icons is not enough to establish a norm (need at least 3)`,
+          suggested: { kind: 'extend', value: 'add more icons from the same family' },
+        },
+      ],
+      meta: { set: rows.map((r) => r.file) },
+    });
+  }
+
+  const sorted = [...rows].map((r) => r.linear).sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+
+  const findings = rows.map((row) => {
+    const delta = (row.linear - median) * row.size;
+    const inside = Math.abs(row.linear - median) <= threshold;
+    return {
+      id: 'geometry/keyline-overshoot',
+      layer: 'heuristic',
+      offset: delta,
+      basis: row.size,
+      forcedVerdict: inside ? 'ok' : 'nudge',
+      evidence:
+        `${row.file}: fill ratio=${round(row.ratio, 3)} linear=${round(row.linear, 3)} ` +
+        `set median=${round(median, 3)} (threshold ±${threshold})`,
+      suggested: inside
+        ? { kind: 'none', value: 'within set norm' }
+        : {
+            kind: 'scale',
+            value: `${round((median / (row.linear || 1) - 1) * 100, 1)}%`,
+          },
+    };
+  });
+
+  return buildReport({
+    target: basename(dir),
+    mode: 'keyline',
+    findings,
+    meta: { set: rows.map((r) => r.file) },
+  });
+}
+
+export { tolFor };

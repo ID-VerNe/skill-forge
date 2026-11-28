@@ -1,0 +1,10 @@
+.btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn__label {
+  display: inline-block;
+  text-box: trim-both cap alphabetic;
+}

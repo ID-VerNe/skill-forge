@@ -1,0 +1,8 @@
+.foo::after {
+  content: "}";
+}
+
+.btn {
+  display: flex;
+  text-box: trim-both;
+}

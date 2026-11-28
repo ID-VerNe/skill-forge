@@ -1,0 +1,6 @@
+@layer components {
+  .card {
+    display: flex;
+    text-box: trim-both cap alphabetic;
+  }
+}
