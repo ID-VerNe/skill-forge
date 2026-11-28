@@ -2798,3 +2798,78 @@ test('margin cascade and unitless zero do not invent or hide a nudge', () => {
   near(nudge('.x{font-size:16px;margin-top:0}'), 0, 0.01);
   near(nudge('.x{font-size:16px;transform:translateY(0)}'), 0, 0.01);
 });
+
+// --- round 19: nudge composes, unreadable lengths clear the stale offset ----
+
+test('a zero margin does not swallow a transform nudge', () => {
+  // Chrome moves the text 2px for every one of these. Reading the margin first
+  // with `??` stopped at the zero and never looked at the transform, so the rule
+  // that exists to catch a real 2px move returned `ok`.
+  const cases = [
+    '.x{font-size:16px;margin:0;transform:translateY(2px)}',
+    '.x{font-size:16px;margin:0 auto;transform:translateY(2px)}',
+    '.x{font-size:16px;margin:0 0 2px;transform:translateY(2px)}',
+    '.x{font-size:16px;margin-top:0!important;transform:translateY(2px)}',
+    '.x{font-size:16px;margin-block-start:0;transform:translateY(2px)}',
+    '.x{font-size:16px;margin:0;transform:translate3d(0,2px,0)}',
+  ];
+  for (const css of cases) {
+    const report = checkCss(css, { target: 'compose.css' });
+    const f = report.findings.find((x) => x.id === 'rule/hardcoded-vertical-nudge');
+    assert.ok(f, css);
+    assert.equal(f.verdict, 'nudge', css);
+    near(f.measured.dx, 2, 0.01);
+  }
+});
+
+test('margin and transform add up, and a cancel nets out', () => {
+  const nudge = (css) => {
+    const f = checkCss(css, { target: 'compose.css' }).findings.find(
+      (x) => x.id === 'rule/hardcoded-vertical-nudge',
+    );
+    return f ? f.measured.dx : 0;
+  };
+  // Both move the same text, so the offsets compose: 2px + 1px is a 3px shift.
+  near(nudge('.x{font-size:16px;margin-top:2px;transform:translateY(1px)}'), 3, 0.01);
+  // A translate that pulls the margin back leaves the text where it was.
+  near(nudge('.x{font-size:16px;margin-top:2px;transform:translateY(-2px)}'), 0, 0.01);
+});
+
+test('a later unreadable margin clears the earlier px offset', () => {
+  // `auto` computes to zero on a block box, so it cancels rather than defers.
+  // The rest win the cascade but cannot be evaluated; keeping the stale 2px
+  // reported a nudge Chrome does not draw.
+  for (const later of ['auto', 'calc(0px)', '1em', 'var(--x)']) {
+    const css = `.x{font-size:16px;margin-top:2px;margin-top:${later}}`;
+    const report = checkCss(css, { target: 'cascade.css' });
+    assert.equal(
+      report.findings.some((x) => x.id === 'rule/hardcoded-vertical-nudge'),
+      false,
+      css,
+    );
+    assert.equal(report.verdict, 'ok', css);
+  }
+});
+
+test('two-argument translate contributes its Y offset', () => {
+  const f = checkCss('.x{font-size:16px;transform:translate(0,2px)}', {
+    target: 'translate.css',
+  }).findings.find((x) => x.id === 'rule/hardcoded-vertical-nudge');
+  assert.ok(f, 'translate(0,2px) is a 2px Y move');
+  near(f.measured.dx, 2, 0.01);
+});
+
+test('a % stroke-width on a nested <svg> itself uses its own viewBox', () => {
+  const nested = (width) =>
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24">'
+      + `<svg x="0" y="0" width="24" height="24" viewBox="0 0 48 48" stroke="#000" `
+      + `fill="none" stroke-width="${width}"><line x1="4" y1="24" x2="44" y2="24"/></svg>`
+      + '</svg>';
+  // Chrome draws 320px² for both: 16.666% of the 48-unit inner viewBox is 8
+  // units, which the outer 2x scale renders as 16px over a 40-unit line.
+  const pct = analyzeSvg(nested('16.666666%'));
+  const explicit = analyzeSvg(nested('8'));
+  assert.deepEqual(pct.unresolved, []);
+  near(pct.ink.area, explicit.ink.area, 0.01);
+  near(pct.ink.area * 4, 320, 1);
+});

@@ -271,6 +271,25 @@ function pxLength(s) {
   return m ? Number(m[1]) : null;
 }
 
+/** A declaration that wins the cascade but whose length we cannot evaluate. */
+const UNCALCULABLE = Symbol('uncalculable');
+
+/**
+ * The top margin one declaration writes, or `UNCALCULABLE`.
+ *
+ * `auto` computes to zero on a block box, so it is a *known* zero — a later
+ * `margin-top:auto` really does cancel an earlier `margin-top:2px`. Any other
+ * non-px length (`1em`, `calc(0px)`, `var(--x)`) does override the earlier
+ * declaration but leaves the offset unknowable; keeping the stale 2px there
+ * reported a nudge Chrome does not draw.
+ */
+function marginTopToken(value) {
+  const first = value.trim().split(/\s+/)[0] || '';
+  if (/^auto$/i.test(first)) return 0;
+  const px = pxLength(first);
+  return px === null ? UNCALCULABLE : px;
+}
+
 /**
  * The physical top margin after the block's own cascade.
  *
@@ -284,17 +303,15 @@ function pxLength(s) {
 function marginTopOf(entries) {
   let best = null;
   for (const [prop, raw] of entries) {
+    if (prop !== 'margin-top' && prop !== 'margin-block-start' && prop !== 'margin') continue;
     const { value, important } = stripImportant(raw);
-    let candidate = null;
-    if (prop === 'margin-top' || prop === 'margin-block-start') {
-      candidate = pxLength(value);
-    } else if (prop === 'margin') {
-      candidate = pxLength(value.split(/\s+/)[0] || '');
-    }
-    if (candidate === null) continue;
+    const candidate = marginTopToken(value);
     if (!best || important || !best.important) best = { value: candidate, important };
   }
-  return best ? best.value : null;
+  // An unreadable winner contributes nothing we can assert; the transform half
+  // of the nudge is still measured on its own.
+  if (!best || best.value === UNCALCULABLE) return 0;
+  return best.value;
 }
 
 /** The winning declaration for one property, including `!important` over order. */
@@ -308,15 +325,22 @@ function cascadeValue(entries, prop) {
   return best ? best.value : null;
 }
 
-/** Every Y translation contributes; `translateY(1px) translateY(2px)` is 3px. */
+/**
+ * Every Y translation contributes; `translateY(1px) translateY(2px)` is 3px.
+ *
+ * `translate(x, y)` moves the element on both axes, so its *second* argument is
+ * a Y nudge too — recognising only `translateY`/`translate3d` reported `ok` on
+ * a real 2px move.
+ */
 function translateYSum(value) {
   const text = stripImportant(value).value;
   const num = '([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:[eE][+-]?\\d+)?)';
   const reY = new RegExp(`translateY\\(\\s*${num}(px)?\\s*\\)`, 'gi');
   const re3 = new RegExp(`translate3d\\(\\s*[^,()]+,\\s*${num}(px)?\\s*,`, 'gi');
+  const re2 = new RegExp(`translate\\(\\s*[^,()]+,\\s*${num}(px)?\\s*\\)`, 'gi');
   let sum = 0;
   let found = false;
-  for (const re of [reY, re3]) {
+  for (const re of [reY, re3, re2]) {
     let m;
     while ((m = re.exec(text)) !== null) {
       const amount = Number(m[1]);
@@ -335,7 +359,14 @@ function nudgeFindings(blocks) {
     // Chrome moves the text for all of these spellings; matching only
     // `margin-top: 2px` reported `ok` on a real 2px displacement.
     const entries = block.order || Object.entries(block.decls);
-    const nudge = marginTopOf(entries) ?? translateYSum(cascadeValue(entries, 'transform'));
+    // Both spellings move the same text, so they compose rather than compete: a
+    // zero margin does not cancel `translateY(2px)`, and a translate that pulls
+    // back a margin nets out. Reading margin first (`??`) made
+    // `margin:0;transform:translateY(2px)` — and the ubiquitous `margin:0 auto`
+    // centring idiom — come back `ok` on a real 2px move.
+    const margin = marginTopOf(entries);
+    const transform = translateYSum(cascadeValue(entries, 'transform')) ?? 0;
+    const nudge = margin + transform;
     // A sub-pixel nudge sits inside the tolerance band by definition; flagging it
     // would be noise. The documented window is 1px <= |nudge| <= 3px.
     if (!nudge || Math.abs(nudge) < 1 || Math.abs(nudge) > 3) continue;

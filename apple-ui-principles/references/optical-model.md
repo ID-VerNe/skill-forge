@@ -687,11 +687,26 @@ The declarations are normalised before matching, so the heuristic also sees
 equivalent authoring forms: the `margin` shorthand with one, two, three or four
 values (a two-value `margin: 2px 0` sets the top margin to `2px`),
 `margin-block-start`, a trailing `! important` with whitespace, case-insensitive
-units (`2PX`), a unitless zero, `translate3d(0, 2px, 0)`, and repeated transforms
+units (`2PX`), a unitless zero, `translate3d(0, 2px, 0)`, a two-argument
+`translate(0, 2px)`, and repeated transforms
 (`translateY(1px) translateY(2px)` sums to `3px`). Conflicting declarations are
 resolved in source order with `!important` winning over a later normal
 declaration, so `margin:2px;margin-top:0` is not a nudge while
 `margin-top:2px!important;margin-top:0` is.
+
+Margin and transform **compose** rather than compete, because both move the same
+text: `margin:0;transform:translateY(2px)` is a 2px nudge, `margin:0 auto` plus a
+translate is still a nudge (the centring shorthand writes a zero top margin, not
+an unknown one), and `margin-top:2px;transform:translateY(-2px)` nets out to zero
+because the text lands where it started. Reading only the first source that
+produced a value reported `ok` on a real 2px move.
+
+A winning declaration whose length cannot be evaluated clears the earlier offset
+instead of inheriting it: `margin-top:auto` computes to `0` on a block box (it
+cancels), while `margin-top:1em`, `calc(0px)` or `var(--x)` overrides the earlier
+`2px` but leaves the offset unknowable, so no offset is claimed. The window
+itself (`1px ≤ |nudge| ≤ 3px`) applies to the composed total: beyond 3px the shift
+is layout, not optical correction.
 
 ## 7. `#6` concentric radii
 
