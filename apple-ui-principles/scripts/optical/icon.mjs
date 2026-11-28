@@ -555,19 +555,17 @@ function paintServerPaints(target, ctx, depth = 0) {
  * Chrome measures it, and the file carries every number needed to do the same.
  * Without either, the basis really is unknowable and the caller still refuses.
  */
-function viewportDiagonal(ctx) {
-  const root = ctx.root;
-  if (!root || !root.attrs) return null;
-  // `parseViewBox` supplies a nominal 24x24 when nothing is declared. That is a
-  // comparison convention, not a canvas, so a percentage against it would be a
-  // guess. Only a declared viewBox or absolute sides give a real diagonal.
-  const w = absolutePx(root.attrs.width);
-  const h = absolutePx(root.attrs.height);
-  if (root.attrs.viewBox === undefined && (w === null || h === null)) return null;
-  const vb = parseViewBox(root.attrs);
-  if (vb && vb.w > 0 && vb.h > 0) return Math.hypot(vb.w, vb.h) / Math.SQRT2;
-  if (w > 0 && h > 0) return Math.hypot(w, h) / Math.SQRT2;
-  return null;
+function viewportDiagonal(inherited) {
+  // Percentages resolve against the **nearest** viewport, and `inherited.viewport`
+  // is expressed in that viewport's own user space. Reading `ctx.root` instead
+  // gave a nested `<svg viewBox="0 0 48 48">` the root's 24-unit diagonal: a
+  // `16.666%` band became 4 units instead of 8, and a symmetric pair of bands
+  // came back `off` by 3px. The nominal 24x24 canvas is a comparison convention,
+  // not a viewport, so an undeclared one still refuses.
+  if (!inherited.viewportDeclared) return null;
+  const { w, h } = inherited.viewport || {};
+  if (!(w > 0) || !(h > 0)) return null;
+  return Math.hypot(w, h) / Math.SQRT2;
 }
 
 /**
@@ -581,14 +579,19 @@ function strokeWidthOf(attrs, inherited, ctx) {
   const raw = String(attrs['stroke-width']).trim();
   if (/%$/.test(raw)) {
     const number = raw.slice(0, -1);
-    const basis = CSS_NUMBER.test(number) ? viewportDiagonal(ctx) : null;
+    const basis = CSS_NUMBER.test(number) ? viewportDiagonal(inherited) : null;
     if (basis === null) {
       ctx.unresolved.add('stroke-width-percentage');
       return inherited.strokeWidth;
     }
     const value = (Number(number) / 100) * basis;
-    if (!Number.isFinite(value) || value < 0) {
+    if (!Number.isFinite(value)) {
       ctx.unresolved.add('stroke-width-percentage');
+      return inherited.strokeWidth;
+    }
+    if (value < 0) {
+      // Invalid declaration: the browser drops it and the property keeps its
+      // inherited value (initially 1), exactly as a negative bare number does.
       return inherited.strokeWidth;
     }
     return value;
@@ -703,6 +706,7 @@ function inheritedFor(attrs, inherited, visible, matrix, ctx) {
     strokeOpacity: strokeOpacityOf(attrs, inherited),
     visible,
     viewport: inherited.viewport,
+    viewportDeclared: inherited.viewportDeclared,
     level: (inherited.level || 0) + 1,
   };
 }
@@ -879,7 +883,12 @@ function collect(node, inherited, out, ctx) {
       );
     }
     const local = inheritedFor(attrs, inherited, visible, matrix, ctx);
-    local.viewport = { w: vpW, h: vpH };
+    // Children live in the inner user space: with a viewBox the viewport rect
+    // maps to the viewBox's own dimensions, so percentages must use those.
+    local.viewport = attrs.viewBox !== undefined
+      ? { w: parseViewBox(attrs).w, h: parseViewBox(attrs).h }
+      : { w: vpW, h: vpH };
+    local.viewportDeclared = true;
     // The clip applies in the *inner* coordinate system, after the viewBox map.
     withClip(attrs, matrix, ctx, out, (sink) => {
       withViewport({ x: 0, y: 0, w: vpW, h: vpH }, outerMatrix, ctx, sink, (inner) => {
@@ -955,19 +964,22 @@ function collect(node, inherited, out, ctx) {
         }
         const symbolLocal = inheritedFor(symbolAttrs, local, visible, useMatrix, ctx);
         let matrix = matrixFrom(symbolAttrs, useMatrix, ctx);
+        let symbolVb = null;
         if (symbolAttrs.viewBox !== undefined) {
           const vb = parseViewBox(symbolAttrs);
           if (!vb) {
             ctx.unresolved.add(viewBoxFailure(symbolAttrs));
             return;
           }
+          symbolVb = vb;
           matrix = multiplyMatrix(
             matrix,
             viewBoxMatrix(vb, { x: 0, y: 0, w: vpW, h: vpH }, symbolAttrs.preserveAspectRatio),
           );
         }
         symbolLocal.matrix = matrix;
-        symbolLocal.viewport = { w: vpW, h: vpH };
+        symbolLocal.viewport = symbolVb ? { w: symbolVb.w, h: symbolVb.h } : { w: vpW, h: vpH };
+        symbolLocal.viewportDeclared = true;
         // A symbol clips to the viewport the <use> gives it, exactly like a
         // nested <svg>. Its own clip-path is in the symbol's user space, which
         // is the one its viewBox establishes — `matrix`, not `useMatrix`.
@@ -1278,16 +1290,26 @@ function visibleUserRect(attrs, viewBox) {
   // Strict grammar: `xMidYMid SLICE`, `xmidymid slice` and a trailing `defer`
   // are dropped by the engine, which renders `meet` and crops nothing. Reading
   // them as slice invented a crop and reported visible ink as unknown.
-  if (mode !== 'slice') return null;
   const w = absolutePx(attrs.width);
   const h = absolutePx(attrs.height);
   // Without both sides the viewport's aspect ratio is not in the file, so which
   // part gets cropped is not either. The caller refuses; guessing here would be
   // exactly the "invented canvas" this pass avoids everywhere else.
-  if (w === null || h === null || !(w > 0) || !(h > 0)) return undefined;
+  if (w === null || h === null || !(w > 0) || !(h > 0)) {
+    // With `slice` the crop depends on an aspect ratio the file does not pin.
+    return mode === 'slice' ? undefined : null;
+  }
   if (!(viewBox.w > 0) || !(viewBox.h > 0)) return undefined;
+  if (mode === 'none') return { x: viewBox.x, y: viewBox.y, w: viewBox.w, h: viewBox.h };
 
-  const scale = Math.max(w / viewBox.w, h / viewBox.h);
+  // `meet` letterboxes: the visible user-space rect is *larger* than the
+  // viewBox. Checking it too catches ink a wide band pushes outside the canvas —
+  // `stroke-width="150%"` rendered 1344px² of ink where the model counted 2016
+  // and still said `ok`. `slice` picks the larger ratio instead.
+  const scale =
+    mode === 'slice'
+      ? Math.max(w / viewBox.w, h / viewBox.h)
+      : Math.min(w / viewBox.w, h / viewBox.h);
   const visibleW = w / scale;
   const visibleH = h / scale;
   // Which side the overflow lands on follows the alignment; `xMidYMid` is the
@@ -1302,6 +1324,24 @@ function visibleUserRect(attrs, viewBox) {
     w: visibleW,
     h: visibleH,
   };
+}
+
+/**
+ * Slack for the viewport clip check, in user units.
+ *
+ * The ink box comes from a flattened path and a `perimeter × width` stroke
+ * approximation, both of which overshoot a curved edge by a few hundredths of
+ * a unit. Treating that as clipped ink turned 115 real icons (octicons,
+ * semi-icons, Chrome's own close button) from measurable into `unknown`. The
+ * checker already has a documented optical tolerance band; the same band is the
+ * right place to ignore a sliver the renderer would clip but that cannot move
+ * a verdict. Anything beyond it — a 150% band, a band at y=-12 — still refuses.
+ */
+function viewportEpsilon(viewBox, sx, sy) {
+  if (!(sx > 0) || !(sy > 0)) return 1e-9;
+  const shortSidePx = Math.min(viewBox.w * sx, viewBox.h * sy);
+  const tolPx = Math.min(1.5, Math.max(0.5, 0.02 * shortSidePx));
+  return tolPx / Math.min(sx, sy);
 }
 
 function boxWithin(box, rect, eps = 1e-9) {
@@ -1398,6 +1438,9 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
       stroke: undefined,
       strokeWidth: 1,
       strokeWidthFromViewport: false,
+      viewportDeclared:
+        svg.attrs.viewBox !== undefined ||
+          (absolutePx(svg.attrs.width) !== null && absolutePx(svg.attrs.height) !== null),
       fillRule: 'nonzero',
       fillOpacity: 1,
       visible: true,
@@ -1559,8 +1602,13 @@ export function analyzeSvg(text, { steps = 24 } = {}) {
     const rootVisible = String(overflow ?? '').trim().toLowerCase() === 'visible';
     if (!rootVisible) {
       const visible = visibleUserRect(svg.attrs || {}, viewBox);
-      if (visible === undefined || (visible && !boxWithin(finalBox, visible))) {
-        ctx.unresolved.add('root-slice-clip');
+      const eps = viewportEpsilon(viewBox, unitScaleX, unitScaleY);
+      if (visible === undefined || (visible && !boxWithin(finalBox, visible, eps))) {
+        ctx.unresolved.add(
+          parsePreserveAspectRatio(svg.attrs.preserveAspectRatio).mode === 'slice'
+            ? 'root-slice-clip'
+            : 'ink-outside-viewport',
+        );
       }
     }
   }

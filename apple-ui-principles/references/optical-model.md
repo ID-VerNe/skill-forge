@@ -123,7 +123,7 @@ report returns `geometry/no-ink` or `geometry/unresolved-graphics` with verdict
 | `<use>` pointing at a missing id, nested deeper than 3, or targeting a non-renderable node | `geometry/unresolved-graphics` |
 | a `<use>` / nested `<svg>` sized in em, ch or viewport units | `geometry/unresolved-graphics` |
 | a `transform` that is not a bare-number list — a unit (`translate(2px,0)`, `rotate(45deg)`), a percentage, `var()`, an unknown function, wrong argument count, empty argument (`translate(10,)`), trailing junk, a trailing dot (`translate(6.,6.)`) | measured **untransformed**, with no finding — the engine drops the whole attribute, so the element sits in its parent's space. The parseable prefix is never applied: that would turn `translate(10%,8)` into `translate(8,0)`. A sign is a number (`+4`) and adjacent signed numbers are two of them (`6-6`, `.5.5`), both applied |
-| a `stroke-width` in `%` with no declared viewBox and no absolute root sides | `geometry/unresolved-graphics` (`stroke-width-percentage`) — there is no real diagonal to take the percentage of; the nominal 24×24 canvas is a comparison convention, not a viewport. With a viewBox, `10%` is 10% of the normalised diagonal and is measured (2.4 units on a 24-unit canvas, Chrome-verified at both 24px and 48px render sizes) |
+| a `stroke-width` in `%` with no declared viewBox and no absolute root sides | `geometry/unresolved-graphics` (`stroke-width-percentage`) — there is no real diagonal to take the percentage of; the nominal 24×24 canvas is a comparison convention, not a viewport. With a viewport, `10%` is 10% of the **nearest viewport's** normalised diagonal, expressed in that viewport's own user space (2.4 units on a 24-unit canvas). A nested `<svg viewBox="0 0 48 48">` uses 48, not the root's 24; reading the root turned a symmetric pair of bands into a 3px false `off`. A negative percentage is an invalid declaration — the width inherits, it is not a refusal |
 | a `stroke-width` in `2pt` / `1em` / `1in` (`stroke-width-relative`), on the shape **or any ancestor** | `geometry/unresolved-graphics`. Absolute units are declined on purpose: `pt`, `pc`, `mm` and `in` would each need a px-per-unit constant, which is a second place to be wrong about the same number. `2px` is accepted — one px *is* one user unit. Write the others in user units |
 | a `stroke-width` that overflows to infinity (`1e999`) | `geometry/unresolved-graphics` (`stroke-width-not-finite`) — one engine clamps it to the largest length and paints over the canvas, another drops the declaration |
 | a `stroke-width` that is finite but whose band area is not (`1e308`) | `geometry/unresolved-graphics` (`non-finite-ink`) — `width × length` overflows to `Infinity` and the centroid comes back `NaN`; `NaN` compares false against every tolerance, so without this check the report reads `off` with a `NaN` displacement instead of admitting it has no measurement |
@@ -325,6 +325,20 @@ that fits inside the strip is measured normally; anything crossing it is refused
 (`root-slice-clip`). Cropping a filled polygon to a rect is tractable, but a
 *stroked* one is not expressible as `perimeter × width`, and clipping half the
 file would be worse than saying so.
+
+The root viewport clips under `meet` and `none` too — `meet` simply letterboxes,
+so the visible user-space rect is *larger* than the viewBox. Ink beyond that rect
+is refused as `ink-outside-viewport`. A `stroke-width="150%"` band used to be
+counted out to 2016px² while Chrome drew only 1344px² inside the canvas, and the
+report still said `ok`. The check only runs when the file declares both root
+sides; an assumed 24px canvas is a comparison convention, not a viewport.
+
+A flattened Bézier or a `perimeter × width` stroke box can overshoot an edge by
+a few thousandths of a unit. That sliver is inside the same tolerance band used
+for verdicts (`tol = clamp(0.02 × shortSide, 0.5px, 1.5px)`, converted back to
+user units), so it is ignored here rather than reported as clipped ink. Without
+that slack the check turned 115 real icons into `unknown`. Ink beyond the band
+still refuses.
 
 `overflow="visible"` is the one declaration that turns that clip off, and then
 the escaping ink is measured as authored. `auto` and `scroll` still clip (they
@@ -667,6 +681,12 @@ metrics (`line-height` / `font-size` / `letter-spacing`) is the fossil of a
 `text-box` workaround. It is reported so it can be replaced, but always as a
 heuristic: the same declaration can be legitimate optical correction.
 
+The declarations are normalised before matching, so the heuristic also sees
+equivalent authoring forms: `margin: 2px 0 0` and `margin-block-start: 2px`,
+trailing `!important`, case-insensitive units (`2PX`), and repeated transforms
+(`translateY(1px) translateY(2px)` sums to `3px`). Multiple conflicting
+declarations use the last one after normalisation, matching CSS cascade order.
+
 ## 7. `#6` concentric radii
 
 For uniformly inset surfaces the inner radius that keeps the curvature
@@ -774,6 +794,10 @@ codes stay distinct so a broken project never looks like an unverifiable one.
 - Two subpaths that share a region inside one shape are refused rather than
   unioned. This costs coverage deliberately: 3 of antd's 834 files, one of which
   was `ok` on a 23%-low area.
+- Conflicting Tailwind utilities in the same family are resolved by **scale
+  order**, not by their order in `className`: Tailwind emits one rule per scale
+  step, so `rounded-lg` wins over `rounded-md` and `p-4` over `p-2` whichever is
+  written first. Chrome's computed `border-radius` is 8px for both class orders.
 - Tailwind variant prefixes (`md:`, `dark:hover:`, `supports-[…]:`) are stripped
   before matching, because `hidden md:flex` and `md:flex` describe the same
   container. The consequence is that a variant-qualified `flex` is treated as

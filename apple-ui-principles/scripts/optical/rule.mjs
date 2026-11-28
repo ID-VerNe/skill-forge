@@ -257,17 +257,50 @@ function textBoxFindings(blocks) {
   return findings;
 }
 
+/** A CSS px length, with the case-insensitive unit and a trailing `!important`. */
+function cssPx(raw) {
+  const s = String(raw || '')
+    .trim()
+    .replace(/\s*!important\s*$/i, '')
+    .trim();
+  const m = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)px$/i.exec(s);
+  return m ? Number(m[1]) : null;
+}
+
+/** The top margin, including the shorthand and the logical-property spelling. */
+function marginTopOf(decls) {
+  const direct = cssPx(decls['margin-top']);
+  if (direct !== null) return direct;
+  const logical = cssPx(decls['margin-block-start']);
+  if (logical !== null) return logical;
+  const parts = String(decls.margin || '')
+    .replace(/\s*!important\s*$/i, '')
+    .trim()
+    .split(/\s+/);
+  if (parts.length === 1 || parts.length >= 3) return cssPx(parts[0]);
+  return null;
+}
+
+/** Every `translateY` contributes; `translateY(1px) translateY(2px)` is 3px. */
+function translateYSum(value) {
+  const text = String(value || '').replace(/\s*!important\s*$/i, '');
+  const re = /translateY\(\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)px\s*\)/gi;
+  let sum = 0;
+  let found = false;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    sum += Number(m[1]);
+    found = true;
+  }
+  return found ? sum : null;
+}
+
 function nudgeFindings(blocks) {
   const findings = [];
   for (const block of blocks) {
-    const marginTop = (block.decls['margin-top'] || '').trim();
-    let nudge = null;
-    if (/^-?\d*\.?\d+px$/.test(marginTop)) {
-      nudge = Number.parseFloat(marginTop);
-    } else if (block.decls.transform) {
-      const m = /translateY\(\s*(-?\d*\.?\d+)px\s*\)/.exec(block.decls.transform);
-      if (m) nudge = Number.parseFloat(m[1]);
-    }
+    // Chrome moves the text for all of these spellings; matching only
+    // `margin-top: 2px` reported `ok` on a real 2px displacement.
+    const nudge = marginTopOf(block.decls) ?? translateYSum(block.decls.transform);
     // A sub-pixel nudge sits inside the tolerance band by definition; flagging it
     // would be noise. The documented window is 1px <= |nudge| <= 3px.
     if (!nudge || Math.abs(nudge) < 1 || Math.abs(nudge) > 3) continue;
@@ -607,23 +640,58 @@ export function parseJsx(text) {
   return elements;
 }
 
-function tailwindRadius(token) {
+function tailwindRadiusKey(token) {
   if (!token.startsWith('rounded')) return null;
   const suffix = token.slice('rounded'.length);
-  if (suffix === '') return RADIUS_SCALE[''];
+  if (suffix === '') return '';
   if (!suffix.startsWith('-')) return null;
   const key = suffix.slice(1);
   // `rounded-` (an interpolated class) and side-specific radii are not a
   // uniform corner radius.
   if (!key || key.includes('-')) return null;
-  return key in RADIUS_SCALE ? RADIUS_SCALE[key] : null;
+  return key in RADIUS_SCALE ? key : null;
 }
 
-function tailwindPadding(token, axis = '') {
+function tailwindPaddingKey(token, axis = '') {
   const re = new RegExp(`^p${axis}-([\\w.]+)$`);
   const m = re.exec(token);
   if (!m) return null;
-  return m[1] in PADDING_SCALE ? PADDING_SCALE[m[1]] : null;
+  return m[1] in PADDING_SCALE ? m[1] : null;
+}
+
+/**
+ * Tailwind emits utilities in **scale order**, so when two utilities in the same
+ * family conflict the later scale step wins regardless of their order in
+ * `className`. Chrome computed `8px` for both `rounded-md rounded-lg` and
+ * `rounded-lg rounded-md`; taking the first token reported `6px` for one of them
+ * and suggested `calc(6px - 4px)`, which would have broken a correct inner radius.
+ */
+function winningKey(tokens, keyOf, scale) {
+  // Rank by the scale *value*, not `Object.keys(scale)`: JS puts integer-like
+  // keys (`1`, `2`, `4`) before string ones (`0.5`, `1.5`, `2.5`), which is the
+  // opposite of Tailwind's emitted order for `p-1` vs `p-1.5`.
+  let best = null;
+  let rank = -Infinity;
+  for (const token of tokens) {
+    const key = keyOf(token);
+    if (key === null) continue;
+    const value = scale[key];
+    if (value > rank) {
+      rank = value;
+      best = key;
+    }
+  }
+  return best;
+}
+
+function winningRadius(tokens) {
+  const key = winningKey(tokens, tailwindRadiusKey, RADIUS_SCALE);
+  return key === null ? undefined : RADIUS_SCALE[key];
+}
+
+function winningPadding(tokens, axis = '') {
+  const key = winningKey(tokens, (t) => tailwindPaddingKey(t, axis), PADDING_SCALE);
+  return key === null ? undefined : PADDING_SCALE[key];
 }
 
 /**
@@ -654,14 +722,6 @@ function stripVariants(token) {
     i += 1;
   }
   return token.slice(stem);
-}
-
-function firstRadius(tokens) {
-  for (const token of tokens) {
-    const value = tailwindRadius(token);
-    if (value !== null) return value;
-  }
-  return undefined;
 }
 
 /** A conditional class list describes several worlds; never assert one of them. */
@@ -717,12 +777,12 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
 
   for (const el of elements) {
     const info = classInfo(el.className);
-    const outerRadius = firstRadius(info.stems);
+    const outerRadius = winningRadius(info.stems);
     if (outerRadius === undefined) continue;
 
-    const uniform = info.stems.map((t) => tailwindPadding(t)).find((p) => p !== null && p !== undefined);
-    const padX = info.stems.map((t) => tailwindPadding(t, 'x')).find((p) => p !== null && p !== undefined);
-    const padY = info.stems.map((t) => tailwindPadding(t, 'y')).find((p) => p !== null && p !== undefined);
+    const uniform = winningPadding(info.stems);
+    const padX = winningPadding(info.stems, 'x');
+    const padY = winningPadding(info.stems, 'y');
 
     let padding;
     if (uniform !== undefined) {
@@ -747,7 +807,7 @@ export function checkTsx(text, { target = '<tsx>' } = {}) {
     for (const child of elements) {
       if (child.parent !== el) continue;
       const childInfo = classInfo(child.className);
-      const childRadius = firstRadius(childInfo.stems);
+      const childRadius = winningRadius(childInfo.stems);
       if (childRadius === undefined) continue;
 
       const conditional = info.ambiguous || childInfo.ambiguous;

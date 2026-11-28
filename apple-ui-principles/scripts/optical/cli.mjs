@@ -73,11 +73,11 @@ function parseArgs(argv) {
       if (!opts.policy) throw usage('--policy needs a file');
       i += 1;
     } else if (arg === '--size') {
-      opts.size = Number.parseFloat(argv[i + 1]);
+      opts.size = Number(argv[i + 1]);
       if (!Number.isFinite(opts.size)) throw usage('--size needs a number');
       i += 1;
     } else if (arg === '--line-height') {
-      opts.lineHeight = Number.parseFloat(argv[i + 1]);
+      opts.lineHeight = Number(argv[i + 1]);
       if (!Number.isFinite(opts.lineHeight)) throw usage('--line-height needs a number');
       i += 1;
     } else if (arg === '--tolerance') {

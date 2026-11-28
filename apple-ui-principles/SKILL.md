@@ -51,7 +51,7 @@ Mathematical perfection often looks visually wrong because **"the human eye is n
 
 - **Concept:** Highly polished shapes (Logos, complex UI curves, squircles) rely on strict geometric constraints to feel "stable".
 - **Action:** When generating SVGs or reviewing corner radii, check for continuous curves. Use `border-radius` smoothing (like `border-curve: continuous` or Apple's squircle shape) instead of basic CSS circles when possible. If an element feels "off", check if its proportions approximate the Golden Ratio ($1.618$).
-- **Concentric corners:** the inner radius is `calc(R_outer − P)` **only when padding is uniform**. With unequal insets the correct form is elliptical (`R−Px` / `R−Py`), and when `P > R` the real problem is an oversized outer radius — clamping to `0` hides it.
+- **Concentric corners:** the inner radius is `calc(R_outer − P)` **only when padding is uniform**. With unequal insets the correct form is elliptical (`R−Px` / `R−Py`), and when `P > R` the real problem is an oversized outer radius — clamping to `0` hides it. Conflicting Tailwind utilities are resolved in **scale order**, not by their order in `className`.
 
 ### 6. Proximity as Syntax (邻近原则) [暂不可校验]
 
@@ -126,13 +126,17 @@ node scripts/optical/cli.mjs check <path...> [--json] [--explain] [--mode <mode>
 node scripts/optical/cli.mjs font <font.ttf> --size 16 [--line-height 1.5]
 ```
 
+`--size` and `--line-height` take bare numbers only; `16px` is a usage error
+(exit `64`), not a silently truncated `16`.
+
 | Input | Mode | What is measured |
 |---|---|---|
 | `icon.svg` | `standalone` | ink box vs viewBox, centroid vs ink box |
 | `icon.svg` with `<text>`/`<image>` | — | `unknown`: visible ink that is not geometry |
 | `icon.svg` painting through `<style>`/`class` | — | paint is resolved: sheet normal < inline normal < sheet `!important` < inline `!important` |
 | `icon.svg` with `fill="var(--x)"` or `@import` | — | `unknown`: the value lives outside the file. Replace it with a literal to measure the icon — a themed colour does not change the area, but `none` does, and the checker cannot tell which you have |
-| `icon.svg` with `%` geometry or a `%` `stroke-width` | — | `unknown`: relative to a viewport the checker cannot see |
+| `icon.svg` with `%` geometry | — | `unknown`: relative to a viewport the checker cannot see |
+| `icon.svg` with `%` `stroke-width` | — | resolved against the **nearest declared viewport** (a nested `viewBox` wins over the root); invalid negative percentages fall back to the inherited width; ink that leaves the visible user area is `unknown` |
 | `icon.svg` that animates, or draws outside its viewport | — | `unknown`: one frame is not the drawing, and the browser clips the rest |
 | `icon.svg` with `mask`/`filter`/`marker-*` (attribute, `style` or class) | — | `unknown`: mask and filter rewrite the painted region, a marker draws a shape of its own outside the path |
 | `icon.svg` with `fill="url(#missing)"` | — | measured as no ink: SVG leaves the element unrendered. A reference to a gradient or pattern is measured normally — colour is not area. Flatten these to shapes if the verdict matters |

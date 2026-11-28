@@ -2605,3 +2605,129 @@ test('a percentage stroke-width is not converted twice by non-scaling-stroke', (
   near(shape.ink.area, 76.8, 0.01);
   near(shape.ink.bbox.minX, 6.8, 0.01);
 });
+
+// --- a % stroke-width resolves against the nearest viewport ----------------
+
+test('a nested viewport uses its own viewBox diagonal for % stroke-width', () => {
+  // Two identical bands, one authored in user units and one as 16.666666% of
+  // the nested 48-unit viewBox. Reading the root's 24-unit diagonal shrank the
+  // second band from 8 to 4 units and reported a 3px centroid offset on a
+  // perfectly centred icon.
+  const markup =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24">'
+      + '<svg x="0" y="0" width="24" height="24" viewBox="0 0 48 48">'
+      + '<rect x="4" y="16" width="16" height="16" fill="none" stroke="#000" stroke-width="8"/>'
+      + '<rect x="28" y="16" width="16" height="16" fill="none" stroke="#000" stroke-width="16.666666%"/>'
+      + '</svg></svg>';
+  const shape = analyzeSvg(markup);
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 256, 0.01);
+  near(shape.ink.centroid.cx, 12, 0.01);
+  assert.equal(checkShape(shape, { target: 'nested.svg' }).verdict, 'ok');
+
+  // Chrome: area 1024px², bbox [0,12,48,36] at the 48px render size.
+  near(shape.ink.area * 4, 1024, 1);
+  near(shape.ink.bbox.minX * 2, 0, 0.01);
+  near(shape.ink.bbox.maxX * 2, 48, 0.01);
+  near(shape.ink.bbox.minY * 2, 12, 0.01);
+  near(shape.ink.bbox.maxY * 2, 36, 0.01);
+});
+
+test('a negative % stroke-width is an invalid declaration, not an unknown', () => {
+  // Chrome drops `-10%` and the property keeps its initial value 1, so the band
+  // is measurable. Refusing the whole file threw away a valid measurement.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">'
+      + '<line x1="10" y1="24" x2="38" y2="24" stroke="#000" stroke-width="-10%"/></svg>',
+  );
+  assert.deepEqual(shape.unresolved, []);
+  near(shape.ink.area, 28, 0.01);
+  assert.equal(checkShape(shape, { target: 'negative.svg' }).verdict, 'ok');
+});
+
+// --- Tailwind conflicts follow scale order, not class attribute order ------
+
+test('conflicting Tailwind radius and padding classes resolve in scale order', () => {
+  // Chrome computed 8px for both spellings of the radius pair; the CSS is
+  // emitted in scale order, so `lg` wins wherever it appears in `className`.
+  for (const cls of ['rounded-md rounded-lg p-1', 'rounded-lg rounded-md p-1']) {
+    const report = checkTsx(`<div className="${cls}"><div className="rounded" /></div>`, {
+      target: 'pair.tsx',
+    });
+    assert.equal(report.verdict, 'ok', cls);
+  }
+  // Same for padding: p-4 wins over p-2 whichever order they are written in.
+  // With an 8px outer radius it must report the real 16px inset, not the 8px
+  // that taking the first class would produce.
+  for (const cls of ['p-2 p-4', 'p-4 p-2']) {
+    const report = checkTsx(`<div className="rounded-lg ${cls}"><div className="rounded" /></div>`, {
+      target: 'pad.tsx',
+    });
+    const f = report.findings.find((x) => x.id === 'rule/non-concentric-radius');
+    assert.ok(f, cls);
+    assert.match(f.evidence, /16px padding/, cls);
+  }
+  // JS object key order puts integer-like keys before fractional ones, but
+  // Tailwind emits `p-1.5` after `p-1`. Chrome computed 6px in both spellings.
+  for (const cls of ['p-1 p-1.5', 'p-1.5 p-1']) {
+    const report = checkTsx(`<div className="rounded ${cls}"><div className="rounded-none" /></div>`, {
+      target: 'fractional.tsx',
+    });
+    const f = report.findings.find((x) => x.id === 'rule/non-concentric-radius');
+    assert.ok(f, cls);
+    assert.match(f.evidence, /6px padding/, cls);
+  }
+});
+
+test('a band pushed outside the declared root viewport is refused, not called ok', () => {
+  // Chrome clips a 150% stroke at the 48px canvas and draws 1344px². The model
+  // counted the full 2016px² band, including the part that was never on screen,
+  // and reported `ok`. `meet` letterboxes, so the visible rect is the viewport
+  // mapped back into user space — not just the viewBox.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">'
+      + '<line x1="10" y1="24" x2="38" y2="24" stroke="#000" stroke-width="150%"/></svg>',
+  );
+  assert.ok(shape.unresolved.includes('ink-outside-viewport'), JSON.stringify(shape.unresolved));
+  assert.equal(checkShape(shape, { target: 'wide.svg' }).verdict, 'unknown');
+});
+
+test('a sub-tolerance flattening overshoot is not treated as clipped ink', () => {
+  // A real octicon/Chrome close button has a curve whose flattened bbox lands
+  // a few thousandths outside the viewBox. Chrome clips that sliver, but it is
+  // far inside the tolerance band and cannot move a verdict. A strict check
+  // turned 115 corpus icons from measurable into `unknown`.
+  const shape = analyzeSvg(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 11 11">'
+      + '<circle cx="5.5" cy="5.5" r="5.506" fill="#000"/></svg>',
+  );
+  assert.ok(shape.ink.bbox.maxX > 11, JSON.stringify(shape.ink.bbox));
+  assert.ok(!shape.unresolved.includes('ink-outside-viewport'), JSON.stringify(shape.unresolved));
+  assert.equal(checkShape(shape, { target: 'sliver.svg' }).verdict, 'ok');
+});
+
+test('the hardcoded-nudge rule sees every way CSS can move text 2px', () => {
+  // Chrome displaces the text for all of these. Matching only the literal
+  // `margin-top: 2px` spelling reported `ok` on a real 2px move.
+  const cases = [
+    '.x{font-size:16px;margin-top:2px!important}',
+    '.x{font-size:16px;margin-top:2PX}',
+    '.x{font-size:16px;margin:2px 0 0}',
+    '.x{font-size:16px;margin-block-start:2px}',
+    '.x{font-size:16px;transform:translateY(2PX)}',
+    '.x{font-size:16px;transform:translateY(1px) translateY(2px)}',
+  ];
+  for (const css of cases) {
+    const report = checkCss(css, { target: 'nudge.css' });
+    const f = report.findings.find((x) => x.id === 'rule/hardcoded-vertical-nudge');
+    assert.ok(f, css);
+    assert.equal(f.verdict, 'nudge', css);
+    assert.equal(f.measured?.dx ?? f.offset, css.includes('translateY(1px)') ? 3 : 2, css);
+  }
+});
+
+test('font --size rejects a unit rather than parsing its numeric prefix', () => {
+  const result = run('font', fixture('missing.ttf'), '--size', '16px');
+  assert.equal(result.status, 64, result.stdout + result.stderr);
+  assert.match(result.stderr, /--size needs a number/);
+});
